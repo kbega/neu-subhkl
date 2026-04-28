@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 env:
   IMAGE_NAME: zjmorgan/subhkl
