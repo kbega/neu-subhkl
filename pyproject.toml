@@ -15,6 +15,7 @@ dependencies = [
     "tdqm>=0.0.1",
     "scipy>=1.17.1",
 ]
+
 license = { text = "GPL3.0" }
 
 [build-system]
