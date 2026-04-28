@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: zjmorgan/subhkl
+  IMAGE_NAME: neutrons/subhkl
 
 jobs:
   build-and-push-image:
