@@ -224,7 +224,16 @@ class VectorizedObjective:
         freeze_orientation=False,
         fixed_rot_params=None,
         num_candidates=None,
+        no_index=False,
+        hkl_fixed=None,
+        lambda_fixed=None,
     ):
+        self.mode = mode
+        self.no_index = no_index
+        if self.no_index:
+            self.hkl_fixed = jnp.array(hkl_fixed)      # Shape: (3, N)
+            self.lambda_fixed = jnp.array(lambda_fixed) # Shape: (N,)
+
         self.B = jnp.array(B)
         self.kf_ki_dir_init = jnp.array(kf_ki_dir)
         if self.kf_ki_dir_init.ndim == 2 and self.kf_ki_dir_init.shape[0] != 3:
@@ -709,6 +718,30 @@ class VectorizedObjective:
             jnp.zeros((S, N)),
         )
 
+        def geometric_loss_jax(self, ub_mat, kf_ki_sample):
+            """
+            Direct displacement loss in q-space bypassing integer grid search.
+            Minimizes || q_obs - q_pred ||_2 where q_pred = UB * hkl.
+            """
+            # q_obs: (S, 3, N) | Derived from exact detector pixels and fixed lambda
+            q_obs = kf_ki_sample / self.lambda_fixed[None, None, :]
+
+            # q_pred: (S, 3, N) | Theoretical q-vector from dynamic UB matrix
+            q_pred = jnp.matmul(ub_mat, self.hkl_fixed)
+
+            # Vector displacement distance
+            dist = jnp.linalg.norm(q_obs - q_pred, axis=1)
+
+            # Mean loss across all peaks for the optimizer
+            loss = jnp.mean(dist, axis=1)
+
+            # Format returns to match indexer_dynamic_soft_jax signature (loss, dist, hkl, lamb)
+            S, _, _ = kf_ki_sample.shape
+            hkl_ret = jnp.tile(self.hkl_fixed.T[None, :, :], (S, 1, 1))
+            lamb_ret = jnp.tile(self.lambda_fixed[None, :], (S, 1))
+
+            return loss, dist, hkl_ret, lamb_ret
+
         def scan_body(carry, i):
             curr_min, curr_best_hkl, curr_best_lamb = carry
 
@@ -839,11 +872,14 @@ class VectorizedObjective:
         else:
             kf_ki_vec = q_lab
 
-        res = self.indexer_dynamic_soft_jax(
-            UB,
-            kf_ki_vec,
-            k_sq_override=k_sq_dyn,
-        )
+        if self.no_index:
+            res = self.geometric_loss_jax(UB, kf_ki_vec)
+        else:
+            res = self.indexer_dynamic_soft_jax(
+                UB,
+                kf_ki_vec,
+                k_sq_override=k_sq_dyn,
+            )
 
         return jax.tree.map(
             lambda arr: (
@@ -936,6 +972,21 @@ class FindUB:
             data["beam/ki_vec"] if "beam/ki_vec" in data else np.array([0.0, 0.0, 1.0])
         )
 
+        # Generalize bootstrap loader for existing hkl and lambda
+        if "peaks/h" in data and "peaks/k" in data and "peaks/l" in data:
+            self.hkl = np.vstack([
+                data["peaks/h"],
+                data["peaks/k"],
+                data["peaks/l"]
+            ])
+        else:
+            self.hkl = None
+
+        if "peaks/lambda" in data:
+            self.lambdas = data["peaks/lambda"]
+        else:
+            self.lambdas = None
+
     def load_peaks(self, filename):
         with h5py.File(os.path.abspath(filename), "r") as f:
             data = {
@@ -971,6 +1022,15 @@ class FindUB:
                 data["goniometer/names"] = f["goniometer/names"][()]
             if "beam/ki_vec" in f:
                 data["beam/ki_vec"] = f["beam/ki_vec"][()]
+
+            # Add bootstrap keys
+            if "peaks/h" in f:
+                data["peaks/h"] = f["peaks/h"][()]
+                data["peaks/k"] = f["peaks/k"][()]
+                data["peaks/l"] = f["peaks/l"][()]
+            if "peaks/lambda" in f:
+                data["peaks/lambda"] = f["peaks/lambda"][()]
+
             self.load_from_dict(data)
 
     def reciprocal_lattice_B(self):
@@ -1118,6 +1178,7 @@ class FindUB:
         detector_trans_bound_meters: float = 0.005,
         detector_rot_bound_deg: float = 1.0,
         freeze_orientation: bool = False,
+        no_index: bool | None = None,
         **kwargs,
     ):
         if goniometer_axes is None and self.goniometer_axes is not None:
@@ -1126,6 +1187,13 @@ class FindUB:
             goniometer_angles = self.goniometer_angles
         if goniometer_names is None and self.goniometer_names is not None:
             goniometer_names = self.goniometer_names
+
+        # Determine if we should bypass indexing based on boolean or presence of hkls
+        if no_index is None:
+            no_index = (self.hkl is not None and self.lambdas is not None)
+
+        if no_index:
+            print("Bootstrapped solution detected. Bypassing integer search and minimizing via geometric vector displacement.")
 
         # Provide a dummy lab vector for metric initialization if angles were removed
         if (
@@ -1262,6 +1330,9 @@ class FindUB:
             detector_rot_bound_deg=detector_rot_bound_deg,
             freeze_orientation=freeze_orientation,
             fixed_rot_params=self.fixed_rot_params,
+            no_index=no_index,
+            hkl_fixed=self.hkl,
+            lambda_fixed=self.lambdas,
         )
 
         num_dims = 0 if freeze_orientation else 3

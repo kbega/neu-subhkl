@@ -91,6 +91,7 @@ def run_index(
     batch_size: int | None = None,
     input_data: dict | None = None,
     num_candidates: int | None = None,
+    no_index: bool | None = None,
 ):
     input_data = input_data or {}
 
@@ -165,6 +166,10 @@ def run_index(
             "peaks/intensity",
             "peaks/sigma",
             "peaks/radius",
+            "peaks/h",
+            "peaks/k",
+            "peaks/l",
+            "peaks/lambda",
             "goniometer/R",
             "goniometer/axes",
             "goniometer/angles",
@@ -322,6 +327,12 @@ def run_index(
                 input_data["sample/offset"] = b_f["sample/offset"][()]
             if "beam/ki_vec" in b_f:
                 ki_vec_val = b_f["beam/ki_vec"][()]
+            if "peaks/h" in b_f:
+                input_data["peaks/h"] = b_f["peaks/h"][()]
+                input_data["peaks/k"] = b_f["peaks/k"][()]
+                input_data["peaks/l"] = b_f["peaks/l"][()]
+            if "peaks/lambda" in b_f:
+                input_data["peaks/lambda"] = b_f["peaks/lambda"][()]
 
     input_data["sample/a"], input_data["sample/b"], input_data["sample/c"] = a, b, c
     (
@@ -514,6 +525,7 @@ def run_index(
         detector_rot_bound_deg=detector_rot_bound_deg,
         freeze_orientation=freeze_orientation,
         num_candidates=num_candidates,
+        no_index=no_index,
     )
 
     print(f"\nOptimization complete. Best solution indexed {num} peaks.")
