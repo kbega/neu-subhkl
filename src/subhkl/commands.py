@@ -618,6 +618,7 @@ def run_index(
             "refine_sample": refine_sample,
             "refine_beam": refine_beam,
             "refine_detector": refine_detector,
+            "detector_modes": detector_modes,
             "freeze_orientation": freeze_orientation,
         }
         f.create_dataset("optimization/flags", data=json.dumps(flags).encode("utf-8"))
