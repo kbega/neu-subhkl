@@ -1192,7 +1192,9 @@ class FindUB:
         if no_index is None:
             no_index = (self.hkl is not None and self.lambdas is not None)
 
-        if no_index:
+        self.no_index = no_index
+
+        if self.no_index:
             print("Bootstrapped solution detected. Bypassing integer search and minimizing via geometric vector displacement.")
 
         # Provide a dummy lab vector for metric initialization if angles were removed
@@ -1330,7 +1332,7 @@ class FindUB:
             detector_rot_bound_deg=detector_rot_bound_deg,
             freeze_orientation=freeze_orientation,
             fixed_rot_params=self.fixed_rot_params,
-            no_index=no_index,
+            no_index=self.no_index,
             hkl_fixed=self.hkl,
             lambda_fixed=self.lambdas,
         )
