@@ -1,5 +1,7 @@
 # src/subhkl/io/command_line_parser.py
 from typing import Annotated
+from typing import Optional
+
 import typer
 import h5py
 import os
