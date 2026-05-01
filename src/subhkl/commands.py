@@ -87,6 +87,7 @@ def run_index(
     detector_global_rot_axis: list[float] | np.ndarray | None = None,
     detector_global_trans_bound_meters: float = 0.01,
     detector_radial_bound_frac: float = 0.05,
+    cylinder_axis: list[float] | np.ndarray | None = None,
     bootstrap_filename: str | None = None,
     batch_size: int | None = None,
     input_data: dict | None = None,
@@ -108,6 +109,16 @@ def run_index(
     else:
         # Safe default fallback for downstream JAX compilation
         detector_global_rot_axis = [0.0, 1.0, 0.0]
+
+    if cylinder_axis is not None:
+        if "radial" in detector_modes:
+            print(f"Auto-switching detector mode: 'radial' -> 'cylindrical' (Axis: {cylinder_axis})")
+            detector_modes = [
+                "cylindrical" if mode == "radial" else mode 
+                for mode in detector_modes
+            ]
+    else:
+        cylinder_axis = [0.0, 1.0, 0.0] # Safe default for downstream JAX compilation
 
     # --- INJECT BOOTSTRAP PHYSICS DIRECTLY ---
     if bootstrap_filename:
@@ -281,6 +292,7 @@ def run_index(
                     "radial_bound": detector_radial_bound_frac,
                     "global_rot_bound_deg": detector_global_rot_bound_deg,
                     "global_rot_axis": np.array(detector_global_rot_axis),
+                    "cylinder_axis": np.array(cylinder_axis),
                     "global_trans_bound_meters": detector_global_trans_bound_meters,
                 }
 

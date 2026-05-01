@@ -412,6 +412,12 @@ class VectorizedObjective:
             )
             self.det_global_rot_axis = rot_axis / (jnp.linalg.norm(rot_axis) + 1e-9)
 
+            # Normalize the cylinder axis
+            cyl_axis = jnp.array(
+                detector_params.get("cylinder_axis", [0.0, 1.0, 0.0])
+            )
+            self.cylinder_axis = cyl_axis / (jnp.linalg.norm(cyl_axis) + 1e-9)
+
             self.bounds = {
                 "radial": detector_params.get("radial_bound", 0.05),
                 "global_rot": jnp.deg2rad(
@@ -426,7 +432,7 @@ class VectorizedObjective:
             }
 
             for mode in self.det_modes:
-                if mode == "radial":
+                if mode in ("radial", "cylindrical"):
                     size = 1
                 elif mode == "global_rot":
                     size = 3
@@ -633,6 +639,21 @@ class VectorizedObjective:
                 scale_norm = det_params[:, slc]
                 scale = _forward_map_param(scale_norm, self.bounds["radial"])
                 c = c * (1.0 + scale[:, :, None])
+
+            if "cylindrical" in self.det_modes:
+                slc = self.det_param_slices["cylindrical"]
+                scale_norm = det_params[:, slc]
+                scale = _forward_map_param(scale_norm, self.bounds["radial"]) # Reuse radial bound mapping
+
+                # Project the center (c) onto the cylinder axis
+                # c shape: (S, num_banks, 3), axis shape: (3,)
+                c_dot_a = jnp.sum(c * self.cylinder_axis, axis=-1, keepdims=True)
+                
+                c_parallel = c_dot_a * self.cylinder_axis
+                c_perp = c - c_parallel
+
+                # Apply scaling ONLY to the perpendicular (radial outward) component
+                c = c_parallel + c_perp * (1.0 + scale[:, :, None])
 
             if "global_rot" in self.det_modes:
                 slc = self.det_param_slices["global_rot"]

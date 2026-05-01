@@ -235,6 +235,13 @@ def indexer(
             help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
         ),
     ] = None,
+    cylinder_axis: Annotated[
+        str,
+        typer.Option(
+            "--cylinder-axis",
+            help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
+        ),
+    ] = None,
     detector_global_trans_bound_meters: Annotated[
         float, typer.Option("--detector-global-trans-bound-meters")
     ] = 0.01,
@@ -268,6 +275,11 @@ def indexer(
     global_rot_axis_parsed = (
         [float(x.strip()) for x in detector_global_rot_axis.split(",")]
         if detector_global_rot_axis
+        else None
+    )
+    cylinder_axis = (
+        [float(x.strip()) for x in cylinder_axis.split(",")]
+        if cylinder_axis
         else None
     )
 
@@ -313,6 +325,7 @@ def indexer(
         detector_global_rot_axis=global_rot_axis_parsed,
         detector_global_trans_bound_meters=detector_global_trans_bound_meters,
         detector_radial_bound_frac=detector_radial_bound_frac,
+        cylinder_axis=cylinder_axis,
         bootstrap_filename=bootstrap_filename,
         batch_size=batch_size,
         num_candidates=num_candidates,
