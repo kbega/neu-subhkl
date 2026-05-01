@@ -717,30 +717,6 @@ class VectorizedObjective:
             jnp.zeros((S, N)),
         )
 
-        def geometric_loss_jax(self, ub_mat, kf_ki_sample):
-            """
-            Direct displacement loss in q-space bypassing integer grid search.
-            Minimizes || q_obs - q_pred ||_2 where q_pred = UB * hkl.
-            """
-            # q_obs: (S, 3, N) | Derived from exact detector pixels and fixed lambda
-            q_obs = kf_ki_sample / self.lambda_fixed[None, None, :]
-
-            # q_pred: (S, 3, N) | Theoretical q-vector from dynamic UB matrix
-            q_pred = jnp.matmul(ub_mat, self.hkl_fixed)
-
-            # Vector displacement distance
-            dist = jnp.linalg.norm(q_obs - q_pred, axis=1)
-
-            # Mean loss across all peaks for the optimizer
-            loss = jnp.mean(dist, axis=1)
-
-            # Format returns to match indexer_dynamic_soft_jax signature (loss, dist, hkl, lamb)
-            S, _, _ = kf_ki_sample.shape
-            hkl_ret = jnp.tile(self.hkl_fixed.T[None, :, :], (S, 1, 1))
-            lamb_ret = jnp.tile(self.lambda_fixed[None, :], (S, 1))
-
-            return loss, dist, hkl_ret, lamb_ret
-
         def scan_body(carry, i):
             curr_min, curr_best_hkl, curr_best_lamb = carry
 
@@ -786,6 +762,31 @@ class VectorizedObjective:
 
         loss = jnp.mean(dist_min, axis=1)
         return loss, dist_min, best_hkl.transpose((0, 2, 1)), best_lamb
+
+    def geometric_loss_jax(self, ub_mat, kf_ki_sample):
+        """
+        Direct displacement loss in q-space bypassing integer grid search.
+        Minimizes || q_obs - q_pred ||_2 where q_pred = UB * hkl.
+        """
+        # q_obs: (S, 3, N) | Derived from exact detector pixels and fixed lambda
+        q_obs = kf_ki_sample / self.lambda_fixed[None, None, :]
+
+        # q_pred: (S, 3, N) | Theoretical q-vector from dynamic UB matrix
+        q_pred = jnp.matmul(ub_mat, self.hkl_fixed)
+
+        # Vector displacement distance
+        dist = jnp.linalg.norm(q_obs - q_pred, axis=1)
+
+        # Mean loss across all peaks for the optimizer
+        loss = jnp.mean(dist, axis=1)
+
+        # Format returns to match indexer_dynamic_soft_jax signature (loss, dist, hkl, lamb)
+        S, _, _ = kf_ki_sample.shape
+        hkl_ret = jnp.tile(self.hkl_fixed.T[None, :, :], (S, 1, 1))
+        lamb_ret = jnp.tile(self.lambda_fixed[None, :], (S, 1))
+
+        return loss, dist, hkl_ret, lamb_ret
+
 
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
