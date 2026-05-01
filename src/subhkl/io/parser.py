@@ -268,7 +268,7 @@ def indexer(
     global_rot_axis_parsed = (
         [float(x.strip()) for x in detector_global_rot_axis.split(",")]
         if detector_global_rot_axis
-        else None,
+        else None
     )
 
     # 2. Hand off to Core Logic
