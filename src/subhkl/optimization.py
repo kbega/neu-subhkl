@@ -1223,6 +1223,7 @@ class FindUB:
 
         if self.no_index:
             print("Bootstrapped solution detected. Bypassing integer search and minimizing via geometric vector displacement.")
+            print("You can enable indexing with --index.")
 
         # Provide a dummy lab vector for metric initialization if angles were removed
         if (
