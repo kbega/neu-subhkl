@@ -97,7 +97,16 @@ def run_index(
 
     if detector_modes is None:
         detector_modes = ["independent"]
-    if detector_global_rot_axis is None:
+
+    if detector_global_rot_axis is not None:
+        if "global_rot" in detector_modes:
+            print(f"Auto-switching detector mode: 'global_rot' -> 'global_rot_axis' (Axis: {detector_global_rot_axis})")
+            detector_modes = [
+                "global_rot_axis" if mode == "global_rot" else mode 
+                for mode in detector_modes
+            ]
+    else:
+        # Safe default fallback for downstream JAX compilation
         detector_global_rot_axis = [0.0, 1.0, 0.0]
 
     # --- INJECT BOOTSTRAP PHYSICS DIRECTLY ---

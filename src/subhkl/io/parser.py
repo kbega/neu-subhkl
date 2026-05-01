@@ -234,7 +234,7 @@ def indexer(
             "--detector-global-rot-axis",
             help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
         ),
-    ] = "0,1,0",
+    ] = None,
     detector_global_trans_bound_meters: Annotated[
         float, typer.Option("--detector-global-trans-bound-meters")
     ] = 0.01,
@@ -268,7 +268,7 @@ def indexer(
     global_rot_axis_parsed = (
         [float(x.strip()) for x in detector_global_rot_axis.split(",")]
         if detector_global_rot_axis
-        else [0.0, 1.0, 0.0]
+        else None,
     )
 
     # 2. Hand off to Core Logic
