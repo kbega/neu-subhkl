@@ -253,7 +253,7 @@ def indexer(
     num_candidates: Annotated[
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
-    no_index: Annotated[bool, typer.Option("--no-index")] = None,
+    index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
 ) -> None:
     # 1. Safely Parse Comma-Separated Strings into Python Lists
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
@@ -329,6 +329,7 @@ def indexer(
         bootstrap_filename=bootstrap_filename,
         batch_size=batch_size,
         num_candidates=num_candidates,
+        no_index = not index if index is not None else None,
     )
 
 
