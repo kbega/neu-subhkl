@@ -228,7 +228,6 @@ class VectorizedObjective:
         hkl_fixed=None,
         lambda_fixed=None,
     ):
-        self.mode = mode
         self.no_index = no_index
         if self.no_index:
             self.hkl_fixed = jnp.array(hkl_fixed)      # Shape: (3, N)
