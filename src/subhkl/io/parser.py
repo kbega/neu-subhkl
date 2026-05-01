@@ -218,7 +218,7 @@ def indexer(
         str,
         typer.Option(
             "--detector-modes",
-            help="Comma-separated list of refinement modes (e.g. radial,global_rot,independent)",
+            help="Comma-separated list of refinement modes (e.g. radial,global_rot,independent,axial_stretch)",
         ),
     ] = "independent",
     detector_trans_bound_meters: Annotated[

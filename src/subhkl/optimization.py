@@ -432,7 +432,7 @@ class VectorizedObjective:
             }
 
             for mode in self.det_modes:
-                if mode in ("radial", "cylindrical"):
+                if mode in ("radial", "cylindrical", "axial_stretch"):
                     size = 1
                 elif mode == "global_rot":
                     size = 3
@@ -654,6 +654,19 @@ class VectorizedObjective:
 
                 # Apply scaling ONLY to the perpendicular (radial outward) component
                 c = c_parallel + c_perp * (1.0 + scale[:, :, None])
+
+            if "axial_stretch" in self.det_modes:
+                slc = self.det_param_slices["axial_stretch"]
+                scale_norm = det_params[:, slc]
+                scale = _forward_map_param(scale_norm, self.bounds["radial"])
+
+                # Decompose again
+                c_dot_a = jnp.sum(c * self.cylinder_axis, axis=-1, keepdims=True)
+                c_parallel = c_dot_a * self.cylinder_axis
+                c_perp = c - c_parallel
+
+                # Apply scaling ONLY to the parallel (height) component
+                c = c_parallel * (1.0 + scale[:, :, None]) + c_perp
 
             if "global_rot" in self.det_modes:
                 slc = self.det_param_slices["global_rot"]
