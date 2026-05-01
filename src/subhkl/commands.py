@@ -612,6 +612,7 @@ def run_index(
         import json
 
         flags = {
+            "no_index": opt.no_index,
             "refine_lattice": refine_lattice,
             "refine_goniometer": refine_goniometer,
             "refine_sample": refine_sample,
