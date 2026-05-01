@@ -238,8 +238,9 @@ def run_index(
 
                 centers, uhats, vhats, m, n, pw, ph = [], [], [], [], [], [], []
                 bank_to_idx = {}
+                valid_target_banks = []
 
-                for idx, b_id in enumerate(target_banks):
+                for b_id in target_banks:
                     try:
                         det = peaks_obj.get_detector(b_id)
                         centers.append(det.center)
@@ -249,9 +250,15 @@ def run_index(
                         n.append(det.n)
                         pw.append(det.width / det.m)
                         ph.append(det.height / det.n)
-                        bank_to_idx[b_id] = idx
+
+                        # Map to the true contiguous index
+                        bank_to_idx[b_id] = len(valid_target_banks) 
+                        valid_target_banks.append(b_id)
                     except Exception as e:
                         print(f"WARNING: Could not load geometry for bank {b_id}: {e}")
+
+                # Overwrite target_banks so the rest of the script is perfectly aligned
+                target_banks = valid_target_banks
 
                 detector_params = {
                     "centers": centers,
