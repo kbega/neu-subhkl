@@ -637,6 +637,11 @@ def run_index(
         if opt.x is not None and opt.x.size > 0:
             f["optimization/best_params"] = opt.x
 
+        if bootstrap_filename:
+            with h5py.File(bootstrap_filename, "r") as b_f:
+                if "detector_calibration" in b_f:
+                    b_f.copy("detector_calibration", f)
+
         import json
 
         flags = {
@@ -654,10 +659,16 @@ def run_index(
         if refine_detector and hasattr(opt, "calibrated_centers"):
             for b_idx, b_id in enumerate(target_banks):
                 grp_name = f"detector_calibration/bank_{b_id}"
+
+                # Cleanly overwrite the specific bank if it was copied from bootstrap
+                if grp_name in f:
+                    del f[grp_name]
+
                 f.create_group(grp_name)
                 f[f"{grp_name}/center"] = opt.calibrated_centers[b_idx]
                 f[f"{grp_name}/uhat"] = opt.calibrated_uhats[b_idx]
                 f[f"{grp_name}/vhat"] = opt.calibrated_vhats[b_idx]
+
     print("Done.")
 
 
