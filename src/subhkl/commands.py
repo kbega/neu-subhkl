@@ -621,6 +621,7 @@ def run_index(
         safe_write(f, "sample/beta", opt.beta)
         safe_write(f, "sample/gamma", opt.gamma)
         safe_write(f, "sample/offset", opt.sample_offset)
+        safe_write(f, "beam/ki_vec", opt.ki_vec)
 
         B_mat = opt.reciprocal_lattice_B()
         safe_write(f, "sample/B", B_mat)
