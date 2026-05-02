@@ -351,8 +351,8 @@ def run_index(
     # --- INJECT SECOND PHASE OF BOOTSTRAP PHYSICS ---
     if bootstrap_filename:
         with h5py.File(bootstrap_filename, "r") as b_f:
-            if "sample/offset" in b_f:
-                input_data["sample/offset"] = b_f["sample/offset"][()]
+            if "goniometer/translations" in b_f:
+                input_data["sample/offset"] = b_f["goniometer/translations"][()]
             if "beam/ki_vec" in b_f:
                 ki_vec_val = b_f["beam/ki_vec"][()]
             if "peaks/h" in b_f:
@@ -377,8 +377,8 @@ def run_index(
 
     if bootstrap_filename:
         with h5py.File(bootstrap_filename, "r") as b_f:
-            if "optimization/goniometer_offsets" in b_f:
-                off_data = b_f["optimization/goniometer_offsets"]
+            off_data = b_f.get("goniometer/offsets") or b_f.get("optimization/goniometer_offsets")
+            if off_data is not None:
                 if isinstance(off_data, h5py.Group):
                     opt.goniometer_offsets = {
                         k: off_data[k][()] for k in off_data.keys()
@@ -604,7 +604,7 @@ def run_index(
         safe_write(f, "goniometer/R", opt.R)
 
         if opt.goniometer_offsets is not None:
-            grp_name = "optimization/goniometer_offsets"
+            grp_name = "goniometer/offsets"
             if grp_name in f:
                 del f[grp_name]
 
@@ -621,8 +621,8 @@ def run_index(
         safe_write(f, "sample/alpha", opt.alpha)
         safe_write(f, "sample/beta", opt.beta)
         safe_write(f, "sample/gamma", opt.gamma)
-        safe_write(f, "sample/offset", opt.sample_offset)
         safe_write(f, "beam/ki_vec", opt.ki_vec)
+        safe_write(f, "goniometer/translations", opt.sample_offset)
 
         B_mat = opt.reciprocal_lattice_B()
         safe_write(f, "sample/B", B_mat)
