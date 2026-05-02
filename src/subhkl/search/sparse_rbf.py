@@ -1249,11 +1249,13 @@ def global_shape_objective(
 
     def fit_one_peak(patch, bg, dr, dc, P_true, D_i):
         # 3. Add the tensors. If fit_mosaicity is False, D_i * 0 = 0.
-        Sigma_total_3D = Sigma_shape + (D_i**2) * Sigma_eta_base
+        Sigma_shape_lab = R_gonio @ Sigma_shape_sample @ R_gonio.T
+
+        Sigma_total_3D = Sigma_shape_lab + (D_i**2) * Sigma_eta_base
 
         # 4. Exact 2D Projection and Pixel Conversion
         Sigma_2D_physical = P_true @ Sigma_total_3D @ P_true.T
-        Sigma_2D = Sigma_2D_physical / (1.0**2)  # assuming 1.0mm pitch in P_true
+        Sigma_2D = Sigma_2D_physical / (1.0**2)
 
         det_sigma = jnp.maximum(
             Sigma_2D[0, 0] * Sigma_2D[1, 1] - Sigma_2D[0, 1] ** 2, 1e-6
@@ -1312,6 +1314,7 @@ def optimize_global_crystal(
             dcs,
             P_mats,
             distances,
+            R_mats,
             patches.shape[-1],
             fit_mosaicity=fit_mosaicity,
         )
@@ -1928,6 +1931,7 @@ def integrate_peaks_rbf_ssn(
     bw = max(border_width, 5)
 
     all_P_mats = []
+    all_R_mats = []
     all_distances = []
 
     for idx, img_key in enumerate(meta_keys):
@@ -1960,8 +1964,10 @@ def integrate_peaks_rbf_ssn(
         # The Ultimate Projection Matrix
         P_final = S_pix @ P_ortho @ Skew
         all_P_mats.append(P_final)
+        all_R_mats.append(current_R if current_R is not None else np.eye(3))
 
     all_P_mats = np.array(all_P_mats)
+    all_R_mats = np.array(all_R_mats)
     all_distances = np.array(all_distances)
 
     # 2. Identify the Top 500 strongest peaks (Proxy)
@@ -2023,6 +2029,8 @@ def integrate_peaks_rbf_ssn(
         all_cov_uv = np.zeros(len(all_rs), dtype=np.float32)
     else:
         # 4. Run the Global Optimizer
+        opt_Rmats = [all_R_mats[idx] for idx in top_indices if bw < int(round(all_rs[idx])) < H - bw and bw < int(round(all_cs[idx])) < W - bw]
+
         res_x = optimize_global_crystal(
             jnp.array(opt_patches),
             jnp.array(opt_bgs),
@@ -2042,16 +2050,17 @@ def integrate_peaks_rbf_ssn(
             Sigma_eta_jnp = jnp.zeros((3, 3))
 
         @jit
-        def project_all_shapes(P_mats, dists):
-            def project_one(P, D_i):
-                Sigma_total = Sigma_shape_jnp + (D_i**2) * Sigma_eta_jnp
-                # P is already scaled by S_pix, so output is perfectly in Pixels^2
+        def project_all_shapes(P_mats, dists, R_mats):
+            def project_one(P, D_i, R_gonio):
+                # Rotate to Lab Frame before projecting
+                Sigma_shape_lab = R_gonio @ Sigma_shape_jnp @ R_gonio.T
+                Sigma_total = Sigma_shape_lab + (D_i**2) * Sigma_eta_jnp
                 return P @ Sigma_total @ P.T
 
-            return vmap(project_one)(P_mats, dists)
+            return vmap(project_one)(P_mats, dists, R_mats)
 
         all_Sigma_2D = project_all_shapes(
-            jnp.array(all_P_mats), jnp.array(all_distances)
+            jnp.array(all_P_mats), jnp.array(all_distances), jnp.array(all_R_mats)
         )
 
         all_var_u = np.array(all_Sigma_2D[:, 0, 0])
