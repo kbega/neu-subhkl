@@ -74,7 +74,7 @@ def run_index(
     refine_goniometer: bool = False,
     refine_goniometer_axes: list[str] | None = None,
     goniometer_bound_deg: float | list[float] | np.ndarray = 5.0,
-    refine_sample: bool = False,
+    refine_goniometer_trans: bool = False,
     sample_bound_meters: float = 0.005,
     refine_beam: bool = False,
     beam_bound_deg: float = 1.0,
@@ -393,8 +393,9 @@ def run_index(
         print("ORIENTATION LOCKED: U Matrix will not be refined.")
     if refine_lattice:
         print(f"Refining lattice parameters with {lattice_bound_frac * 100}% bounds.")
-    if refine_sample:
-        print(f"Refining sample offset with {1000 * sample_bound_meters} mm bounds.")
+    if refine_goniometer_rans:
+        num_axes = len(opt.goniometer_axes) if opt.goniometer_axes is not None else 1
+        print(f"Refining per-axis goniometer translations ({num_axes} axes) with {1000 * sample_bound_meters} mm bounds.")
     if refine_beam:
         print(f"Refining beam tilt with {beam_bound_deg}° bounds.")
 
@@ -541,7 +542,7 @@ def run_index(
         refine_goniometer=refine_goniometer,
         refine_goniometer_axes=refine_goniometer_axes,
         goniometer_names=goniometer_names,
-        refine_sample=refine_sample,
+        refine_sample=refine_goniometer_trans,
         sample_bound_meters=sample_bound_meters,
         refine_beam=refine_beam,
         beam_bound_deg=beam_bound_deg,
@@ -649,7 +650,7 @@ def run_index(
             "no_index": opt.no_index,
             "refine_lattice": refine_lattice,
             "refine_goniometer": refine_goniometer,
-            "refine_sample": refine_sample,
+            "refine_goniometer_trans": refine_goniometer_trans,
             "refine_beam": refine_beam,
             "refine_detector": refine_detector,
             "detector_modes": detector_modes,

@@ -319,7 +319,7 @@ def indexer(
         refine_goniometer=refine_goniometer,
         refine_goniometer_axes=gonio_axes_parsed,
         goniometer_bound_deg=gonio_bounds_parsed,
-        refine_sample=refine_sample,
+        refine_goniometer_trans=refine_goniometer_trans,
         sample_bound_meters=sample_bound_meters,
         refine_beam=refine_beam,
         beam_bound_deg=beam_bound_deg,
