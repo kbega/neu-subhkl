@@ -302,6 +302,10 @@ class VectorizedObjective:
                 else np.ones(self.num_motors, dtype=bool)
             )
             self.num_active_gonio = np.sum(self.gonio_mask)
+
+            self.gonio_trans_mask = self.gonio_mask[self.motor_map]
+            self.num_active_trans = np.sum(self.gonio_trans_mask)
+
             self.gonio_nominal_offsets = (
                 jnp.array(goniometer_nominal_offsets)
                 if goniometer_nominal_offsets is not None
@@ -310,6 +314,8 @@ class VectorizedObjective:
         else:
             self.gonio_axes = None
             self.num_gonio_axes = 0
+            self.num_active_trans = 1
+            self.gonio_trans_mask = np.ones(1, dtype=bool)
             self.num_motors = 0
 
         self.refine_gonio_trans = refine_sample
@@ -560,8 +566,15 @@ class VectorizedObjective:
 
         num_trans = max(1, self.num_gonio_axes)
         if self.refine_gonio_trans:
-            t_norm = x[:, idx : idx + num_trans * 3].reshape(-1, num_trans, 3)
-            idx += num_trans * 3
+            # Only extract active translation parameters
+            num_active = self.num_active_trans
+            t_norm_active = x[:, idx : idx + num_active * 3].reshape(-1, num_active, 3)
+            idx += num_active * 3
+
+            # Scatter active parameters into a full (S, num_trans, 3) zero array
+            t_norm = jnp.zeros((x.shape[0], num_trans, 3))
+            t_norm = t_norm.at[:, self.gonio_trans_mask, :].set(t_norm_active)
+
             t_delta = _forward_map_param(t_norm, self.gonio_trans_bound)
             t_axes = self.gonio_trans_nominal[None, :, :] + t_delta
         else:
@@ -1140,9 +1153,15 @@ class FindUB:
         if b_offset is not None:
             self.base_sample_offset = b_offset
         if refine_sample:
-            # We will use refine_sample for goniometer translations as well
-            num_trans = max(1, len(self.goniometer_axes)) if self.goniometer_axes is not None else 1
-            new_params.append(np.full(num_trans * 3, 0.5))
+            if refine_goniometer_axes is not None and self.goniometer_names is not None:
+                trans_mask = [
+                    any(req in name for req in refine_goniometer_axes)
+                    for name in self.goniometer_names
+                ]
+                new_params.append(np.full(sum(trans_mask) * 3, 0.5))
+            else:
+                num_trans = max(1, len(self.goniometer_axes)) if self.goniometer_axes is not None else 1
+                new_params.append(np.full(num_trans * 3, 0.5))
 
         if b_ki is not None:
             self.ki_vec = b_ki
@@ -1387,8 +1406,13 @@ class FindUB:
         if refine_lattice:
             num_dims += num_lattice_params
         if refine_sample and self.peak_xyz is not None:
-            num_trans = max(1, len(goniometer_axes)) if goniometer_axes is not None else 1
-            num_dims += num_trans * 3
+            if goniometer_refine_mask is not None and goniometer_axes is not None:
+                # motor_map exists here, map mask to axes
+                axis_mask = goniometer_refine_mask[motor_map]
+                num_dims += np.sum(axis_mask) * 3
+            else:
+                num_trans = max(1, len(goniometer_axes)) if goniometer_axes is not None else 1
+                num_dims += num_trans * 3
         if refine_beam and self.peak_xyz is not None:
             num_dims += 2
         if refine_goniometer:
