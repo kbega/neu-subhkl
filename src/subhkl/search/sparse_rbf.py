@@ -1292,7 +1292,7 @@ val_and_grad_fn = jit(
 
 
 def optimize_global_crystal(
-    patches, bgs, drs, dcs, P_mats, distances, fit_mosaicity=False
+    patches, bgs, drs, dcs, P_mats, distances, R_mats, fit_mosaicity=False
 ):
     # 1. Dynamically size the optimizer state based on the configuration
     if fit_mosaicity:
