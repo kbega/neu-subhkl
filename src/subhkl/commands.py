@@ -393,7 +393,7 @@ def run_index(
         print("ORIENTATION LOCKED: U Matrix will not be refined.")
     if refine_lattice:
         print(f"Refining lattice parameters with {lattice_bound_frac * 100}% bounds.")
-    if refine_goniometer_rans:
+    if refine_goniometer_trans:
         num_axes = len(opt.goniometer_axes) if opt.goniometer_axes is not None else 1
         print(f"Refining per-axis goniometer translations ({num_axes} axes) with {1000 * sample_bound_meters} mm bounds.")
     if refine_beam:
