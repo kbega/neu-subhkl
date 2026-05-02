@@ -268,6 +268,7 @@ def indexer(
         [float(x.strip()) for x in goniometer_bound_deg.split(",")]
         if goniometer_bound_deg
         else [5.0]
+    )
     det_banks_parsed = (
         [int(x.strip()) for x in refine_detector_banks.split(",")]
         if refine_detector_banks
