@@ -201,7 +201,7 @@ def indexer(
     goniometer_bound_deg: Annotated[
         str, typer.Option("--goniometer-bound-deg", help="Comma-separated bounds per axis or a single float")
     ] = "5.0",
-    refine_sample: Annotated[bool, typer.Option("--refine-sample")] = False,
+    refine_goniometer_trans: Annotated[bool, typer.Option("--refine-goniometer-trans")] = False,
     sample_bound_meters: Annotated[
         float, typer.Option("--sample-bound-meters")
     ] = 0.005,
