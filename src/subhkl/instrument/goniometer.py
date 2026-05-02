@@ -42,7 +42,6 @@ from dataclasses import dataclass, field
 from typing import Union, List
 from subhkl.config import reduction_settings
 
-
 def get_rotation_data_from_nexus(filename, instrument):
     settings = reduction_settings[instrument]
     axes, angles, names = [], [], []
@@ -70,7 +69,28 @@ def get_rotation_data_from_nexus(filename, instrument):
 
     return axes, angles, names
 
-import numpy as np
+def calc_goniometer_rotation_matrix(axes, angles):
+    """
+    Computes the cumulative rotation matrix R for reciprocal space transformations.
+    (Translations are ignored in momentum space).
+    """
+    R_cum = np.eye(3)
+    deg2rad = np.pi / 180.0
+
+    for i in range(len(axes)):
+        direction = axes[i][:3]
+        direction = direction / np.linalg.norm(direction)
+        theta = axes[i][3] * angles[i] * deg2rad
+
+        K = np.array([
+            [0, -direction[2], direction[1]],
+            [direction[2], 0, -direction[0]],
+            [-direction[1], direction[0], 0]
+        ])
+        R_i = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+        R_cum = R_cum @ R_i
+
+    return R_cum
 
 def sample_to_lab(p_sample, axes, angles, offsets):
     """
