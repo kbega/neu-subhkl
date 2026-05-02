@@ -2038,6 +2038,7 @@ def integrate_peaks_rbf_ssn(
             jnp.array(opt_dcs),
             jnp.array(opt_Pmats),
             jnp.array(opt_dists),
+            jnp.array(opt_Rmats),
             fit_mosaicity=fit_mosaicity,
         )
 
