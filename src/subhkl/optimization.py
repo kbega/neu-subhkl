@@ -310,7 +310,7 @@ class VectorizedObjective:
         self.lattice_system = lattice_system
         self.lattice_bound_frac = lattice_bound_frac
         self.refine_goniometer = refine_goniometer
-        self.goniometer_bound_deg = goniometer_bound_deg
+        self.goniometer_bound_deg = jnp.array(goniometer_bound_deg)
 
         if self.refine_lattice:
             self.cell_init = jnp.array(cell_params)
@@ -1203,7 +1203,7 @@ class FindUB:
         goniometer_axes: list | None = None,
         goniometer_angles: np.ndarray | None = None,
         refine_goniometer: bool = False,
-        goniometer_bound_deg: float = 5.0,
+        goniometer_bound_deg: float | list | np.ndarray = 5.0,
         goniometer_names: list | None = None,
         refine_goniometer_axes: list | None = None,
         refine_sample: bool = False,
@@ -1317,15 +1317,34 @@ class FindUB:
                 motor_map = list(range(len(goniometer_axes)))
                 unique_motors = [f"axis_{i}" for i in range(len(goniometer_axes))]
 
+        # Ensure bounds is a structured list
+        if isinstance(goniometer_bound_deg, (int, float)):
+            gonio_bounds_list = [float(goniometer_bound_deg)]
+        else:
+            gonio_bounds_list = list(goniometer_bound_deg)
+
+        # Initialize the global bounds array using the first value as a default fallback
+        bounds_array = np.full(
+            len(unique_motors), 
+            gonio_bounds_list[0] if gonio_bounds_list else 5.0
+        )
+
         goniometer_refine_mask = None
         if refine_goniometer and refine_goniometer_axes is not None:
-            mask = [
-                any(req in name for req in refine_goniometer_axes)
-                for name in unique_motors
-            ]
+            mask = [False] * len(unique_motors)
+            for i, name in enumerate(unique_motors):
+                for req_idx, req in enumerate(refine_goniometer_axes):
+                    if req in name:
+                        mask[i] = True
+                        # If a 1:1 list of bounds was provided, map it to the corresponding axis
+                        if len(gonio_bounds_list) == len(refine_goniometer_axes):
+                            bounds_array[i] = gonio_bounds_list[req_idx]
             goniometer_refine_mask = np.array(mask, dtype=bool)
         elif refine_goniometer:
             goniometer_refine_mask = np.ones(len(unique_motors), dtype=bool)
+            # If they provided exactly enough bounds for all physical motors, map them directly
+            if len(gonio_bounds_list) == len(unique_motors):
+                bounds_array = np.array(gonio_bounds_list)
 
         cell_params_init = np.array(
             [self.a, self.b, self.c, self.alpha, self.beta, self.gamma]
@@ -1356,7 +1375,7 @@ class FindUB:
             refine_goniometer=refine_goniometer,
             goniometer_refine_mask=goniometer_refine_mask,
             goniometer_nominal_offsets=self.base_gonio_offset,
-            goniometer_bound_deg=goniometer_bound_deg,
+            goniometer_bound_deg=bounds_array,
             refine_sample=refine_sample,
             sample_bound_meters=sample_bound_meters,
             sample_nominal=self.base_sample_offset,

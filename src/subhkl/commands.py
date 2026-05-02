@@ -73,7 +73,7 @@ def run_index(
     lattice_bound_frac: float = 0.05,
     refine_goniometer: bool = False,
     refine_goniometer_axes: list[str] | None = None,
-    goniometer_bound_deg: float = 5.0,
+    goniometer_bound_deg: float | list[float] | np.ndarray = 5.0,
     refine_sample: bool = False,
     sample_bound_meters: float = 0.005,
     refine_beam: bool = False,

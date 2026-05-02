@@ -199,8 +199,8 @@ def indexer(
         str | None, typer.Option("--refine-goniometer-axes")
     ] = None,
     goniometer_bound_deg: Annotated[
-        float, typer.Option("--goniometer-bound-deg")
-    ] = 5.0,
+        str, typer.Option("--goniometer-bound-deg", help="Comma-separated bounds per axis or a single float")
+    ] = "5.0",
     refine_sample: Annotated[bool, typer.Option("--refine-sample")] = False,
     sample_bound_meters: Annotated[
         float, typer.Option("--sample-bound-meters")
@@ -264,6 +264,10 @@ def indexer(
         if refine_goniometer_axes
         else None
     )
+    gonio_bounds_parsed = (
+        [float(x.strip()) for x in goniometer_bound_deg.split(",")]
+        if goniometer_bound_deg
+        else [5.0]
     det_banks_parsed = (
         [int(x.strip()) for x in refine_detector_banks.split(",")]
         if refine_detector_banks
@@ -313,7 +317,7 @@ def indexer(
         lattice_bound_frac=lattice_bound_frac,
         refine_goniometer=refine_goniometer,
         refine_goniometer_axes=gonio_axes_parsed,
-        goniometer_bound_deg=goniometer_bound_deg,
+        goniometer_bound_deg=gonio_bounds_parsed,
         refine_sample=refine_sample,
         sample_bound_meters=sample_bound_meters,
         refine_beam=refine_beam,
