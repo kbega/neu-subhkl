@@ -1232,10 +1232,10 @@ def build_3d_cov(params):
 
 @partial(jit, static_argnames=["patch_size", "fit_mosaicity"])
 def global_shape_objective(
-    params, patches, bgs, drs, dcs, P_mats, distances, patch_size, fit_mosaicity
+    params, patches, bgs, drs, dcs, P_mats, distances, R_mats, patch_size, fit_mosaicity
 ):
     # 1. Build the crystal shape tensor
-    Sigma_shape = build_3d_cov(params[:6])
+    Sigma_shape_sample = build_3d_cov(params[:6])
 
     # 2. Handle the optional Mosaicity Tensor
     if fit_mosaicity:
@@ -1247,15 +1247,16 @@ def global_shape_objective(
 
     yy, xx = jnp.indices((patch_size, patch_size))
 
-    def fit_one_peak(patch, bg, dr, dc, P_true, D_i):
-        # 3. Add the tensors. If fit_mosaicity is False, D_i * 0 = 0.
+    def fit_one_peak(patch, bg, dr, dc, P_true, D_i, R_gonio):
+        # 3. Rotate Crystal Shape to the Lab Frame
         Sigma_shape_lab = R_gonio @ Sigma_shape_sample @ R_gonio.T
 
+        # 4. Add the tensors. If fit_mosaicity is False, D_i * 0 = 0.
         Sigma_total_3D = Sigma_shape_lab + (D_i**2) * Sigma_eta_base
 
-        # 4. Exact 2D Projection and Pixel Conversion
+        # 5. Exact 2D Projection and Pixel Conversion
         Sigma_2D_physical = P_true @ Sigma_total_3D @ P_true.T
-        Sigma_2D = Sigma_2D_physical / (1.0**2)
+        Sigma_2D = Sigma_2D_physical / (1.0**2)  # assuming 1.0mm pitch in P_true
 
         det_sigma = jnp.maximum(
             Sigma_2D[0, 0] * Sigma_2D[1, 1] - Sigma_2D[0, 1] ** 2, 1e-6
@@ -1280,16 +1281,14 @@ def global_shape_objective(
         residual = y_sub - amp * template
         return jnp.sum(residual**2)
 
-    mses = vmap(fit_one_peak)(patches, bgs, drs, dcs, P_mats, distances)
+    mses = vmap(fit_one_peak)(patches, bgs, drs, dcs, P_mats, distances, R_mats)
     return jnp.mean(mses)
-
 
 # Bind the val_and_grad wrapper to recognize the new static argument
 val_and_grad_fn = jit(
     jax.value_and_grad(global_shape_objective),
     static_argnames=["patch_size", "fit_mosaicity"],
 )
-
 
 def optimize_global_crystal(
     patches, bgs, drs, dcs, P_mats, distances, R_mats, fit_mosaicity=False
