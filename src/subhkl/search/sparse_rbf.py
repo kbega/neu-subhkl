@@ -1254,14 +1254,18 @@ def global_shape_objective(
         Sigma_2D_physical = P_true @ Sigma_total_3D @ P_true.T
         Sigma_2D = Sigma_2D_physical / (1.0**2)  # assuming 1.0mm pitch in P_true
 
-        det_sigma = jnp.maximum(
-            Sigma_2D[0, 0] * Sigma_2D[1, 1] - Sigma_2D[0, 1] ** 2, 1e-6
-        )
-        a = Sigma_2D[1, 1] / det_sigma
-        b = -Sigma_2D[0, 1] / det_sigma
-        c = Sigma_2D[0, 0] / det_sigma
+        var_r = jnp.maximum(Sigma_2D[0, 0], 1e-6)
+        var_c = jnp.maximum(Sigma_2D[1, 1], 1e-6)
+        
+        max_cov = jnp.sqrt(var_r * var_c) * 0.999
+        cov_rc = jnp.clip(Sigma_2D[0, 1], -max_cov, max_cov)
 
-        # dr and dc are the exact distance grids
+        det_sigma = var_r * var_c - cov_rc**2
+        
+        a = var_c / det_sigma
+        b = -cov_rc / det_sigma
+        c = var_r / det_sigma
+
         dr_grid = dr
         dc_grid = dc
 
@@ -2010,7 +2014,8 @@ def integrate_peaks_rbf_ssn(
 
         # The Central Projection Skew Matrix
         cos_alpha = np.dot(k_f_hat, n_det_hat)
-        cos_alpha = np.sign(cos_alpha) * max(abs(cos_alpha), 0.01)
+        ca_sign = 1.0 if cos_alpha >= 0 else -1.0
+        cos_alpha = ca_sign * max(abs(cos_alpha), 0.01)
         Skew = np.eye(3) - np.outer(k_f_hat, n_det_hat) / cos_alpha
 
         # Pixel Pitch Scaling Matrix
