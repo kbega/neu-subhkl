@@ -338,6 +338,7 @@ def indexer(
         detector_global_rot_axis=global_rot_axis_parsed,
         detector_global_trans_bound_meters=detector_global_trans_bound_meters,
         detector_radial_bound_frac=detector_radial_bound_frac,
+        detector_area_bound_frac=detector_area_bound_frac,
         cylinder_axis=cylinder_axis,
         bootstrap_filename=bootstrap_filename,
         batch_size=batch_size,
