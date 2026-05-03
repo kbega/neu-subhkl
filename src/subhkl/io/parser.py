@@ -251,7 +251,6 @@ def indexer(
     detector_radial_bound_frac: Annotated[
         float, typer.Option("--detector-radial-bound-frac")
     ] = 0.05,
-    detector_area_bound_frac=detector_area_bound_frac,
     bootstrap_filename: Annotated[str | None, typer.Option("--bootstrap")] = None,
     batch_size: Annotated[int | None, typer.Option("--batch-size")] = None,
     num_candidates: Annotated[
