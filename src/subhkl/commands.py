@@ -75,7 +75,7 @@ def run_index(
     refine_goniometer_axes: list[str] | None = None,
     goniometer_bound_deg: float | list[float] | np.ndarray = 5.0,
     refine_goniometer_trans: bool = False,
-    sample_bound_meters: float = 0.005,
+    goniometer_trans_bound_meters: float | list[float] | np.ndarray = 0.005,
     refine_beam: bool = False,
     beam_bound_deg: float = 1.0,
     refine_detector: bool = False,
@@ -394,8 +394,8 @@ def run_index(
     if refine_lattice:
         print(f"Refining lattice parameters with {lattice_bound_frac * 100}% bounds.")
     if refine_goniometer_trans:
-        num_axes = len(opt.goniometer_axes) if opt.goniometer_axes is not None else 1
-        print(f"Refining per-axis goniometer translations ({num_axes} axes) with {1000 * sample_bound_meters} mm bounds.")
+    num_axes = len(opt.goniometer_axes) if opt.goniometer_axes is not None else 1
+        print(f"Refining per-axis goniometer translations ({num_axes} axes) with bounds: {goniometer_trans_bound_meters} m.")
     if refine_beam:
         print(f"Refining beam tilt with {beam_bound_deg}° bounds.")
 
@@ -543,7 +543,7 @@ def run_index(
         refine_goniometer_axes=refine_goniometer_axes,
         goniometer_names=goniometer_names,
         refine_sample=refine_goniometer_trans,
-        sample_bound_meters=sample_bound_meters,
+        goniometer_trans_bound_meters=goniometer_trans_bound_meters,
         refine_beam=refine_beam,
         beam_bound_deg=beam_bound_deg,
         batch_size=batch_size,

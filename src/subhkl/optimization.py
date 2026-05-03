@@ -208,7 +208,7 @@ class VectorizedObjective:
         goniometer_refine_mask=None,
         goniometer_nominal_offsets=None,
         refine_sample=False,
-        sample_bound_meters=0.002,
+        goniometer_trans_bound_meters=0.005,
         sample_nominal=None,
         refine_beam=False,
         beam_bound_deg=1.0,
@@ -305,6 +305,13 @@ class VectorizedObjective:
 
             self.gonio_trans_mask = self.gonio_mask[self.motor_map]
             self.num_active_trans = np.sum(self.gonio_trans_mask)
+
+            raw_trans_bounds = jnp.array(goniometer_trans_bound_meters)
+            if raw_trans_bounds.ndim == 1 and raw_trans_bounds.size == self.num_motors:
+                # Shape becomes (Num_Active_Motors, 1) to broadcast over XYZ
+                self.gonio_trans_bound = raw_trans_bounds[self.gonio_trans_mask][:, None]
+            else:
+                self.gonio_trans_bound = raw_trans_bounds
 
             self.gonio_nominal_offsets = (
                 jnp.array(goniometer_nominal_offsets)
@@ -571,11 +578,10 @@ class VectorizedObjective:
             t_norm_active = x[:, idx : idx + num_active * 3].reshape(-1, num_active, 3)
             idx += num_active * 3
 
+            t_delta_active = _forward_map_param(t_norm_active, self.gonio_trans_bound)
             # Scatter active parameters into a full (S, num_trans, 3) zero array
-            t_norm = jnp.zeros((x.shape[0], num_trans, 3))
-            t_norm = t_norm.at[:, self.gonio_trans_mask, :].set(t_norm_active)
-
-            t_delta = _forward_map_param(t_norm, self.gonio_trans_bound)
+            t_delta = jnp.zeros((x.shape[0], num_trans, 3))
+            t_delta = t_delta.at[:, self.gonio_trans_mask, :].set(t_delta_active)
             t_axes = self.gonio_trans_nominal[None, :, :] + t_delta
         else:
             t_axes = self.gonio_trans_nominal[None, :, :].repeat(x.shape[0], axis=0)
@@ -1212,7 +1218,7 @@ class FindUB:
         goniometer_names: list | None = None,
         refine_goniometer_axes: list | None = None,
         refine_sample: bool = False,
-        sample_bound_meters: float = 2.0,
+        goniometer_trans_bound_meters: float | list | np.ndarray = 0.005,
         refine_beam: bool = False,
         beam_bound_deg: float = 1.0,
         batch_size: int | None = None,
@@ -1351,6 +1357,27 @@ class FindUB:
             if len(gonio_bounds_list) == len(unique_motors):
                 bounds_array = np.array(gonio_bounds_list)
 
+        # --- NEW: Map translation bounds to active axes ---
+        if isinstance(goniometer_trans_bound_meters, (int, float)):
+            gonio_trans_bounds_list = [float(goniometer_trans_bound_meters)]
+        else:
+            gonio_trans_bounds_list = list(goniometer_trans_bound_meters)
+
+        bounds_array_trans = np.full(
+            len(unique_motors), 
+            gonio_trans_bounds_list[0] if gonio_trans_bounds_list else 0.005
+        )
+
+        if refine_sample and refine_goniometer_axes is not None:
+            for i, name in enumerate(unique_motors):
+                for req_idx, req in enumerate(refine_goniometer_axes):
+                    if req in name:
+                        if len(gonio_trans_bounds_list) == len(refine_goniometer_axes):
+                            bounds_array_trans[i] = gonio_trans_bounds_list[req_idx]
+        elif refine_sample:
+            if len(gonio_trans_bounds_list) == len(unique_motors):
+                bounds_array_trans = np.array(gonio_trans_bounds_list)
+
         cell_params_init = np.array(
             [self.a, self.b, self.c, self.alpha, self.beta, self.gamma]
         )
@@ -1381,7 +1408,7 @@ class FindUB:
             goniometer_refine_mask=goniometer_refine_mask,
             goniometer_nominal_offsets=self.base_gonio_offset,
             goniometer_bound_deg=bounds_array,
-            refine_sample=refine_sample,
+            goniometer_trans_bound_meters=bounds_array_trans,
             sample_bound_meters=sample_bound_meters,
             sample_nominal=self.base_sample_offset,
             refine_beam=refine_beam,

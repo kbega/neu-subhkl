@@ -202,9 +202,9 @@ def indexer(
         str, typer.Option("--goniometer-bound-deg", help="Comma-separated bounds per axis or a single float")
     ] = "5.0",
     refine_goniometer_trans: Annotated[bool, typer.Option("--refine-goniometer-trans")] = False,
-    sample_bound_meters: Annotated[
-        float, typer.Option("--sample-bound-meters")
-    ] = 0.005,
+    goniometer_trans_bound_meters: Annotated[
+        str, typer.Option("--goniometer-trans-bound-meters", help="Comma-separated translation bounds per axis (meters) or a single float")
+    ] = "0.005",
     refine_beam: Annotated[bool, typer.Option("--refine-beam")] = False,
     beam_bound_deg: Annotated[float, typer.Option("--beam-bound-deg")] = 1.0,
     refine_detector: Annotated[bool, typer.Option("--refine-detector")] = False,
@@ -269,6 +269,11 @@ def indexer(
         if goniometer_bound_deg
         else [5.0]
     )
+    gonio_trans_bounds_parsed = (
+        [float(x.strip()) for x in goniometer_trans_bound_meters.split(",")]
+        if goniometer_trans_bound_meters
+        else [0.005]
+    )
     det_banks_parsed = (
         [int(x.strip()) for x in refine_detector_banks.split(",")]
         if refine_detector_banks
@@ -320,7 +325,7 @@ def indexer(
         refine_goniometer_axes=gonio_axes_parsed,
         goniometer_bound_deg=gonio_bounds_parsed,
         refine_goniometer_trans=refine_goniometer_trans,
-        sample_bound_meters=sample_bound_meters,
+        goniometer_trans_bound_meters=gonio_trans_bounds_parsed,
         refine_beam=refine_beam,
         beam_bound_deg=beam_bound_deg,
         refine_detector=refine_detector,
