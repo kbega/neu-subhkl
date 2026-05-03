@@ -42,8 +42,8 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
                         "vhat"
                     ][()].tolist()
                     if "width" in calib_grp[bank_key] and "height" in calib_grp[bank_key]:
-                        beamlines[instrument][bank_id]["width"] = float(calib_grp[b_key]["width"][()])
-                        beamlines[instrument][bank_id]["height"] = float(calib_grp[b_key]["height"][()])
+                        beamlines[instrument][bank_id]["width"] = float(calib_grp[bank_key]["width"][()])
+                        beamlines[instrument][bank_id]["height"] = float(calib_grp[bank_key]["height"][()])
                     count += 1
             if count > 0:
                 print(f"Successfully applied calibration to {count} detector panels.")
