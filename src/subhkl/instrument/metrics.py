@@ -140,6 +140,9 @@ def extract_xyz_from_file(file_path, instrument=None):
                         det.center = calibration_dict[bank_str]["center"]
                         det.uhat = calibration_dict[bank_str]["uhat"]
                         det.vhat = calibration_dict[bank_str]["vhat"]
+                        if "width" in calibration_dict[bank_str]:
+                            det.width = calibration_dict[bank_str]["width"]
+                            det.height = calibration_dict[bank_str]["height"]
 
                     xyz = det.pixel_to_lab(i_p, j_p)
                     if xyz.ndim == 1:
