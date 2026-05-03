@@ -1318,19 +1318,22 @@ def optimize_global_crystal(
         grad_opt = np.array(grad_phys, dtype=np.float64) * scales
         return np.array(val, dtype=np.float64), grad_opt
 
-    bounds = []
-    # 1. Physical radii bounds (e.g., max 3.0 mm to prevent depth-of-field explosion)
-    max_radius_mm = 3.0 
-    for i in range(3):
-        bounds.append((1e-4, max_radius_mm / scales[i]))
-        
-    # 2. Off-diagonals (unconstrained bounds)
-    for i in range(3, 6):
-        bounds.append((None, None))
-        
-    # 3. Mosaicity bound (if active, e.g., max 10 mrad)
+    bounds = [(None, None)] * (7 if fit_mosaicity else 6)
+
+    # 1. Physical bounds (in METERS). 3.0 mm = 0.003 meters.
+    max_radius_meters = 0.003 
+
+    # 2. Diagonals (Indices 0, 2, 5) -> Must be positive, capped at max radius
+    for idx in [0, 2, 5]:
+        bounds[idx] = (1e-6, max_radius_meters / scales[idx])
+
+    # 3. Off-diagonals (Indices 1, 3, 4) -> Symmetric bounds to prevent extreme skew
+    for idx in [1, 3, 4]:
+        bounds[idx] = (-max_radius_meters / scales[idx], max_radius_meters / scales[idx])
+
+    # 4. Mosaicity bound (if active, e.g., max 10 mrad = 0.010 rad)
     if fit_mosaicity:
-        bounds.append((1e-6, 0.010 / scales[6]))
+        bounds[6] = (1e-6, 0.010 / scales[6])
 
     x0_opt = x0_phys / scales
     res = scipy.optimize.minimize(
