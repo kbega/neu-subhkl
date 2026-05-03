@@ -2080,9 +2080,6 @@ def integrate_peaks_rbf_ssn(
         all_var_v = np.full(len(all_rs), integrator.nominal_sigma**2, dtype=np.float32)
         all_cov_uv = np.zeros(len(all_rs), dtype=np.float32)
     else:
-        # 4. Run the Global Optimizer
-        opt_Rmats = [all_R_mats[idx] for idx in top_indices if bw < int(round(all_rs[idx])) < H - bw and bw < int(round(all_cs[idx])) < W - bw]
-
         res_x = optimize_global_crystal(
             jnp.array(opt_patches),
             jnp.array(opt_bgs),
