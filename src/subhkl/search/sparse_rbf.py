@@ -2019,7 +2019,7 @@ def integrate_peaks_rbf_ssn(
         [],
         [],
     )
-    opt_R_mats = []
+    opt_Rmats = []
 
     if show_progress:
         print(f"  > 3D Tensor Optimization: Using ALL {len(frames)} peaks.")
@@ -2035,7 +2035,7 @@ def integrate_peaks_rbf_ssn(
         # Use the mathematically correct Oblique matrices accumulated in Phase 1
         opt_Pmats.append(all_P_mats[idx])
         opt_dists.append(all_distances[idx])
-        opt_R_mats.append(all_R_mats[idx])
+        opt_Rmats.append(all_R_mats[idx])
 
         ri, ci = int(round(r)) + opt_P, int(round(c)) + opt_P
 
