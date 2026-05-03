@@ -1833,22 +1833,26 @@ def integrate_peaks_rbf_ssn(
     def get_s_lab_for_img(img_key_str, run_id):
         # 1. Use exact dynamic kinematics if available
         if gonio_axes is not None and gonio_angles is not None:
-            # Safely get the angle frame
-            ang = gonio_angles[run_id] if len(gonio_angles) > run_id else gonio_angles[0]
+            if gonio_angles.ndim == 2:
+                ang = gonio_angles[:, run_id] if run_id < gonio_angles.shape[1] else gonio_angles[:, 0]
+            else:
+                ang = gonio_angles
 
             # Map legacy 1D offset into the full multi-axis array
             offsets = sample_offset
             if offsets is not None and offsets.ndim == 1:
-                offsets = np.zeros((len(gonio_axes), 3))
-                offsets[-1] = sample_offset
+                offsets_full = np.zeros((len(gonio_axes), 3))
+                offsets_full[-1] = offsets
             elif offsets is None:
-                offsets = np.zeros((len(gonio_axes), 3))
+                offsets_full = np.zeros((len(gonio_axes), 3))
+            else:
+                offsets_full = offsets
 
-            return sample_to_lab(np.array([0.0, 0.0, 0.0]), gonio_axes, ang, offsets)
+            return sample_to_lab(np.array([0.0, 0.0, 0.0]), gonio_axes, ang, offsets_full)
 
         # 2. Legacy fallback
         R_val = get_R_for_img(img_key_str)
-        s_off = sample_offset if sample_offset.ndim == 1 else sample_offset[-1]
+        s_off = sample_offset if sample_offset is not None and sample_offset.ndim == 1 else (sample_offset[-1] if sample_offset is not None else np.zeros(3))
         return R_val @ s_off if R_val is not None else s_off
 
     # --- PHASE 1: GATHER AND BATCH ---

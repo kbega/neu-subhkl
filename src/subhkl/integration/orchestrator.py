@@ -242,8 +242,9 @@ def prepare_predict_tasks(
         # 3. Extract single goniometer angle state
         angles_bank = None
         if gonio_angles is not None:
+            # --- FIX: Slice the column [:, run_id] ---
             if gonio_angles.ndim == 2:
-                angles_bank = gonio_angles[run_id] if run_id < len(gonio_angles) else gonio_angles[0]
+                angles_bank = gonio_angles[:, run_id] if run_id < gonio_angles.shape[1] else gonio_angles[:, 0]
             else:
                 angles_bank = gonio_angles
 

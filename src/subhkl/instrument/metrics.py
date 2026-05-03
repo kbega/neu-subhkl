@@ -355,7 +355,14 @@ def compute_metrics(
         else:
             RUB = R_all @ UB
 
-        gonio_angles_mapped = gonio_angles[run_index]
+        if gonio_angles is not None:
+            if gonio_angles.ndim == 2:
+                # Extract (N_axes, N_peaks) and transpose to (N_peaks, N_axes)
+                gonio_angles_mapped = gonio_angles[:, run_index].T
+            else:
+                gonio_angles_mapped = gonio_angles
+        else:
+            gonio_angles_mapped = None
 
         d_err, ang_err = calculate_angular_error(
             xyz_det, h, k, l, lam, RUB, sample_offset, ki_vec, R_all,
