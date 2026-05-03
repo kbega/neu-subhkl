@@ -1448,6 +1448,7 @@ class FindUB:
             goniometer_trans_bound_meters=bounds_array_trans,
             sample_nominal=self.base_sample_offset,
             refine_beam=refine_beam,
+            refine_sample=refine_sample,
             beam_bound_deg=beam_bound_deg,
             beam_nominal=self.ki_vec,
             static_R=static_R_input,
