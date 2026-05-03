@@ -104,7 +104,6 @@ class SparseRBFPeakFinder:
         gamma: float = 2.0,
         min_sigma: float = 0.5,
         max_sigma: float = 8.0,
-        max_peaks: int = 500,
         chunk_size: int = 128,
         loss: str = "gaussian",
         border_width: int = 0,
@@ -118,7 +117,6 @@ class SparseRBFPeakFinder:
         self.ref_sigma = 1.0  # [Pixel^0.5]
         self.min_sigma = min_sigma  # [Pixel^0.5]
         self.max_sigma = max_sigma  # [Pixel^0.5]
-        self.max_peaks = max_peaks  # [-]
         self.chunk_size = chunk_size  # [-]
         self.loss = loss  # [-]
         self.border_width = border_width  # [Pixel^0.5]
@@ -1763,7 +1761,6 @@ def integrate_peaks_rbf_ssn(
     sigmas: List[float],
     alpha: float,
     gamma: float,
-    max_peaks: int,
     show_progress: bool,
     all_R: np.ndarray = None,
     sample_offset: np.ndarray = None,
@@ -1999,7 +1996,7 @@ def integrate_peaks_rbf_ssn(
     all_R_mats = np.array(all_R_mats)
     all_distances = np.array(all_distances)
 
-    # 2. Identify the Top 500 strongest peaks (Proxy)
+    # 2. Identify peaks for the global shape optimizer
     P_proxy = 3
     pad_images = np.pad(
         images_batch, ((0, 0), (P_proxy, P_proxy), (P_proxy, P_proxy)), mode="reflect"
@@ -2011,33 +2008,59 @@ def integrate_peaks_rbf_ssn(
             np.sum(pad_images[f, ri - 1 : ri + 2, ci - 1 : ci + 2])
         )
 
-    top_indices = np.argsort(proxy_intensities)[-500:]
+    # 2. Extract exact patches for global optimization (USING ALL PEAKS)
+        opt_P = 15
+        opt_half = opt_P // 2
+        opt_patches, opt_bgs, opt_drs, opt_dcs, opt_Pmats, opt_dists = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        opt_R_mats = []
 
-    # 3. Extract exact patches
-    opt_P = 15
-    opt_half = opt_P // 2
-    opt_patches, opt_bgs, opt_drs, opt_dcs, opt_Pmats, opt_dists = (
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-    )
-    for idx in top_indices:
-        f, r, c = frames[idx], all_rs[idx], all_cs[idx]
-        ri, ci = int(round(r)), int(round(c))
+        if show_progress:
+            print(f"  > 3D Tensor Optimization: Using ALL {len(frames)} peaks.")
 
-        if bw < ri < H - bw and bw < ci < W - bw:
-            patch = images_batch[
-                f, ri - opt_half : ri + opt_half + 1, ci - opt_half : ci + opt_half + 1
-            ]
-            opt_patches.append(patch)
-            opt_bgs.append(np.median(patch))
-            opt_drs.append(r - (ri - opt_half))
-            opt_dcs.append(c - (ci - opt_half))
+        # Pad images once for the exact patch extraction
+        pad_images = np.pad(
+            images_batch, ((0, 0), (opt_P, opt_P), (opt_P, opt_P)), mode="reflect"
+        )
+
+        for idx in range(len(frames)):
+            f, r, c = frames[idx], all_rs[idx], all_cs[idx]
+
+            # Use the mathematically correct Oblique matrices accumulated in Phase 1
             opt_Pmats.append(all_P_mats[idx])
             opt_dists.append(all_distances[idx])
+            opt_R_mats.append(all_R_mats[idx])
+
+            ri, ci = int(round(r)) + opt_P, int(round(c)) + opt_P
+
+            # Bounding box bounds
+            r_min, r_max = ri - opt_half, ri + opt_half + 1
+            c_min, c_max = ci - opt_half, ci + opt_half + 1
+
+            patch = pad_images[f, r_min:r_max, c_min:c_max].astype(np.float32)
+
+            # Local background estimation (edges of the 15x15 patch)
+            bg_mask = np.ones_like(patch, dtype=bool)
+            bg_mask[2:-2, 2:-2] = False
+            bg = np.median(patch[bg_mask])
+
+            opt_patches.append(patch)
+            opt_bgs.append(bg)
+
+            # Sub-pixel grid shifts
+            rr, cc = np.meshgrid(
+                np.arange(r_min, r_max) - opt_P,
+                np.arange(c_min, c_max) - opt_P,
+                indexing="ij",
+            )
+            opt_drs.append(rr - r)
+            opt_dcs.append(cc - c)
 
     # We require at least 15 valid peaks to mathematically constrain a 6-parameter 3D tensor
     MIN_PEAKS_FOR_GLOBAL_FIT = 15

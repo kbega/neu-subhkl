@@ -92,7 +92,6 @@ def finder(
     sparse_rbf_gamma: float = 1.0,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
-    sparse_rbf_max_peaks: int = 500,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_loss: Annotated[
         str, typer.Option(help="Likelihood for peak finder.")
@@ -138,7 +137,6 @@ def finder(
         sparse_rbf_gamma=sparse_rbf_gamma,
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
-        sparse_rbf_max_peaks=sparse_rbf_max_peaks,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
         sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
@@ -377,12 +375,6 @@ def rbf_integrator(
             help="Whether to fit the mosaicity separately from sample dimensions to explain peak shape. Only use in non-spherical detector geometries."
         ),
     ] = False,
-    max_peaks: Annotated[
-        int,
-        typer.Option(
-            "--max-peaks", help="Maximum peaks per panel (used for JAX matrix padding)"
-        ),
-    ] = 500,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.0,
@@ -408,7 +400,6 @@ def rbf_integrator(
         nominal_sigma=nominal_sigma,
         anisotropic=anisotropic,
         fit_mosaicity=fit_mosaicity,
-        max_peaks=max_peaks,
         rel_border_width=rel_border_width,
         show_progress=show_progress,
         create_visualizations=create_visualizations,

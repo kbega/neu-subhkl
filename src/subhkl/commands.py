@@ -714,7 +714,6 @@ def run_finder(
     sparse_rbf_gamma: float = 1.0,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
-    sparse_rbf_max_peaks: int = 500,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
@@ -761,7 +760,6 @@ def run_finder(
                 "gamma": sparse_rbf_gamma,
                 "min_sigma": sparse_rbf_min_sigma,
                 "max_sigma": sparse_rbf_max_sigma,
-                "max_peaks": sparse_rbf_max_peaks,
                 "chunk_size": sparse_rbf_chunk_size,
                 "show_steps": show_steps,
                 "show_scale": "linear",
@@ -1054,7 +1052,6 @@ def run_rbf_integrator(
     nominal_sigma: float = 1.0,
     anisotropic: bool = False,
     fit_mosaicity: bool = False,
-    max_peaks: int = 500,
     rel_border_width: float = 0.0,
     show_progress: bool = True,
     create_visualizations: bool = False,
@@ -1069,7 +1066,7 @@ def run_rbf_integrator(
     sigma_list = [float(k.strip()) for k in sigmas.split(",")]
     print(f"Starting Dense Sparse RBF Integration on {filename}")
     print(
-        f"Parameters: Alpha={alpha}, Gamma={gamma}, Sigma={sigma_list}, Max Peaks Padding={max_peaks}"
+        f"Parameters: Alpha={alpha}, Gamma={gamma}, Sigma={sigma_list}"
     )
 
     peak_dict = {}
@@ -1120,7 +1117,6 @@ def run_rbf_integrator(
         sigmas=sigma_list,
         gamma=gamma,
         nominal_sigma=nominal_sigma,
-        max_peaks=max_peaks,
         show_progress=show_progress,
         all_R=all_R,  # Pass rotation and offset downstream
         sample_offset=sample_offset,
