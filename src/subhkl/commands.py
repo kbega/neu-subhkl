@@ -897,16 +897,22 @@ def run_peak_predictor(
         B = f_idx["sample/B"][()]
 
         offsets = None
-        if "optimization/goniometer_offsets" in f_idx:
-            off_data = f_idx["optimization/goniometer_offsets"]
+        off_data = f_idx.get("goniometer/offsets") or f_idx.get("optimization/goniometer_offsets")
+        if off_data is not None:
             if isinstance(off_data, h5py.Group):
                 offsets = {k: off_data[k][()] for k in off_data.keys()}
             else:
                 offsets = off_data[()]
 
-        sample_offset = (
-            f_idx["sample/offset"][()] if "sample/offset" in f_idx else np.zeros(3)
-        )
+        if "goniometer/translations" in f_idx:
+            sample_offset = f_idx["goniometer/translations"][()]
+        elif "sample/offset" in f_idx:
+            sample_offset = f_idx["sample/offset"][()]
+        else:
+            sample_offset = np.zeros(3)
+
+        gonio_axes = f_idx["goniometer/axes"][()] if "goniometer/axes" in f_idx else None
+
         ki_vec = (
             f_idx["beam/ki_vec"][()]
             if "beam/ki_vec" in f_idx
@@ -979,6 +985,8 @@ def run_peak_predictor(
         ki_vec=ki_vec,
         max_workers=max_workers,
         R_all=all_R,
+        gonio_axes=gonio_axes,
+        gonio_angles=angles_refined,
     )
 
     print(f"Saving predictions to {integration_peaks_filename}")
@@ -1070,8 +1078,8 @@ def run_rbf_integrator(
         if "goniometer/angles" in f:
             angles_stack = f["goniometer/angles"][()]
 
-        if "sample/offset" in f:
-            sample_offset = f["sample/offset"][()]
+        if "goniometer/translations" in f:
+            sample_offset = f["goniometer/translations"][()]
         else:
             sample_offset = np.zeros(3)
 
@@ -1115,6 +1123,8 @@ def run_rbf_integrator(
         create_visualizations=create_visualizations,
         file_prefix=filename,
         max_workers=max_workers,
+        gonio_axes=gonio_axes,
+        gonio_angles=angles_stack
     )
 
     print(f"Saving RBF integrated peaks to {output_filename}")
@@ -1141,7 +1151,7 @@ def run_rbf_integrator(
             "sample/space_group",
             "sample/U",
             "sample/B",
-            "sample/offset",
+            "goniometer/translations",
             "beam/ki_vec",
             "instrument/wavelength",
         ]
@@ -1188,7 +1198,7 @@ def run_integrator(
         B = f["sample/B"][()] if "sample/B" in f else None
         all_R = f["goniometer/R"][()] if "goniometer/R" in f else None
         angles_stack = f["goniometer/angles"][()] if "goniometer/angles" in f else None
-        sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
+        sample_offset = f["goniometer/translations"][()] if "goniometer/translations" in f else np.zeros(3)
         ki_vec = (
             f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
         )
@@ -1239,6 +1249,7 @@ def run_integrator(
         RUB=RUB,
         R_stack=all_R,
         angles_stack=angles_stack,
+        gonio_axes=gonio_axes,
         sample_offset=sample_offset,
         ki_vec=ki_vec,
         create_visualizations=create_visualizations,
@@ -1261,7 +1272,7 @@ def run_integrator(
         "sample/space_group",
         "sample/U",
         "sample/B",
-        "sample/offset",
+        "goniometer/translations",
         "beam/ki_vec",
         "instrument/wavelength",
     ]

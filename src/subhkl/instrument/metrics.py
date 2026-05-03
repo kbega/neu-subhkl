@@ -168,9 +168,13 @@ def compute_metrics(
             ub_helper.gamma = f["sample/gamma"][()]
             B_mat = ub_helper.reciprocal_lattice_B()
             U = f["sample/U"][()] if "sample/U" in f else np.eye(3)
-            sample_offset = (
-                f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
-            )
+            if "goniometer/translations" in f:
+                sample_offset = f["goniometer/translations"][()]
+            else:
+                sample_offset = np.zeros(3)
+
+            gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
+            gonio_angles = f["goniometer/angles"][()] if "goniometer/angles" in f else None
 
             if ki_vec_override is not None:
                 ki_vec = ki_vec_override
@@ -351,8 +355,12 @@ def compute_metrics(
         else:
             RUB = R_all @ UB
 
+        gonio_angles_mapped = gonio_angles[run_index]
+
         d_err, ang_err = calculate_angular_error(
-            xyz_det, h, k, l, lam, RUB, sample_offset, ki_vec, R_all
+            xyz_det, h, k, l, lam, RUB, sample_offset, ki_vec, R_all,
+            gonio_axes=gonio_axes,
+            gonio_angles=gonio_angles_mapped
         )
 
         result = {

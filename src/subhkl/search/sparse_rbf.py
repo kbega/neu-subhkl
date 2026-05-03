@@ -1776,6 +1776,8 @@ def integrate_peaks_rbf_ssn(
     create_visualizations: bool = False,
     file_prefix: str = None,
     max_workers: int = None,
+    gonio_axes: np.ndarray = None,
+    gonio_angles: np.ndarray = None,
 ):
     """
     Args:
@@ -1825,6 +1827,29 @@ def integrate_peaks_rbf_ssn(
     # Ensure the solver dictionary perfectly matches the provided list
     integrator.candidate_sigmas = jnp.array(sigmas, dtype=jnp.float32)
     integrator.show_steps = show_progress
+
+    from subhkl.instrument.goniometer import sample_to_lab
+
+    def get_s_lab_for_img(img_key_str, run_id):
+        # 1. Use exact dynamic kinematics if available
+        if gonio_axes is not None and gonio_angles is not None:
+            # Safely get the angle frame
+            ang = gonio_angles[run_id] if len(gonio_angles) > run_id else gonio_angles[0]
+
+            # Map legacy 1D offset into the full multi-axis array
+            offsets = sample_offset
+            if offsets is not None and offsets.ndim == 1:
+                offsets = np.zeros((len(gonio_axes), 3))
+                offsets[-1] = sample_offset
+            elif offsets is None:
+                offsets = np.zeros((len(gonio_axes), 3))
+
+            return sample_to_lab(np.array([0.0, 0.0, 0.0]), gonio_axes, ang, offsets)
+
+        # 2. Legacy fallback
+        R_val = get_R_for_img(img_key_str)
+        s_off = sample_offset if sample_offset.ndim == 1 else sample_offset[-1]
+        return R_val @ s_off if R_val is not None else s_off
 
     # --- PHASE 1: GATHER AND BATCH ---
     images_list = []
@@ -1880,12 +1905,7 @@ def integrate_peaks_rbf_ssn(
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = peaks_obj.image.get_run_id(img_key)
 
-        current_R_val = get_R_for_img(img_key)
-        s_lab = (
-            current_R_val @ sample_offset
-            if current_R_val is not None
-            else sample_offset
-        )
+        s_lab = get_s_lab_for_img(img_key, run_id)
 
         batch_rs = np.array([i_arr[d["rep_idx"]] for d in keep_data])
         batch_cs = np.array([j_arr[d["rep_idx"]] for d in keep_data])
@@ -1937,7 +1957,7 @@ def integrate_peaks_rbf_ssn(
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = frames[idx]
         current_R = get_R_for_img(img_key)
-        s_lab = current_R @ sample_offset if current_R is not None else sample_offset
+        s_lab = get_s_lab_for_img(img_key, run_id)
 
         pixel_xyz = det.pixel_to_lab(all_rs[idx], all_cs[idx])
         k_f = pixel_xyz - s_lab
@@ -2107,12 +2127,7 @@ def integrate_peaks_rbf_ssn(
         H, W = image_raw.shape
         bw = border_width
 
-        current_R_val = get_R_for_img(img_key)
-        s_lab = (
-            current_R_val @ sample_offset
-            if current_R_val is not None
-            else sample_offset
-        )
+        s_lab = get_s_lab_for_img(img_key, run_id)
 
         img_rs = [all_rs[idx] for idx in indices]
         img_cs = [all_cs[idx] for idx in indices]
