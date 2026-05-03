@@ -227,7 +227,10 @@ def prepare_predict_tasks(
 
         # 1. Extract single RUB
         if RUB.ndim == 3:
-            RUB_bank = RUB[run_id] if run_id < len(RUB) else RUB[0]
+            if len(RUB) == total_images:
+                RUB_bank = RUB[img_index]
+            else:
+                RUB_bank = RUB[run_id] if run_id < len(RUB) else RUB[0]
         else:
             RUB_bank = RUB
 
@@ -235,7 +238,10 @@ def prepare_predict_tasks(
         R_bank = None
         if R_all is not None:
             if R_all.ndim == 3:
-                R_bank = R_all[run_id] if run_id < len(R_all) else R_all[0]
+                if len(R_all) == total_images:
+                    R_bank = R_all[img_index]
+                else:
+                    R_bank = R_all[run_id] if run_id < len(R_all) else R_all[0]
             else:
                 R_bank = R_all
 
@@ -245,11 +251,17 @@ def prepare_predict_tasks(
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes) if gonio_axes is not None else 1
                 if gonio_angles.shape[1] == num_axes:
-                    # Shape is (N_runs, N_axes)
-                    angles_bank = gonio_angles[run_id, :] if run_id < gonio_angles.shape[0] else gonio_angles[0, :]
+                    # Shape is (N, N_axes)
+                    if gonio_angles.shape[0] == total_images:
+                        angles_bank = gonio_angles[img_index, :]
+                    else:
+                        angles_bank = gonio_angles[run_id, :] if run_id < gonio_angles.shape[0] else gonio_angles[0, :]
                 else:
-                    # Shape is (N_axes, N_runs)
-                    angles_bank = gonio_angles[:, run_id] if run_id < gonio_angles.shape[1] else gonio_angles[:, 0]
+                    # Shape is (N_axes, N)
+                    if gonio_angles.shape[1] == total_images:
+                        angles_bank = gonio_angles[:, img_index]
+                    else:
+                        angles_bank = gonio_angles[:, run_id] if run_id < gonio_angles.shape[1] else gonio_angles[:, 0]
             else:
                 angles_bank = gonio_angles
 
