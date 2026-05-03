@@ -90,6 +90,7 @@ def run_index(
     detector_global_rot_axis: list[float] | np.ndarray | None = None,
     detector_global_trans_bound_meters: float = 0.01,
     detector_radial_bound_frac: float = 0.05,
+    detector_area_bound_frac: float = 0.05,
     cylinder_axis: list[float] | np.ndarray | None = None,
     bootstrap_filename: str | None = None,
     batch_size: int | None = None,
