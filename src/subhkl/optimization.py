@@ -685,6 +685,11 @@ class VectorizedObjective:
                 scale_norm = det_params[:, slc]
                 scale = _forward_map_param(scale_norm, self.bounds["area"])
                 area_scale = scale
+
+                # Pin the physical center of the panel ---
+                # Shift the corner backwards to counteract the area expansion
+                c = c - (w / 2.0)[:, :, None] * scale[:, :, None] * u - (h / 2.0)[:, :, None] * scale[:, :, None] * v
+                
                 w = w * (1.0 + scale)
                 h = h * (1.0 + scale)
 
