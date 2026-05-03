@@ -1130,8 +1130,11 @@ class FindUB:
             )
             if "goniometer/translations" in f:
                 b_offset = f["goniometer/translations"][()]
+            elif "sample/offset" in f:
+                b_offset = f["sample/offset"][()]
             else:
                 b_offset = np.zeros(3)
+                
             b_ki = (
                 f["beam/ki_vec"][()]
                 if "beam/ki_vec" in f
@@ -1177,13 +1180,29 @@ class FindUB:
 
         if b_offset is not None:
             self.base_sample_offset = b_offset
+
+        # Build the 1:N motor-to-axis map exactly like minimize()
+        motor_map = []
+        unique_motors = []
+        if self.goniometer_names is not None:
+            for name in self.goniometer_names:
+                if name not in unique_motors:
+                    unique_motors.append(name)
+                motor_map.append(unique_motors.index(name))
+        elif self.goniometer_axes is not None:
+            motor_map = list(range(len(self.goniometer_axes)))
+            unique_motors = [f"axis_{i}" for i in range(len(self.goniometer_axes))]
+
         if refine_sample:
             if refine_goniometer_axes is not None and self.goniometer_names is not None:
-                trans_mask = [
+                # 1. Match requested axes against unique motors
+                motor_mask = [
                     any(req.lower() in name.lower() for req in refine_goniometer_axes)
-                    for name in self.goniometer_names
+                    for name in unique_motors
                 ]
-                new_params.append(np.full(sum(trans_mask) * 3, 0.5))
+                # 2. Expand motor mask to physical axis mask
+                axis_mask = [motor_mask[m_idx] for m_idx in motor_map]
+                new_params.append(np.full(sum(axis_mask) * 3, 0.5))
             else:
                 num_trans = max(1, len(self.goniometer_axes)) if self.goniometer_axes is not None else 1
                 new_params.append(np.full(num_trans * 3, 0.5))
@@ -1195,10 +1214,7 @@ class FindUB:
 
         if b_gonio_offsets is not None:
             if isinstance(b_gonio_offsets, dict) and self.goniometer_names is not None:
-                unique_motors = []
-                for name in self.goniometer_names:
-                    if name not in unique_motors:
-                        unique_motors.append(name)
+                # Re-use unique_motors built above
                 self.base_gonio_offset = np.array(
                     [b_gonio_offsets.get(name, 0.0) for name in unique_motors]
                 )
@@ -1206,13 +1222,15 @@ class FindUB:
                 self.base_gonio_offset = b_gonio_offsets
 
         if refine_goniometer:
-            active_mask = [True] * len(self.goniometer_axes)
             if refine_goniometer_axes is not None and self.goniometer_names is not None:
-                active_mask = [
+                # Rotations are optimized per-MOTOR, so we just use the motor_mask
+                motor_mask = [
                     any(req.lower() in name.lower() for req in refine_goniometer_axes)
-                    for name in self.goniometer_names
+                    for name in unique_motors
                 ]
-            new_params.append(np.full(sum(active_mask), 0.5))
+                new_params.append(np.full(sum(motor_mask), 0.5))
+            else:
+                new_params.append(np.full(len(unique_motors), 0.5))
 
         return (
             np.concatenate([np.atleast_1d(p) for p in new_params])
