@@ -1747,6 +1747,9 @@ class FindUB:
             dyn_centers,
             dyn_uhats,
             dyn_vhats,
+            dyn_widths,
+            dyn_heights,
+            area_scale
         ) = objective._get_physical_params_jax(x_batch)
 
         self.sample_offset = np.array(t_axes_batch[0])
