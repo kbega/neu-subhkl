@@ -328,7 +328,6 @@ class VectorizedObjective:
             self.num_motors = 0
 
         self.refine_gonio_trans = refine_sample
-        self.gonio_trans_bound = sample_bound_meters
         num_trans = max(1, self.num_gonio_axes)
 
         if sample_nominal is not None:
