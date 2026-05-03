@@ -575,7 +575,7 @@ def run_index(
         "peaks/run_index",
         "peaks/image_index",
         "bank",
-        "goniometer/translatiions",
+        "goniometer/translations",
         "beam/ki_vec",
         "peaks/pixel_r",
         "peaks/pixel_c",

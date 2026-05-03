@@ -1016,8 +1016,8 @@ class FindUB:
         sg = data["sample/space_group"]
         self.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
 
-        if "sample/offset" in data:
-            self.base_sample_offset = data["sample/offset"]
+        if "goniometer/translations" in data:
+            self.base_sample_offset = data["goniometer/translations"]
         if "peaks/xyz" in data:
             self.peak_xyz = data["peaks/xyz"]
         if "goniometer/axes" in data:
@@ -1081,6 +1081,8 @@ class FindUB:
                 data["goniometer/angles"] = f["goniometer/angles"][()]
             if "goniometer/names" in f:
                 data["goniometer/names"] = f["goniometer/names"][()]
+            if "goniometer/translations" in f:
+                data["goniometer/translations"] = f["goniometer/translations"][()]
             if "beam/ki_vec" in f:
                 data["beam/ki_vec"] = f["beam/ki_vec"][()]
 
@@ -1130,7 +1132,10 @@ class FindUB:
                 f["sample/beta"][()],
                 f["sample/gamma"][()],
             )
-            b_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
+            if "goniometer/translations" in f:
+                b_offset = f["goniometer/translations"][()]
+            else:
+                b_offset = np.zeros(3)
             b_ki = (
                 f["beam/ki_vec"][()]
                 if "beam/ki_vec" in f
