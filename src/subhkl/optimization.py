@@ -766,43 +766,60 @@ class VectorizedObjective:
             jnp.zeros((S, N)),
         )
 
+        # 1. Unpack v
+        v_h = v[:, 0, :]
+        v_k = v[:, 1, :]
+        v_l = v[:, 2, :]
+
+        # 2. Pre-compute the projection (UB^T @ kf_ki) 
+        ub_T_kf_ki = jnp.matmul(ub_mat.transpose((0, 2, 1)), kf_ki_sample)
+        ub_T_kf_ki_h = ub_T_kf_ki[:, 0, :]
+        ub_T_kf_ki_k = ub_T_kf_ki[:, 1, :]
+        ub_T_kf_ki_l = ub_T_kf_ki[:, 2, :]
+
         def scan_body(carry, i):
             curr_min, curr_best_hkl, curr_best_lamb = carry
 
-            # 1. Float HKL from coarse grid search (Assignment Step)
             lamda_cand = lam_grid[i]
-            hkl_float_coarse = v / lamda_cand
-            hkl_int = jnp.round(hkl_float_coarse).astype(jnp.int32)
-            
-            # Stop gradients on the discrete integer assignment so JAX treats it as a fixed target
-            hkl_int_fixed = jax.lax.stop_gradient(hkl_int.astype(jnp.float32))
 
-            # 2. Exact Analytical Lambda for the assigned integer
-            q_int = jnp.matmul(ub_mat, hkl_int_fixed)
-            k_dot_q = jnp.sum(kf_ki_sample * q_int, axis=1)
+            # 1. Float HKL from coarse grid search (Fully Unrolled)
+            h_float = v_h / lamda_cand
+            k_float = v_k / lamda_cand
+            l_float = v_l / lamda_cand
+
+            h_int = jnp.round(h_float)
+            k_int = jnp.round(k_float)
+            l_int = jnp.round(l_float)
+
+            h_i = jax.lax.stop_gradient(h_int)
+            k_i = jax.lax.stop_gradient(k_int)
+            l_i = jax.lax.stop_gradient(l_int)
+
+            # Reconstruct the integer array for the carry state
+            hkl_int = jnp.stack([h_i, k_i, l_i], axis=1).astype(jnp.int32)
+
+            # 2. Exact Analytical Lambda (Using Hoisted Projection)
+            k_dot_q = ub_T_kf_ki_h * h_i + ub_T_kf_ki_k * k_i + ub_T_kf_ki_l * l_i
             safe_dot = jnp.where(jnp.abs(k_dot_q) < 1e-9, 1e-9, k_dot_q)
             lambda_opt = jnp.clip(k_sq / safe_dot, self.wl_min_val, self.wl_max_val)
 
-            # 3. Exact Analytical Fractional HKL (Replaces the coarse grid float!)
-            # lambda_opt is (S, N), v is (S, 3, N), so we expand dims to divide
-            hkl_float_exact = v / lambda_opt[:, None, :]
+            # 3. Exact Analytical Fractional HKL (Unrolled)
+            h = v_h / lambda_opt
+            k = v_k / lambda_opt
+            l = v_l / lambda_opt
 
-            h = hkl_float_exact[:, 0, :]
-            k = hkl_float_exact[:, 1, :]
-            l = hkl_float_exact[:, 2, :]
-
-            # Apply Lattice Centering
+            # 4. Apply Lattice Centering
             h_p = self.M_prim[0, 0] * h + self.M_prim[0, 1] * k + self.M_prim[0, 2] * l
             k_p = self.M_prim[1, 0] * h + self.M_prim[1, 1] * k + self.M_prim[1, 2] * l
             l_p = self.M_prim[2, 0] * h + self.M_prim[2, 1] * k + self.M_prim[2, 2] * l
 
-            # 4. The 3-term loss on the ANALYTICAL coordinates
+            # 5. The 3-term loss
             dh = jnp.sin(jnp.pi * h_p)
             dk = jnp.sin(jnp.pi * k_p)
             dl = jnp.sin(jnp.pi * l_p)
             dist = jnp.sqrt(dh**2 + dk**2 + dl**2) / jnp.pi
 
-            # 5. Update states 
+            # 6. Update states
             update_mask = dist < curr_min
             new_min = jnp.where(update_mask, dist, curr_min)
             new_best_hkl = jnp.where(update_mask[:, None, :], hkl_int, curr_best_hkl)
