@@ -203,6 +203,8 @@ def prepare_predict_tasks(
     sample_offset: Optional[np.ndarray] = None,
     ki_vec: Optional[np.ndarray] = None,
     R_all: Optional[np.ndarray] = None,
+    gonio_axes: Optional[Any] = None,
+    gonio_angles: Optional[np.ndarray] = None,
 ) -> List[Tuple[Any, ...]]:
     bank_mapping = image_data.bank_mapping
     tasks = []
@@ -220,23 +222,48 @@ def prepare_predict_tasks(
         bank_id = bank_mapping.get(img_key, img_key)
         det_config = beamlines[instrument][str(int(bank_id))]
 
+        # Correctly identify the physical frame index
+        run_id = image_data.get_run_id(img_key)
+
+        # 1. Extract single RUB
+        if RUB.ndim == 3:
+            RUB_bank = RUB[run_id] if run_id < len(RUB) else RUB[0]
+        else:
+            RUB_bank = RUB
+
+        # 2. Extract single R matrix
+        R_bank = None
+        if R_all is not None:
+            if R_all.ndim == 3:
+                R_bank = R_all[run_id] if run_id < len(R_all) else R_all[0]
+            else:
+                R_bank = R_all
+
+        # 3. Extract single goniometer angle state
+        angles_bank = None
+        if gonio_angles is not None:
+            if gonio_angles.ndim == 2:
+                angles_bank = gonio_angles[run_id] if run_id < len(gonio_angles) else gonio_angles[0]
+            else:
+                angles_bank = gonio_angles
+
         tasks.append(
             (
-                img_key,  # The HDF5 array index (e.g., 0, 1, 2)
-                bank_id,  # The physical name (e.g., 52, 53)
-                det_config,  # Geometry dict from beamlines.json
+                img_key,
+                bank_id,
+                det_config,
                 unit_cell_params,
-                RUB,  # The full RUB stack
+                RUB_bank,         # <-- Extracted single matrix
                 wavelength_min,
                 wavelength_max,
                 sample_offset,
                 ki_vec,
-                R_all,  # The full R_all stack
-                img_index,  # The sequential index for matrix extraction
+                R_bank,           # <-- Extracted single matrix
+                gonio_axes,
+                angles_bank,      # <-- Extracted single angle array
             )
         )
     return tasks
-
 
 def prepare_integrate_tasks(
     image: ImageData,

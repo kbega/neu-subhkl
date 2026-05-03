@@ -911,8 +911,6 @@ def run_peak_predictor(
 
         gonio_axes = f_idx["goniometer/axes"][()] if "goniometer/axes" in f_idx else None
 
-        gonio_axes = f_idx["goniometer/axes"][()] if "goniometer/axes" in f_idx else None
-
         ki_vec = (
             f_idx["beam/ki_vec"][()]
             if "beam/ki_vec" in f_idx
