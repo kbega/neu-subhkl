@@ -357,8 +357,13 @@ def compute_metrics(
 
         if gonio_angles is not None:
             if gonio_angles.ndim == 2:
-                # Extract (N_axes, N_peaks) and transpose to (N_peaks, N_axes)
-                gonio_angles_mapped = gonio_angles[:, run_index].T
+                num_axes = len(gonio_axes) if gonio_axes is not None else 1
+                # Check if the array is oriented as (N_runs, N_axes)
+                if gonio_angles.shape[1] == num_axes:
+                    gonio_angles_mapped = gonio_angles[run_index, :]
+                # Otherwise, it must be (N_axes, N_runs)
+                else:
+                    gonio_angles_mapped = gonio_angles[:, run_index].T
             else:
                 gonio_angles_mapped = gonio_angles
         else:
