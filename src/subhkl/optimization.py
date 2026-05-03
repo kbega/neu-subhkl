@@ -1180,7 +1180,7 @@ class FindUB:
         if refine_sample:
             if refine_goniometer_axes is not None and self.goniometer_names is not None:
                 trans_mask = [
-                    any(req in name for req in refine_goniometer_axes)
+                    any(req.lower() in name.lower() for req in refine_goniometer_axes)
                     for name in self.goniometer_names
                 ]
                 new_params.append(np.full(sum(trans_mask) * 3, 0.5))
@@ -1209,7 +1209,7 @@ class FindUB:
             active_mask = [True] * len(self.goniometer_axes)
             if refine_goniometer_axes is not None and self.goniometer_names is not None:
                 active_mask = [
-                    any(req in name for req in refine_goniometer_axes)
+                    any(req.lower() in name.lower() for req in refine_goniometer_axes)
                     for name in self.goniometer_names
                 ]
             new_params.append(np.full(sum(active_mask), 0.5))
@@ -1364,19 +1364,18 @@ class FindUB:
             mask = [False] * len(unique_motors)
             for i, name in enumerate(unique_motors):
                 for req_idx, req in enumerate(refine_goniometer_axes):
-                    if req in name:
+                    # --- FIX: Case-insensitive match ---
+                    if req.lower() in name.lower():
                         mask[i] = True
-                        # If a 1:1 list of bounds was provided, map it to the corresponding axis
                         if len(gonio_bounds_list) == len(refine_goniometer_axes):
                             bounds_array[i] = gonio_bounds_list[req_idx]
             goniometer_refine_mask = np.array(mask, dtype=bool)
         elif refine_goniometer:
             goniometer_refine_mask = np.ones(len(unique_motors), dtype=bool)
-            # If they provided exactly enough bounds for all physical motors, map them directly
             if len(gonio_bounds_list) == len(unique_motors):
                 bounds_array = np.array(gonio_bounds_list)
 
-        # --- NEW: Map translation bounds to active axes ---
+        # Map translation bounds to active axes
         if isinstance(goniometer_trans_bound_meters, (int, float)):
             gonio_trans_bounds_list = [float(goniometer_trans_bound_meters)]
         else:
@@ -1390,7 +1389,8 @@ class FindUB:
         if refine_sample and refine_goniometer_axes is not None:
             for i, name in enumerate(unique_motors):
                 for req_idx, req in enumerate(refine_goniometer_axes):
-                    if req in name:
+                    # --- FIX: Case-insensitive match ---
+                    if req.lower() in name.lower():
                         if len(gonio_trans_bounds_list) == len(refine_goniometer_axes):
                             bounds_array_trans[i] = gonio_trans_bounds_list[req_idx]
         elif refine_sample:

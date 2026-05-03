@@ -523,8 +523,16 @@ def run_index(
     init_params = None
     if bootstrap_filename:
         init_params = opt.get_bootstrap_params(
-            refine_goniometer_axes=refine_goniometer_axes,
             bootstrap_filename=bootstrap_filename,
+            refine_lattice=refine_lattice,
+            lattice_bound_frac=lattice_bound_frac,
+            refine_sample=refine_goniometer_trans,
+            sample_bound_meters=goniometer_trans_bound_meters,
+            refine_beam=refine_beam,
+            beam_bound_deg=beam_bound_deg,
+            refine_goniometer=refine_goniometer,
+            goniometer_bound_deg=goniometer_bound_deg,
+            refine_goniometer_axes=refine_goniometer_axes,
             freeze_orientation=freeze_orientation,
         )
 
