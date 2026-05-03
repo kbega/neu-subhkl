@@ -394,7 +394,7 @@ def run_index(
     if refine_lattice:
         print(f"Refining lattice parameters with {lattice_bound_frac * 100}% bounds.")
     if refine_goniometer_trans:
-    num_axes = len(opt.goniometer_axes) if opt.goniometer_axes is not None else 1
+        num_axes = len(opt.goniometer_axes) if opt.goniometer_axes is not None else 1
         print(f"Refining per-axis goniometer translations ({num_axes} axes) with bounds: {goniometer_trans_bound_meters} m.")
     if refine_beam:
         print(f"Refining beam tilt with {beam_bound_deg}° bounds.")
