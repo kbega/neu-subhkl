@@ -874,19 +874,13 @@ class VectorizedObjective:
         R_curr = R_cum if R_cum is not None else self.static_R
 
         if sample_origin_lab.shape[1] > 1:
+            # Multi-frame: Extract the specific origin for each peak's run
             s_lab = sample_origin_lab[:, self.peak_run_indices, :]
-            s = s_lab.transpose(0, 2, 1)
         else:
-            if R_curr is not None and R_curr.ndim == 3:
-                R_per_peak = R_curr[self.peak_run_indices, :, :]
-                s_lab = jnp.matmul(R_per_peak[None, ...], sample_origin_lab[:, :, :, None]).squeeze(-1)
-                s = s_lab.transpose(0, 2, 1)
-            elif R_curr is not None and R_curr.ndim == 4:
-                R_per_peak = R_curr[:, self.peak_run_indices, :, :]
-                s_lab = jnp.matmul(R_per_peak, sample_origin_lab[:, :, :, None]).squeeze(-1)
-                s = s_lab.transpose(0, 2, 1)
-            else:
-                s = sample_origin_lab[:, 0, :][:, :, None]
+            # Single-frame: Tile the origin to match all peaks
+            s_lab = jnp.tile(sample_origin_lab, (1, self.peak_run_indices.shape[0], 1))
+
+        s = s_lab.transpose(0, 2, 1) # Shape: (S, 3, N_peaks)
 
         if self.refine_detector:
             c = dyn_centers[:, self.peak_det_idx, :]
@@ -916,6 +910,8 @@ class VectorizedObjective:
             q_lab = kf - ki
             k_sq_dyn = jnp.sum(q_lab**2, axis=1)
 
+        # q_lab is a pure momentum vector, so it strictly requires the 
+        # inverse goniometer rotation (R^T) to reach the sample frame
         if R_curr is not None:
             q_lab_vec = q_lab.transpose(0, 2, 1)[..., None]
             if R_curr.ndim == 4:
