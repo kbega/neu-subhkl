@@ -1409,7 +1409,6 @@ class FindUB:
             goniometer_nominal_offsets=self.base_gonio_offset,
             goniometer_bound_deg=bounds_array,
             goniometer_trans_bound_meters=bounds_array_trans,
-            sample_bound_meters=sample_bound_meters,
             sample_nominal=self.base_sample_offset,
             refine_beam=refine_beam,
             beam_bound_deg=beam_bound_deg,
