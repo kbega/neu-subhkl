@@ -194,13 +194,13 @@ def run_index(
             "goniometer/axes",
             "goniometer/angles",
             "goniometer/names",
+            "goniometer/translations",
             "files",
             "file_offsets",
             "peaks/run_index",
             "peaks/image_index",
             "bank",
             "bank_ids",
-            "sample/offset",
             "beam/ki_vec",
             "peaks/pixel_r",
             "peaks/pixel_c",
@@ -352,7 +352,7 @@ def run_index(
     if bootstrap_filename:
         with h5py.File(bootstrap_filename, "r") as b_f:
             if "goniometer/translations" in b_f:
-                input_data["sample/offset"] = b_f["goniometer/translations"][()]
+                input_data["goniometer/translations"] = b_f["goniometer/translations"][()]
             if "beam/ki_vec" in b_f:
                 ki_vec_val = b_f["beam/ki_vec"][()]
             if "peaks/h" in b_f:
@@ -575,7 +575,7 @@ def run_index(
         "peaks/run_index",
         "peaks/image_index",
         "bank",
-        "sample/offset",
+        "goniometer/translatiions",
         "beam/ki_vec",
         "peaks/pixel_r",
         "peaks/pixel_c",
@@ -906,10 +906,10 @@ def run_peak_predictor(
 
         if "goniometer/translations" in f_idx:
             sample_offset = f_idx["goniometer/translations"][()]
-        elif "sample/offset" in f_idx:
-            sample_offset = f_idx["sample/offset"][()]
         else:
             sample_offset = np.zeros(3)
+
+        gonio_axes = f_idx["goniometer/axes"][()] if "goniometer/axes" in f_idx else None
 
         gonio_axes = f_idx["goniometer/axes"][()] if "goniometer/axes" in f_idx else None
 
@@ -1019,7 +1019,7 @@ def run_peak_predictor(
                 "goniometer/names", data=peaks.goniometer.names_raw, dtype=dt
             )
 
-        f["sample/offset"] = sample_offset
+        f["goniometer/translations"] = sample_offset
         f["beam/ki_vec"] = ki_vec
 
         for img_key, (i, j, h, k, l, wl) in results_map.items():
