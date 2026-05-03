@@ -1081,6 +1081,8 @@ def run_rbf_integrator(
         else:
             sample_offset = np.zeros(3)
 
+        gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
+
         for key in f["banks"].keys():
             img_idx = int(key)
             grp = f[f"banks/{key}"]
