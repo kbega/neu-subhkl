@@ -63,11 +63,15 @@ def extract_xyz_from_file(file_path, instrument=None):
         if "detector_calibration" in f:
             calib_grp = f["detector_calibration"]
             for b_key in calib_grp.keys():
-                calibration_dict[b_key] = {
+                calib = {
                     "center": calib_grp[b_key]["center"][()],
                     "uhat": calib_grp[b_key]["uhat"][()],
                     "vhat": calib_grp[b_key]["vhat"][()],
                 }
+                if "width" in calib_grp[b_key] and "height" in calib_grp[b_key]:
+                    calib["width"] = float(calib_grp[b_key]["width"][()])
+                    calib["height"] = float(calib_grp[b_key]["height"][()])
+                calibration_dict[b_key] = calib
 
         # 1. Coordinate array reconstruction (Finder, Indexer, Integrator)
         if "peaks/pixel_r" in f and "peaks/pixel_c" in f:
@@ -100,6 +104,9 @@ def extract_xyz_from_file(file_path, instrument=None):
                         det.center = calibration_dict[bank_str]["center"]
                         det.uhat = calibration_dict[bank_str]["uhat"]
                         det.vhat = calibration_dict[bank_str]["vhat"]
+                        if "width" in calibration_dict[bank_str]:
+                            det.width = calibration_dict[bank_str]["width"]
+                            det.height = calibration_dict[bank_str]["height"]
 
                     xyz[mask] = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
                 except KeyError:

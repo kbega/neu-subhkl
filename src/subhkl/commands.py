@@ -41,6 +41,9 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
                     beamlines[instrument][bank_id]["vhat"] = calib_grp[bank_key][
                         "vhat"
                     ][()].tolist()
+                    if "width" in calib_grp[bank_key] and "height" in calib_grp[bank_key]:
+                        beamlines[instrument][bank_id]["width"] = float(calib_grp[b_key]["width"][()])
+                        beamlines[instrument][bank_id]["height"] = float(calib_grp[b_key]["height"][()])
                     count += 1
             if count > 0:
                 print(f"Successfully applied calibration to {count} detector panels.")
@@ -290,6 +293,7 @@ def run_index(
                     "ph": ph,
                     "modes": detector_modes,
                     "radial_bound": detector_radial_bound_frac,
+                    "area_bound": detector_area_bound_frac,
                     "global_rot_bound_deg": detector_global_rot_bound_deg,
                     "global_rot_axis": np.array(detector_global_rot_axis),
                     "cylinder_axis": np.array(cylinder_axis),
@@ -678,6 +682,10 @@ def run_index(
                 f[f"{grp_name}/center"] = opt.calibrated_centers[b_idx]
                 f[f"{grp_name}/uhat"] = opt.calibrated_uhats[b_idx]
                 f[f"{grp_name}/vhat"] = opt.calibrated_vhats[b_idx]
+
+                if hasattr(opt, "calibrated_widths"):
+                    f[f"{grp_name}/width"] = opt.calibrated_widths[b_idx]
+                    f[f"{grp_name}/height"] = opt.calibrated_heights[b_idx]
 
     print("Done.")
 

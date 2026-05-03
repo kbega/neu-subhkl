@@ -242,12 +242,16 @@ def indexer(
             help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
         ),
     ] = None,
+    detector_area_bound_frac: Annotated[
+        float, typer.Option("--detector-area-bound-frac")
+    ] = 0.05,
     detector_global_trans_bound_meters: Annotated[
         float, typer.Option("--detector-global-trans-bound-meters")
     ] = 0.01,
     detector_radial_bound_frac: Annotated[
         float, typer.Option("--detector-radial-bound-frac")
     ] = 0.05,
+    detector_area_bound_frac=detector_area_bound_frac,
     bootstrap_filename: Annotated[str | None, typer.Option("--bootstrap")] = None,
     batch_size: Annotated[int | None, typer.Option("--batch-size")] = None,
     num_candidates: Annotated[

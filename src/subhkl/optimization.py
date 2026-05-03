@@ -442,6 +442,7 @@ class VectorizedObjective:
 
             self.bounds = {
                 "radial": detector_params.get("radial_bound", 0.05),
+                "area": detector_params.get("area_bound", 0.05),
                 "global_rot": jnp.deg2rad(
                     detector_params.get("global_rot_bound_deg", 2.0)
                 ),
@@ -454,7 +455,7 @@ class VectorizedObjective:
             }
 
             for mode in self.det_modes:
-                if mode in ("radial", "cylindrical", "axial_stretch"):
+                if mode in ("radial", "cylindrical", "axial_stretch", "area"):
                     size = 1
                 elif mode == "global_rot":
                     size = 3
@@ -471,6 +472,9 @@ class VectorizedObjective:
                     self.num_det_params, self.num_det_params + size
                 )
                 self.num_det_params += size
+
+            self.det_widths = jnp.array([pw * m for pw, m in zip(detector_params["pw"], detector_params["m"])])
+            self.det_heights = jnp.array([ph * n for ph, n in zip(detector_params["ph"], detector_params["n"])])
 
         # primitive cell
         self.centering = centering
@@ -654,6 +658,10 @@ class VectorizedObjective:
             u = self.det_uhats[None, :, :].repeat(S, axis=0)
             v = self.det_vhats[None, :, :].repeat(S, axis=0)
 
+            w = self.det_widths[None, :].repeat(S, axis=0)
+            h = self.det_heights[None, :].repeat(S, axis=0)
+            area_scale = jnp.zeros((S, 1))
+
             if "radial" in self.det_modes:
                 slc = self.det_param_slices["radial"]
                 scale_norm = det_params[:, slc]
@@ -671,6 +679,14 @@ class VectorizedObjective:
                 c_perp = c - c_parallel
 
                 c = c_parallel + c_perp * (1.0 + scale[:, :, None])
+
+            if "area" in self.det_modes:
+                slc = self.det_param_slices["area"]
+                scale_norm = det_params[:, slc]
+                scale = _forward_map_param(scale_norm, self.bounds["area"])
+                area_scale = scale
+                w = w * (1.0 + scale)
+                h = h * (1.0 + scale)
 
             if "axial_stretch" in self.det_modes:
                 slc = self.det_param_slices["axial_stretch"]
@@ -734,8 +750,10 @@ class VectorizedObjective:
                 v = jnp.einsum("snij,snj->sni", R_local, v)
 
             dyn_centers, dyn_uhats, dyn_vhats = c, u, v
+            dyn_widths, dyn_heights = w, h
         else:
             dyn_centers, dyn_uhats, dyn_vhats = None, None, None
+            dyn_widths, dyn_heights, area_scale = None, None, None
 
         return (
             UB,
@@ -748,6 +766,9 @@ class VectorizedObjective:
             dyn_centers,
             dyn_uhats,
             dyn_vhats,
+            dyn_widths,
+            dyn_heights,
+            area_scale
         )
 
     def indexer_dynamic_soft_jax(self, ub_mat, kf_ki_sample, k_sq_override=None):
@@ -867,8 +888,8 @@ class VectorizedObjective:
         pad_size = max(0, 2 - original_S)
         x_pad = jnp.pad(x, ((0, pad_size), (0, 0)), mode="edge") if pad_size > 0 else x
 
-        UB, _, _, sample_origin_lab, ki_vec, _, R_cum, dyn_centers, dyn_uhats, dyn_vhats = (
-            self._get_physical_params_jax(x_pad)
+        UB, _, _, sample_origin_lab, ki_vec, _, R_cum, dyn_centers, dyn_uhats, dyn_vhats,
+            dyn_widths, dyn_heights, area_scale) = self._get_physical_params_jax(x_pad)
         )
 
         R_curr = R_cum if R_cum is not None else self.static_R
@@ -886,6 +907,14 @@ class VectorizedObjective:
             c = dyn_centers[:, self.peak_det_idx, :]
             u_vec = dyn_uhats[:, self.peak_det_idx, :]
             v_vec = dyn_vhats[:, self.peak_det_idx, :]
+
+            if area_scale is not None:
+                scale_factor = 1.0 + area_scale[:, 0][:, None]
+                u_offset = self.peak_u_offsets[None, :] * scale_factor
+                v_offset = self.peak_v_offsets[None, :] * scale_factor
+            else:
+                u_offset = self.peak_u_offsets[None, :]
+                v_offset = self.peak_v_offsets[None, :]
 
             u_offset = self.peak_u_offsets
             v_offset = self.peak_v_offsets
@@ -1505,6 +1534,9 @@ class FindUB:
                 dyn_centers,
                 dyn_uhats,
                 dyn_vhats,
+                dyn_widths,
+                dyn_heights,
+                area_scale
             ) = objective._get_physical_params_jax(x_batch)
             self.sample_offset = np.array(t_axes_batch[0])
             self.ki_vec = np.array(ki_vec_batch[0]).flatten()
@@ -1757,6 +1789,8 @@ class FindUB:
             self.calibrated_centers = np.array(dyn_centers[0])
             self.calibrated_uhats = np.array(dyn_uhats[0])
             self.calibrated_vhats = np.array(dyn_vhats[0])
+            self.calibrated_widths = np.array(dyn_widths[0])
+            self.calibrated_heights = np.array(dyn_heights[0])
             max_drift = (
                 np.max(
                     np.linalg.norm(
