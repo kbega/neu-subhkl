@@ -888,9 +888,8 @@ class VectorizedObjective:
         pad_size = max(0, 2 - original_S)
         x_pad = jnp.pad(x, ((0, pad_size), (0, 0)), mode="edge") if pad_size > 0 else x
 
-        UB, _, _, sample_origin_lab, ki_vec, _, R_cum, dyn_centers, dyn_uhats, dyn_vhats,
+        (UB, _, _, sample_origin_lab, ki_vec, _, R_cum, dyn_centers, dyn_uhats, dyn_vhats,
             dyn_widths, dyn_heights, area_scale) = self._get_physical_params_jax(x_pad)
-        )
 
         R_curr = R_cum if R_cum is not None else self.static_R
 
