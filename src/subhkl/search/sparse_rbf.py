@@ -2009,58 +2009,58 @@ def integrate_peaks_rbf_ssn(
         )
 
     # 2. Extract exact patches for global optimization (USING ALL PEAKS)
-        opt_P = 15
-        opt_half = opt_P // 2
-        opt_patches, opt_bgs, opt_drs, opt_dcs, opt_Pmats, opt_dists = (
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
+    opt_P = 15
+    opt_half = opt_P // 2
+    opt_patches, opt_bgs, opt_drs, opt_dcs, opt_Pmats, opt_dists = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+    opt_R_mats = []
+
+    if show_progress:
+        print(f"  > 3D Tensor Optimization: Using ALL {len(frames)} peaks.")
+
+    # Pad images once for the exact patch extraction
+    pad_images = np.pad(
+        images_batch, ((0, 0), (opt_P, opt_P), (opt_P, opt_P)), mode="reflect"
+    )
+
+    for idx in range(len(frames)):
+        f, r, c = frames[idx], all_rs[idx], all_cs[idx]
+
+        # Use the mathematically correct Oblique matrices accumulated in Phase 1
+        opt_Pmats.append(all_P_mats[idx])
+        opt_dists.append(all_distances[idx])
+        opt_R_mats.append(all_R_mats[idx])
+
+        ri, ci = int(round(r)) + opt_P, int(round(c)) + opt_P
+
+        # Bounding box bounds
+        r_min, r_max = ri - opt_half, ri + opt_half + 1
+        c_min, c_max = ci - opt_half, ci + opt_half + 1
+
+        patch = pad_images[f, r_min:r_max, c_min:c_max].astype(np.float32)
+
+        # Local background estimation (edges of the 15x15 patch)
+        bg_mask = np.ones_like(patch, dtype=bool)
+        bg_mask[2:-2, 2:-2] = False
+        bg = np.median(patch[bg_mask])
+
+        opt_patches.append(patch)
+        opt_bgs.append(bg)
+
+        # Sub-pixel grid shifts
+        rr, cc = np.meshgrid(
+            np.arange(r_min, r_max) - opt_P,
+            np.arange(c_min, c_max) - opt_P,
+            indexing="ij",
         )
-        opt_R_mats = []
-
-        if show_progress:
-            print(f"  > 3D Tensor Optimization: Using ALL {len(frames)} peaks.")
-
-        # Pad images once for the exact patch extraction
-        pad_images = np.pad(
-            images_batch, ((0, 0), (opt_P, opt_P), (opt_P, opt_P)), mode="reflect"
-        )
-
-        for idx in range(len(frames)):
-            f, r, c = frames[idx], all_rs[idx], all_cs[idx]
-
-            # Use the mathematically correct Oblique matrices accumulated in Phase 1
-            opt_Pmats.append(all_P_mats[idx])
-            opt_dists.append(all_distances[idx])
-            opt_R_mats.append(all_R_mats[idx])
-
-            ri, ci = int(round(r)) + opt_P, int(round(c)) + opt_P
-
-            # Bounding box bounds
-            r_min, r_max = ri - opt_half, ri + opt_half + 1
-            c_min, c_max = ci - opt_half, ci + opt_half + 1
-
-            patch = pad_images[f, r_min:r_max, c_min:c_max].astype(np.float32)
-
-            # Local background estimation (edges of the 15x15 patch)
-            bg_mask = np.ones_like(patch, dtype=bool)
-            bg_mask[2:-2, 2:-2] = False
-            bg = np.median(patch[bg_mask])
-
-            opt_patches.append(patch)
-            opt_bgs.append(bg)
-
-            # Sub-pixel grid shifts
-            rr, cc = np.meshgrid(
-                np.arange(r_min, r_max) - opt_P,
-                np.arange(c_min, c_max) - opt_P,
-                indexing="ij",
-            )
-            opt_drs.append(rr - r)
-            opt_dcs.append(cc - c)
+        opt_drs.append(rr - r)
+        opt_dcs.append(cc - c)
 
     # We require at least 15 valid peaks to mathematically constrain a 6-parameter 3D tensor
     MIN_PEAKS_FOR_GLOBAL_FIT = 15
