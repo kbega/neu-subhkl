@@ -308,8 +308,10 @@ class VectorizedObjective:
 
             raw_trans_bounds = jnp.array(goniometer_trans_bound_meters)
             if raw_trans_bounds.ndim == 1 and raw_trans_bounds.size == self.num_motors:
-                # Shape becomes (Num_Active_Motors, 1) to broadcast over XYZ
-                self.gonio_trans_bound = raw_trans_bounds[self.gonio_trans_mask][:, None]
+                # 1. Expand the motor bounds to match the physical axes
+                mapped_bounds = raw_trans_bounds[self.motor_map]
+                # 2. Mask down to active axes and add (:, None) to broadcast over XYZ
+                self.gonio_trans_bound = mapped_bounds[self.gonio_trans_mask][:, None]
             else:
                 self.gonio_trans_bound = raw_trans_bounds
 
