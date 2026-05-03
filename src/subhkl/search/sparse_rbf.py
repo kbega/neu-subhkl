@@ -1243,8 +1243,6 @@ def global_shape_objective(
         # If disabled, the tensor is perfectly zeroed out.
         Sigma_eta_base = jnp.zeros((3, 3))
 
-    yy, xx = jnp.indices((patch_size, patch_size))
-
     def fit_one_peak(patch, bg, dr, dc, P_true, D_i, R_gonio):
         # 3. Rotate Crystal Shape to the Lab Frame
         Sigma_shape_lab = R_gonio @ Sigma_shape_sample @ R_gonio.T
@@ -1263,18 +1261,20 @@ def global_shape_objective(
         b = -Sigma_2D[0, 1] / det_sigma
         c = Sigma_2D[0, 0] / det_sigma
 
-        dr_grid = yy - dr
-        dc_grid = xx - dc
+        # dr and dc are the exact distance grids
+        dr_grid = dr
+        dc_grid = dc
 
         template = jnp.exp(
             -0.5 * (a * dc_grid**2 + 2.0 * b * dr_grid * dc_grid + c * dr_grid**2)
         )
 
         y_sub = patch - bg
+
+        # Calculate the exact least-squares amplitude
         amp = jnp.sum(y_sub * template) / jnp.maximum(
             jnp.sum(template * template), 1e-6
         )
-        amp = jnp.maximum(amp, 0.0)
 
         residual = y_sub - amp * template
         return jnp.sum(residual**2)
