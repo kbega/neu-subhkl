@@ -876,11 +876,11 @@ class VectorizedObjective:
         if sample_origin_lab.shape[1] > 1:
             # Multi-frame: Extract the specific origin for each peak's run
             s_lab = sample_origin_lab[:, self.peak_run_indices, :]
-            s = s_lab.transpose(0, 2, 1)
         else:
             # Single-frame: Tile the origin to match all peaks
             s_lab = jnp.tile(sample_origin_lab, (1, self.peak_run_indices.shape[0], 1))
-            s = s_lab.transpose(0, 2, 1)
+
+        s = s_lab.transpose(0, 2, 1) # Shape: (S, 3, N_peaks)
 
         if self.refine_detector:
             c = dyn_centers[:, self.peak_det_idx, :]
