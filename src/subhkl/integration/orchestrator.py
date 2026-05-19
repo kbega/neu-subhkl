@@ -244,12 +244,20 @@ def prepare_predict_tasks(
                     if gonio_angles.shape[0] == total_images:
                         angles_bank = gonio_angles[img_index, :]
                     else:
-                        angles_bank = gonio_angles[run_id, :] if run_id < gonio_angles.shape[0] else gonio_angles[0, :]
+                        angles_bank = (
+                            gonio_angles[run_id, :]
+                            if run_id < gonio_angles.shape[0]
+                            else gonio_angles[0, :]
+                        )
                 else:
                     if gonio_angles.shape[1] == total_images:
                         angles_bank = gonio_angles[:, img_index]
                     else:
-                        angles_bank = gonio_angles[:, run_id] if run_id < gonio_angles.shape[1] else gonio_angles[:, 0]
+                        angles_bank = (
+                            gonio_angles[:, run_id]
+                            if run_id < gonio_angles.shape[1]
+                            else gonio_angles[:, 0]
+                        )
             else:
                 angles_bank = gonio_angles
 
@@ -259,7 +267,7 @@ def prepare_predict_tasks(
                 bank_id,
                 det_config,
                 unit_cell_params,
-                UB,               # <-- Pass constant UB!
+                UB,  # <-- Pass constant UB!
                 wavelength_min,
                 wavelength_max,
                 sample_offset,
@@ -267,10 +275,11 @@ def prepare_predict_tasks(
                 R_bank,
                 gonio_axes,
                 angles_bank,
-                gonio_offsets,    # <-- NEW
+                gonio_offsets,  # <-- NEW
             )
         )
     return tasks
+
 
 def prepare_integrate_tasks(
     image: ImageData,

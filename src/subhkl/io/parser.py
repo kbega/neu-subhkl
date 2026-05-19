@@ -197,11 +197,21 @@ def indexer(
         str | None, typer.Option("--refine-goniometer-axes")
     ] = None,
     goniometer_bound_deg: Annotated[
-        str, typer.Option("--goniometer-bound-deg", help="Comma-separated bounds per axis or a single float")
+        str,
+        typer.Option(
+            "--goniometer-bound-deg",
+            help="Comma-separated bounds per axis or a single float",
+        ),
     ] = "5.0",
-    refine_goniometer_trans: Annotated[bool, typer.Option("--refine-goniometer-trans")] = False,
+    refine_goniometer_trans: Annotated[
+        bool, typer.Option("--refine-goniometer-trans")
+    ] = False,
     goniometer_trans_bound_meters: Annotated[
-        str, typer.Option("--goniometer-trans-bound-meters", help="Comma-separated translation bounds per axis (meters) or a single float")
+        str,
+        typer.Option(
+            "--goniometer-trans-bound-meters",
+            help="Comma-separated translation bounds per axis (meters) or a single float",
+        ),
     ] = "0.005",
     refine_beam: Annotated[bool, typer.Option("--refine-beam")] = False,
     beam_bound_deg: Annotated[float, typer.Option("--beam-bound-deg")] = 1.0,
@@ -291,9 +301,7 @@ def indexer(
         else None
     )
     cylinder_axis = (
-        [float(x.strip()) for x in cylinder_axis.split(",")]
-        if cylinder_axis
-        else None
+        [float(x.strip()) for x in cylinder_axis.split(",")] if cylinder_axis else None
     )
 
     # 2. Hand off to Core Logic
@@ -343,7 +351,7 @@ def indexer(
         bootstrap_filename=bootstrap_filename,
         batch_size=batch_size,
         num_candidates=num_candidates,
-        no_index = not index if index is not None else None,
+        no_index=not index if index is not None else None,
     )
 
 

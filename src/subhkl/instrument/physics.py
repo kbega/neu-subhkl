@@ -1,6 +1,5 @@
 import numpy as np
 import numpy.typing as npt
-from subhkl.core.crystallography import get_q_lab
 
 
 def scale_coordinates(xp, yp, scale_x, scale_y, nx, ny):
@@ -45,7 +44,7 @@ def predict_reflections_on_panel(
     R_all=None,
     gonio_axes=None,
     gonio_angles=None,
-    gonio_offsets=None,   # <-- NEW
+    gonio_offsets=None,  # <-- NEW
 ):
     """
     Predict reflection positions on a specific detector panel.
@@ -64,6 +63,7 @@ def predict_reflections_on_panel(
     # 2. Transform Sample frame Q-vectors to absolute Lab frame Q-vectors
     if gonio_axes is not None and gonio_angles is not None:
         from subhkl.instrument.goniometer import sample_to_lab
+
         offsets = sample_offset
         if offsets is not None and offsets.ndim == 1:
             offsets_full = np.zeros((len(gonio_axes), 3))
@@ -75,23 +75,23 @@ def predict_reflections_on_panel(
 
         # Lab frame Q-vectors (is_vector=True skips translations)
         q_lab_T = sample_to_lab(
-            q_sample.T, 
-            gonio_axes, 
-            gonio_angles, 
-            offsets_full, 
-            zero_offsets=gonio_offsets, 
-            is_vector=True
+            q_sample.T,
+            gonio_axes,
+            gonio_angles,
+            offsets_full,
+            zero_offsets=gonio_offsets,
+            is_vector=True,
         )
         q_lab = q_lab_T.T
-        
+
         # True Sample Ray Origin (is_vector=False applies translations)
         s_lab = sample_to_lab(
-            np.array([0.0, 0.0, 0.0]), 
-            gonio_axes, 
-            gonio_angles, 
-            offsets_full, 
+            np.array([0.0, 0.0, 0.0]),
+            gonio_axes,
+            gonio_angles,
+            offsets_full,
             zero_offsets=gonio_offsets,
-            is_vector=False
+            is_vector=False,
         )
     else:
         # Legacy fallback
@@ -111,8 +111,12 @@ def predict_reflections_on_panel(
 
     if not np.any(mask_wl):
         return (
-            np.array([]), np.array([]), np.array([]),
-            np.array([]), np.array([]), np.array([])
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
         )
 
     lamda_v = lamda[mask_wl]
@@ -130,10 +134,14 @@ def predict_reflections_on_panel(
     )
 
     return (
-        row[mask_panel], col[mask_panel],
-        h_v[mask_panel], k_v[mask_panel], l_v[mask_panel],
+        row[mask_panel],
+        col[mask_panel],
+        h_v[mask_panel],
+        k_v[mask_panel],
+        l_v[mask_panel],
         lamda_v[mask_panel],
     )
+
 
 def calculate_angular_error(
     xyz_det: npt.NDArray,
@@ -141,13 +149,13 @@ def calculate_angular_error(
     k: npt.NDArray,
     l: npt.NDArray,
     lam: npt.NDArray,
-    UB: npt.NDArray,            # <-- Changed from RUB
+    UB: npt.NDArray,  # <-- Changed from RUB
     sample_offset: npt.NDArray = None,
     ki_vec: npt.NDArray = None,
     R_all: npt.NDArray = None,
     gonio_axes: npt.NDArray = None,
     gonio_angles: npt.NDArray = None,
-    gonio_offsets: npt.NDArray = None, # <-- NEW
+    gonio_offsets: npt.NDArray = None,  # <-- NEW
 ):
     if sample_offset is None:
         sample_offset = np.zeros(3)
@@ -165,31 +173,35 @@ def calculate_angular_error(
             offsets_full[-1] = offsets
         else:
             offsets_full = offsets
-            
-        angles = np.tile(gonio_angles, (len(xyz_det), 1)) if gonio_angles.ndim == 1 else gonio_angles
+
+        angles = (
+            np.tile(gonio_angles, (len(xyz_det), 1))
+            if gonio_angles.ndim == 1
+            else gonio_angles
+        )
 
         from subhkl.instrument.goniometer import sample_to_lab
-        
+
         # Q-vectors only rotate (is_vector=True bypasses translations)
         q_lab_calc = sample_to_lab(
-            q_sample_calc, 
-            gonio_axes, 
-            angles.T, 
-            offsets_full, 
+            q_sample_calc,
+            gonio_axes,
+            angles.T,
+            offsets_full,
             zero_offsets=gonio_offsets,
-            is_vector=True
+            is_vector=True,
         )
 
         # Sample origin translates and rotates (is_vector=False applies translations)
         s_lab = sample_to_lab(
-            np.zeros((len(xyz_det), 3)), 
-            gonio_axes, 
-            angles.T, 
-            offsets_full, 
+            np.zeros((len(xyz_det), 3)),
+            gonio_axes,
+            angles.T,
+            offsets_full,
             zero_offsets=gonio_offsets,
-            is_vector=False
+            is_vector=False,
         )
-        
+
         v = xyz_det - s_lab
     elif R_all is not None:
         # Legacy static fallback

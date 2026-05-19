@@ -230,8 +230,8 @@ class VectorizedObjective:
     ):
         self.no_index = no_index
         if self.no_index:
-            self.hkl_fixed = jnp.array(hkl_fixed)      # Shape: (3, N)
-            self.lambda_fixed = jnp.array(lambda_fixed) # Shape: (N,)
+            self.hkl_fixed = jnp.array(hkl_fixed)  # Shape: (3, N)
+            self.lambda_fixed = jnp.array(lambda_fixed)  # Shape: (N,)
 
         self.B = jnp.array(B)
         self.kf_ki_dir_init = jnp.array(kf_ki_dir)
@@ -435,9 +435,7 @@ class VectorizedObjective:
             self.det_global_rot_axis = rot_axis / (jnp.linalg.norm(rot_axis) + 1e-9)
 
             # Normalize the cylinder axis
-            cyl_axis = jnp.array(
-                detector_params.get("cylinder_axis", [0.0, 1.0, 0.0])
-            )
+            cyl_axis = jnp.array(detector_params.get("cylinder_axis", [0.0, 1.0, 0.0]))
             self.cylinder_axis = cyl_axis / (jnp.linalg.norm(cyl_axis) + 1e-9)
 
             self.bounds = {
@@ -473,8 +471,12 @@ class VectorizedObjective:
                 )
                 self.num_det_params += size
 
-            self.det_widths = jnp.array([pw * m for pw, m in zip(detector_params["pw"], detector_params["m"])])
-            self.det_heights = jnp.array([ph * n for ph, n in zip(detector_params["ph"], detector_params["n"])])
+            self.det_widths = jnp.array(
+                [pw * m for pw, m in zip(detector_params["pw"], detector_params["m"])]
+            )
+            self.det_heights = jnp.array(
+                [ph * n for ph, n in zip(detector_params["ph"], detector_params["n"])]
+            )
 
         # primitive cell
         self.centering = centering
@@ -616,10 +618,14 @@ class VectorizedObjective:
                     )
                     idx += self.num_active_gonio
 
-                offsets_delta = _forward_map_param(gonio_norm, self.goniometer_bound_deg)
+                offsets_delta = _forward_map_param(
+                    gonio_norm, self.goniometer_bound_deg
+                )
                 offsets_total = self.gonio_nominal_offsets[None, :] + offsets_delta
             else:
-                offsets_total = self.gonio_nominal_offsets[None, :].repeat(x.shape[0], axis=0)
+                offsets_total = self.gonio_nominal_offsets[None, :].repeat(
+                    x.shape[0], axis=0
+                )
 
             S, M = offsets_total.shape[0], self.gonio_angles.shape[1]
             R_list = []
@@ -628,9 +634,11 @@ class VectorizedObjective:
             for i in range(self.num_gonio_axes):
                 motor_idx = self.motor_map[i]
                 direction = self.gonio_axes[i][0:3]
-                
+
                 # Extract direction multiplier to maintain geometry parity
-                direction_mult = self.gonio_axes[i][3] if len(self.gonio_axes[i]) > 3 else 1.0
+                direction_mult = (
+                    self.gonio_axes[i][3] if len(self.gonio_axes[i]) > 3 else 1.0
+                )
 
                 current_axis_angle = (
                     self.gonio_angles[i, :][None, :]
@@ -649,7 +657,9 @@ class VectorizedObjective:
             for i in reversed(range(self.num_gonio_axes)):
                 t_i = t_axes[:, i, :][:, None, :]
                 # --- NEW KINEMATICS: Translate in local frame, THEN Rotate ---
-                sample_origin_lab = jnp.einsum('smij,smj->smi', R_list[i], sample_origin_lab + t_i)
+                sample_origin_lab = jnp.einsum(
+                    "smij,smj->smi", R_list[i], sample_origin_lab + t_i
+                )
         else:
             sample_origin_lab = t_axes[:, 0, :][:, None, :]
 
@@ -678,7 +688,7 @@ class VectorizedObjective:
                 scale = _forward_map_param(scale_norm, self.bounds["radial"])
 
                 c_dot_a = jnp.sum(c * self.cylinder_axis, axis=-1, keepdims=True)
-                
+
                 c_parallel = c_dot_a * self.cylinder_axis
                 c_perp = c - c_parallel
 
@@ -692,8 +702,12 @@ class VectorizedObjective:
 
                 # Pin the physical center of the panel ---
                 # Shift the corner backwards to counteract the area expansion
-                c = c - (w / 2.0)[:, :, None] * scale[:, :, None] * u - (h / 2.0)[:, :, None] * scale[:, :, None] * v
-                
+                c = (
+                    c
+                    - (w / 2.0)[:, :, None] * scale[:, :, None] * u
+                    - (h / 2.0)[:, :, None] * scale[:, :, None] * v
+                )
+
                 w = w * (1.0 + scale)
                 h = h * (1.0 + scale)
 
@@ -777,7 +791,7 @@ class VectorizedObjective:
             dyn_vhats,
             dyn_widths,
             dyn_heights,
-            area_scale
+            area_scale,
         )
 
     def indexer_dynamic_soft_jax(self, ub_mat, kf_ki_sample, k_sq_override=None):
@@ -802,7 +816,7 @@ class VectorizedObjective:
         v_k = v[:, 1, :]
         v_l = v[:, 2, :]
 
-        # 2. Pre-compute the projection (UB^T @ kf_ki) 
+        # 2. Pre-compute the projection (UB^T @ kf_ki)
         ub_T_kf_ki = jnp.matmul(ub_mat.transpose((0, 2, 1)), kf_ki_sample)
         ub_T_kf_ki_h = ub_T_kf_ki[:, 0, :]
         ub_T_kf_ki_k = ub_T_kf_ki[:, 1, :]
@@ -890,15 +904,27 @@ class VectorizedObjective:
 
         return loss, dist, hkl_ret, lamb_ret
 
-
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
         original_S = x.shape[0]
         pad_size = max(0, 2 - original_S)
         x_pad = jnp.pad(x, ((0, pad_size), (0, 0)), mode="edge") if pad_size > 0 else x
 
-        (UB, _, _, sample_origin_lab, ki_vec, _, R_cum, dyn_centers, dyn_uhats, dyn_vhats,
-            dyn_widths, dyn_heights, area_scale) = self._get_physical_params_jax(x_pad)
+        (
+            UB,
+            _,
+            _,
+            sample_origin_lab,
+            ki_vec,
+            _,
+            R_cum,
+            dyn_centers,
+            dyn_uhats,
+            dyn_vhats,
+            dyn_widths,
+            dyn_heights,
+            area_scale,
+        ) = self._get_physical_params_jax(x_pad)
 
         R_curr = R_cum if R_cum is not None else self.static_R
 
@@ -909,7 +935,7 @@ class VectorizedObjective:
             # Single-frame: Tile the origin to match all peaks
             s_lab = jnp.tile(sample_origin_lab, (1, self.peak_run_indices.shape[0], 1))
 
-        s = s_lab.transpose(0, 2, 1) # Shape: (S, 3, N_peaks)
+        s = s_lab.transpose(0, 2, 1)  # Shape: (S, 3, N_peaks)
 
         if self.refine_detector:
             c = dyn_centers[:, self.peak_det_idx, :]
@@ -947,7 +973,7 @@ class VectorizedObjective:
             q_lab = kf - ki
             k_sq_dyn = jnp.sum(q_lab**2, axis=1)
 
-        # q_lab is a pure momentum vector, so it strictly requires the 
+        # q_lab is a pure momentum vector, so it strictly requires the
         # inverse goniometer rotation (R^T) to reach the sample frame
         if R_curr is not None:
             q_lab_vec = q_lab.transpose(0, 2, 1)[..., None]
@@ -1068,11 +1094,7 @@ class FindUB:
 
         # Generalize bootstrap loader for existing hkl and lambda
         if "peaks/h" in data and "peaks/k" in data and "peaks/l" in data:
-            self.hkl = np.vstack([
-                data["peaks/h"],
-                data["peaks/k"],
-                data["peaks/l"]
-            ])
+            self.hkl = np.vstack([data["peaks/h"], data["peaks/k"], data["peaks/l"]])
         else:
             self.hkl = None
 
@@ -1171,7 +1193,7 @@ class FindUB:
                 b_offset = f["sample/offset"][()]
             else:
                 b_offset = np.zeros(3)
-                
+
             b_ki = (
                 f["beam/ki_vec"][()]
                 if "beam/ki_vec" in f
@@ -1241,7 +1263,11 @@ class FindUB:
                 axis_mask = [motor_mask[m_idx] for m_idx in motor_map]
                 new_params.append(np.full(sum(axis_mask) * 3, 0.5))
             else:
-                num_trans = max(1, len(self.goniometer_axes)) if self.goniometer_axes is not None else 1
+                num_trans = (
+                    max(1, len(self.goniometer_axes))
+                    if self.goniometer_axes is not None
+                    else 1
+                )
                 new_params.append(np.full(num_trans * 3, 0.5))
 
         if b_ki is not None:
@@ -1315,12 +1341,14 @@ class FindUB:
 
         # Determine if we should bypass indexing based on boolean or presence of hkls
         if no_index is None:
-            no_index = (self.hkl is not None and self.lambdas is not None)
+            no_index = self.hkl is not None and self.lambdas is not None
 
         self.no_index = no_index
 
         if self.no_index:
-            print("Bootstrapped solution detected. Bypassing integer search and minimizing via geometric vector displacement.")
+            print(
+                "Bootstrapped solution detected. Bypassing integer search and minimizing via geometric vector displacement."
+            )
             print("You can enable indexing with --index.")
 
         # Provide a dummy lab vector for metric initialization if angles were removed
@@ -1410,8 +1438,7 @@ class FindUB:
 
         # Initialize the global bounds array using the first value as a default fallback
         bounds_array = np.full(
-            len(unique_motors), 
-            gonio_bounds_list[0] if gonio_bounds_list else 5.0
+            len(unique_motors), gonio_bounds_list[0] if gonio_bounds_list else 5.0
         )
 
         goniometer_refine_mask = None
@@ -1437,8 +1464,8 @@ class FindUB:
             gonio_trans_bounds_list = list(goniometer_trans_bound_meters)
 
         bounds_array_trans = np.full(
-            len(unique_motors), 
-            gonio_trans_bounds_list[0] if gonio_trans_bounds_list else 0.005
+            len(unique_motors),
+            gonio_trans_bounds_list[0] if gonio_trans_bounds_list else 0.005,
         )
 
         if refine_sample and refine_goniometer_axes is not None:
@@ -1512,7 +1539,9 @@ class FindUB:
                 axis_mask = goniometer_refine_mask[motor_map]
                 num_dims += np.sum(axis_mask) * 3
             else:
-                num_trans = max(1, len(goniometer_axes)) if goniometer_axes is not None else 1
+                num_trans = (
+                    max(1, len(goniometer_axes)) if goniometer_axes is not None else 1
+                )
                 num_dims += num_trans * 3
         if refine_beam and self.peak_xyz is not None:
             num_dims += 2
@@ -1544,7 +1573,7 @@ class FindUB:
                 dyn_vhats,
                 dyn_widths,
                 dyn_heights,
-                area_scale
+                area_scale,
             ) = objective._get_physical_params_jax(x_batch)
             self.sample_offset = np.array(t_axes_batch[0])
             self.ki_vec = np.array(ki_vec_batch[0]).flatten()
@@ -1758,7 +1787,7 @@ class FindUB:
             dyn_vhats,
             dyn_widths,
             dyn_heights,
-            area_scale
+            area_scale,
         ) = objective._get_physical_params_jax(x_batch)
 
         self.sample_offset = np.array(t_axes_batch[0])

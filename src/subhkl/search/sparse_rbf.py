@@ -1256,12 +1256,12 @@ def global_shape_objective(
 
         var_r = jnp.maximum(Sigma_2D[0, 0], 1e-6)
         var_c = jnp.maximum(Sigma_2D[1, 1], 1e-6)
-        
+
         max_cov = jnp.sqrt(var_r * var_c) * 0.999
         cov_rc = jnp.clip(Sigma_2D[0, 1], -max_cov, max_cov)
 
         det_sigma = var_r * var_c - cov_rc**2
-        
+
         a = var_c / det_sigma
         b = -cov_rc / det_sigma
         c = var_r / det_sigma
@@ -1286,11 +1286,13 @@ def global_shape_objective(
     mses = vmap(fit_one_peak)(patches, bgs, drs, dcs, P_mats, distances, R_mats)
     return jnp.mean(mses)
 
+
 # Bind the val_and_grad wrapper to recognize the new static argument
 val_and_grad_fn = jit(
     jax.value_and_grad(global_shape_objective),
     static_argnames=["patch_size", "fit_mosaicity"],
 )
+
 
 def optimize_global_crystal(
     patches, bgs, drs, dcs, P_mats, distances, R_mats, fit_mosaicity=False
@@ -1325,7 +1327,7 @@ def optimize_global_crystal(
     bounds = [(None, None)] * (7 if fit_mosaicity else 6)
 
     # 1. Physical bounds (in METERS). 3.0 mm = 0.003 meters.
-    max_radius_meters = 0.003 
+    max_radius_meters = 0.003
 
     # 2. Diagonals (Indices 0, 2, 5) -> Must be positive, capped at max radius
     for idx in [0, 2, 5]:
@@ -1333,7 +1335,10 @@ def optimize_global_crystal(
 
     # 3. Off-diagonals (Indices 1, 3, 4) -> Symmetric bounds to prevent extreme skew
     for idx in [1, 3, 4]:
-        bounds[idx] = (-max_radius_meters / scales[idx], max_radius_meters / scales[idx])
+        bounds[idx] = (
+            -max_radius_meters / scales[idx],
+            max_radius_meters / scales[idx],
+        )
 
     # 4. Mosaicity bound (if active, e.g., max 10 mrad = 0.010 rad)
     if fit_mosaicity:
@@ -1341,12 +1346,12 @@ def optimize_global_crystal(
 
     x0_opt = x0_phys / scales
     res = scipy.optimize.minimize(
-        scipy_objective, 
-        x0_opt, 
-        method="L-BFGS-B", 
-        jac=True, 
+        scipy_objective,
+        x0_opt,
+        method="L-BFGS-B",
+        jac=True,
         bounds=bounds,
-        options={"maxiter": 250, "disp": False}
+        options={"maxiter": 250, "disp": False},
     )
 
     x_final_phys = res.x * scales
@@ -1854,9 +1859,17 @@ def integrate_peaks_rbf_ssn(
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes)
                 if gonio_angles.shape[1] == num_axes:
-                    ang = gonio_angles[run_id, :] if run_id < gonio_angles.shape[0] else gonio_angles[0, :]
+                    ang = (
+                        gonio_angles[run_id, :]
+                        if run_id < gonio_angles.shape[0]
+                        else gonio_angles[0, :]
+                    )
                 else:
-                    ang = gonio_angles[:, run_id] if run_id < gonio_angles.shape[1] else gonio_angles[:, 0]
+                    ang = (
+                        gonio_angles[:, run_id]
+                        if run_id < gonio_angles.shape[1]
+                        else gonio_angles[:, 0]
+                    )
             else:
                 ang = gonio_angles
 
@@ -1870,15 +1883,19 @@ def integrate_peaks_rbf_ssn(
                 offsets_full = offsets
 
             return sample_to_lab(
-                np.array([0.0, 0.0, 0.0]), 
-                gonio_axes, 
-                ang, 
+                np.array([0.0, 0.0, 0.0]),
+                gonio_axes,
+                ang,
                 offsets_full,
-                zero_offsets=gonio_offsets
+                zero_offsets=gonio_offsets,
             )
 
         # 2. Legacy fallback
-        s_off = sample_offset if sample_offset is not None and sample_offset.ndim == 1 else (sample_offset[-1] if sample_offset is not None else np.zeros(3))
+        s_off = (
+            sample_offset
+            if sample_offset is not None and sample_offset.ndim == 1
+            else (sample_offset[-1] if sample_offset is not None else np.zeros(3))
+        )
         return R_val @ s_off if R_val is not None else s_off
 
     integrator = SparseLaueIntegrator(
@@ -1907,9 +1924,9 @@ def integrate_peaks_rbf_ssn(
 
     frame_counter = 0
 
-    for seq_idx, img_key in enumerate(tqdm(
-        img_keys_ordered, disable=not show_progress, desc="Batching Images"
-    )):
+    for seq_idx, img_key in enumerate(
+        tqdm(img_keys_ordered, disable=not show_progress, desc="Batching Images")
+    ):
         p_data = peak_dict[img_key]
         i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr = p_data
 
@@ -2054,7 +2071,7 @@ def integrate_peaks_rbf_ssn(
 
     for idx in range(len(frames)):
         f, r, c = frames[idx], all_rs[idx], all_cs[idx]
-        
+
         # Boundary safety check (matches your H, W constraints)
         if not (bw < int(round(r)) < H - bw and bw < int(round(c)) < W - bw):
             continue
@@ -2064,7 +2081,7 @@ def integrate_peaks_rbf_ssn(
         opt_Rmats.append(all_R_mats[idx])
 
         ri, ci = int(round(r)) + opt_P, int(round(c)) + opt_P
-        
+
         # Bounding box bounds
         r_min, r_max = ri - opt_half, ri + opt_half + 1
         c_min, c_max = ci - opt_half, ci + opt_half + 1

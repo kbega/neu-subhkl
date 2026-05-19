@@ -158,6 +158,7 @@ def extract_xyz_from_file(file_path, instrument=None):
 
     return None, None
 
+
 def compute_metrics(
     file1: str,
     file2: str | None = None,
@@ -183,14 +184,21 @@ def compute_metrics(
                 sample_offset = np.zeros(3)
 
             gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
-            gonio_angles = f["goniometer/angles"][()] if "goniometer/angles" in f else None
+            gonio_angles = (
+                f["goniometer/angles"][()] if "goniometer/angles" in f else None
+            )
 
             gonio_offsets = None
             off_data = f.get("goniometer/offsets")
             if off_data is not None:
-                gonio_names = f["goniometer/names"][()] if "goniometer/names" in f else None
+                gonio_names = (
+                    f["goniometer/names"][()] if "goniometer/names" in f else None
+                )
                 if gonio_names is not None:
-                    gonio_names = [n.decode('utf-8') if isinstance(n, bytes) else str(n) for n in gonio_names]
+                    gonio_names = [
+                        n.decode("utf-8") if isinstance(n, bytes) else str(n)
+                        for n in gonio_names
+                    ]
                 if isinstance(off_data, h5py.Group) and gonio_names is not None:
                     gonio_offsets = np.zeros(len(gonio_names), dtype=np.float32)
                     for i, name in enumerate(gonio_names):
@@ -199,7 +207,7 @@ def compute_metrics(
                 else:
                     raw_offs = off_data[()]
                     gonio_offsets = np.zeros(len(raw_offs), dtype=np.float32)
-                    gonio_offsets[:len(raw_offs)] = raw_offs
+                    gonio_offsets[: len(raw_offs)] = raw_offs
 
             if ki_vec_override is not None:
                 ki_vec = ki_vec_override
@@ -388,12 +396,18 @@ def compute_metrics(
             gonio_angles_mapped = None
 
         d_err, ang_err = calculate_angular_error(
-            xyz_det, h, k, l, lam, 
+            xyz_det,
+            h,
+            k,
+            l,
+            lam,
             UB,
-            sample_offset, ki_vec, R_all,
+            sample_offset,
+            ki_vec,
+            R_all,
             gonio_axes=gonio_axes,
             gonio_angles=gonio_angles_mapped,
-            gonio_offsets=gonio_offsets # <-- Pass Down
+            gonio_offsets=gonio_offsets,  # <-- Pass Down
         )
 
         result = {

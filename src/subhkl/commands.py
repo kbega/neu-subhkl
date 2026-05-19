@@ -41,9 +41,16 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
                     beamlines[instrument][bank_id]["vhat"] = calib_grp[bank_key][
                         "vhat"
                     ][()].tolist()
-                    if "width" in calib_grp[bank_key] and "height" in calib_grp[bank_key]:
-                        beamlines[instrument][bank_id]["width"] = float(calib_grp[bank_key]["width"][()])
-                        beamlines[instrument][bank_id]["height"] = float(calib_grp[bank_key]["height"][()])
+                    if (
+                        "width" in calib_grp[bank_key]
+                        and "height" in calib_grp[bank_key]
+                    ):
+                        beamlines[instrument][bank_id]["width"] = float(
+                            calib_grp[bank_key]["width"][()]
+                        )
+                        beamlines[instrument][bank_id]["height"] = float(
+                            calib_grp[bank_key]["height"][()]
+                        )
                     count += 1
             if count > 0:
                 print(f"Successfully applied calibration to {count} detector panels.")
@@ -105,9 +112,11 @@ def run_index(
 
     if detector_global_rot_axis is not None:
         if "global_rot" in detector_modes:
-            print(f"Auto-switching detector mode: 'global_rot' -> 'global_rot_axis' (Axis: {detector_global_rot_axis})")
+            print(
+                f"Auto-switching detector mode: 'global_rot' -> 'global_rot_axis' (Axis: {detector_global_rot_axis})"
+            )
             detector_modes = [
-                "global_rot_axis" if mode == "global_rot" else mode 
+                "global_rot_axis" if mode == "global_rot" else mode
                 for mode in detector_modes
             ]
     else:
@@ -116,13 +125,14 @@ def run_index(
 
     if cylinder_axis is not None:
         if "radial" in detector_modes:
-            print(f"Auto-switching detector mode: 'radial' -> 'cylindrical' (Axis: {cylinder_axis})")
+            print(
+                f"Auto-switching detector mode: 'radial' -> 'cylindrical' (Axis: {cylinder_axis})"
+            )
             detector_modes = [
-                "cylindrical" if mode == "radial" else mode 
-                for mode in detector_modes
+                "cylindrical" if mode == "radial" else mode for mode in detector_modes
             ]
     else:
-        cylinder_axis = [0.0, 1.0, 0.0] # Safe default for downstream JAX compilation
+        cylinder_axis = [0.0, 1.0, 0.0]  # Safe default for downstream JAX compilation
 
     # --- INJECT BOOTSTRAP PHYSICS DIRECTLY ---
     if bootstrap_filename:
@@ -276,7 +286,7 @@ def run_index(
                         ph.append(det.height / det.n)
 
                         # Map to the true contiguous index
-                        bank_to_idx[b_id] = len(valid_target_banks) 
+                        bank_to_idx[b_id] = len(valid_target_banks)
                         valid_target_banks.append(b_id)
                     except Exception as e:
                         print(f"WARNING: Could not load geometry for bank {b_id}: {e}")
@@ -357,7 +367,9 @@ def run_index(
     if bootstrap_filename:
         with h5py.File(bootstrap_filename, "r") as b_f:
             if "goniometer/translations" in b_f:
-                input_data["goniometer/translations"] = b_f["goniometer/translations"][()]
+                input_data["goniometer/translations"] = b_f["goniometer/translations"][
+                    ()
+                ]
             if "beam/ki_vec" in b_f:
                 ki_vec_val = b_f["beam/ki_vec"][()]
             if "peaks/h" in b_f:
@@ -400,7 +412,9 @@ def run_index(
         print(f"Refining lattice parameters with {lattice_bound_frac * 100}% bounds.")
     if refine_goniometer_trans:
         num_axes = len(opt.goniometer_axes) if opt.goniometer_axes is not None else 1
-        print(f"Refining per-axis goniometer translations ({num_axes} axes) with bounds: {goniometer_trans_bound_meters} m.")
+        print(
+            f"Refining per-axis goniometer translations ({num_axes} axes) with bounds: {goniometer_trans_bound_meters} m."
+        )
     if refine_beam:
         print(f"Refining beam tilt with {beam_bound_deg}° bounds.")
 
@@ -903,39 +917,55 @@ def run_peak_predictor(
             space_group = f_idx["sample/space_group"][()].decode("utf-8")
 
         wavelength = f_idx["instrument/wavelength"][()]
-        if wavel_min: wavelength[0] = wavel_min
-        if wavel_max: wavelength[1] = wavel_max
+        if wavel_min:
+            wavelength[0] = wavel_min
+        if wavel_max:
+            wavelength[1] = wavel_max
 
         U = f_idx["sample/U"][()]
         B = f_idx["sample/B"][()]
 
         gonio_offsets = None
         off_data = f_idx.get("goniometer/offsets")
-        gonio_names = f_idx["goniometer/names"][()] if "goniometer/names" in f_idx else None
+        gonio_names = (
+            f_idx["goniometer/names"][()] if "goniometer/names" in f_idx else None
+        )
 
         if gonio_names is not None:
-            gonio_names = [n.decode('utf-8') if isinstance(n, bytes) else str(n) for n in gonio_names]
+            gonio_names = [
+                n.decode("utf-8") if isinstance(n, bytes) else str(n)
+                for n in gonio_names
+            ]
 
         if off_data is not None:
-            gonio_offsets = np.zeros(len(gonio_names) if gonio_names else 1, dtype=np.float32)
+            gonio_offsets = np.zeros(
+                len(gonio_names) if gonio_names else 1, dtype=np.float32
+            )
             if isinstance(off_data, h5py.Group) and gonio_names is not None:
                 for i, name in enumerate(gonio_names):
                     if name in off_data:
                         gonio_offsets[i] = float(off_data[name][()])
             else:
                 raw_offs = off_data[()]
-                gonio_offsets[:len(raw_offs)] = raw_offs
+                gonio_offsets[: len(raw_offs)] = raw_offs
 
         if "goniometer/translations" in f_idx:
             sample_offset = f_idx["goniometer/translations"][()]
         else:
             sample_offset = np.zeros(3)
 
-        gonio_axes = f_idx["goniometer/axes"][()] if "goniometer/axes" in f_idx else None
-        ki_vec = f_idx["beam/ki_vec"][()] if "beam/ki_vec" in f_idx else np.array([0.0, 0.0, 1.0])
+        ki_vec = (
+            f_idx["beam/ki_vec"][()]
+            if "beam/ki_vec" in f_idx
+            else np.array([0.0, 0.0, 1.0])
+        )
 
-    peaks = Peaks(filename, instrument, wavelength_min=wavelength[0], wavelength_max=wavelength[1])
-    print(f"Predicting peaks for {len(peaks.image.ims)} images using solution from {indexed_hdf5_filename}")
+    peaks = Peaks(
+        filename, instrument, wavelength_min=wavelength[0], wavelength_max=wavelength[1]
+    )
+    print(
+        f"Predicting peaks for {len(peaks.image.ims)} images using solution from {indexed_hdf5_filename}"
+    )
 
     if gonio_offsets is not None:
         print(f"Applying refined goniometer offsets from indexer: {gonio_offsets}")
@@ -944,18 +974,23 @@ def run_peak_predictor(
     UB = U @ B
 
     results_map = peaks.predict_peaks(
-        a, b, c, alpha, beta, gamma, d_min,
+        a,
+        b,
+        c,
+        alpha,
+        beta,
+        gamma,
+        d_min,
         UB=UB,
         space_group=space_group,
         sample_offset=sample_offset,
         ki_vec=ki_vec,
         max_workers=max_workers,
-
         # --- NEW GROUND TRUTH DELEGATION ---
-        R_all=None, # Force dynamic evaluation
+        R_all=None,  # Force dynamic evaluation
         gonio_axes=peaks.goniometer.axes_raw,
         gonio_angles=peaks.goniometer.angles_raw,
-        gonio_offsets=gonio_offsets # Pass the pure zero-points
+        gonio_offsets=gonio_offsets,  # Pass the pure zero-points
     )
 
     print(f"Saving predictions to {integration_peaks_filename}")
@@ -965,7 +1000,9 @@ def run_peak_predictor(
         f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = alpha, beta, gamma
 
         sorted_keys = sorted(peaks.image.ims.keys())
-        bank_ids = np.array([peaks.image.bank_mapping.get(k, k) for k in sorted_keys], dtype=np.int32)
+        bank_ids = np.array(
+            [peaks.image.bank_mapping.get(k, k) for k in sorted_keys], dtype=np.int32
+        )
         f.create_dataset("bank_ids", data=bank_ids)
 
         f["sample/space_group"] = space_group
@@ -982,17 +1019,24 @@ def run_peak_predictor(
 
         if peaks.goniometer.names_raw:
             dt = h5py.string_dtype(encoding="utf-8")
-            f.create_dataset("goniometer/names", data=peaks.goniometer.names_raw, dtype=dt)
+            f.create_dataset(
+                "goniometer/names", data=peaks.goniometer.names_raw, dtype=dt
+            )
 
         for img_key, (i, j, h, k, l, wl) in results_map.items():
             grp = f.create_group(f"banks/{img_key}")
             grp.create_dataset("i", data=i), grp.create_dataset("j", data=j)
-            grp.create_dataset("h", data=h), grp.create_dataset("k", data=k), grp.create_dataset("l", data=l)
+            (
+                grp.create_dataset("h", data=h),
+                grp.create_dataset("k", data=k),
+                grp.create_dataset("l", data=l),
+            )
             grp.create_dataset("wavelength", data=wl)
 
         with h5py.File(indexed_hdf5_filename, "r") as f_in:
             if "detector_calibration" in f_in:
                 f_in.copy("detector_calibration", f)
+
 
 def run_rbf_integrator(
     filename: str,
@@ -1024,17 +1068,27 @@ def run_rbf_integrator(
 
     with h5py.File(integration_peaks_filename, "r") as f:
         angles_stack = f["goniometer/angles"][()] if "goniometer/angles" in f else None
-        sample_offset = f["goniometer/translations"][()] if "goniometer/translations" in f else np.zeros(3)
+        sample_offset = (
+            f["goniometer/translations"][()]
+            if "goniometer/translations" in f
+            else np.zeros(3)
+        )
         gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
 
-        gonio_offsets = f["goniometer/offsets"][()] if "goniometer/offsets" in f else None
+        gonio_offsets = (
+            f["goniometer/offsets"][()] if "goniometer/offsets" in f else None
+        )
 
         for key in f["banks"].keys():
             img_idx = int(key)
             grp = f[f"banks/{key}"]
             peak_dict[img_idx] = [
-                grp["i"][()], grp["j"][()], grp["h"][()],
-                grp["k"][()], grp["l"][()], grp["wavelength"][()]
+                grp["i"][()],
+                grp["j"][()],
+                grp["h"][()],
+                grp["k"][()],
+                grp["l"][()],
+                grp["wavelength"][()],
             ]
 
     peaks = Peaks(filename, instrument)
@@ -1064,7 +1118,7 @@ def run_rbf_integrator(
         max_workers=max_workers,
         gonio_axes=gonio_axes,
         gonio_angles=angles_stack,
-        gonio_offsets=gonio_offsets
+        gonio_offsets=gonio_offsets,
     )
 
     print(f"Saving RBF integrated peaks to {output_filename}")
@@ -1077,18 +1131,29 @@ def run_rbf_integrator(
 
         # Copy metadata
         copy_keys = [
-            "sample/a", "sample/b", "sample/c",
-            "sample/alpha", "sample/beta", "sample/gamma",
-            "sample/space_group", "sample/U", "sample/B",
-            "goniometer/translations", "goniometer/offsets", # <-- INCLUDED
-            "beam/ki_vec", "instrument/wavelength",
+            "sample/a",
+            "sample/b",
+            "sample/c",
+            "sample/alpha",
+            "sample/beta",
+            "sample/gamma",
+            "sample/space_group",
+            "sample/U",
+            "sample/B",
+            "goniometer/translations",
+            "goniometer/offsets",  # <-- INCLUDED
+            "beam/ki_vec",
+            "instrument/wavelength",
         ]
 
         with h5py.File(integration_peaks_filename, "r") as f_in:
             for key in copy_keys:
-                if key in f_in: f_in.copy(f_in[key], f, key)
+                if key in f_in:
+                    f_in.copy(f_in[key], f, key)
             for k in ["goniometer/axes", "goniometer/names"]:
-                if k in f_in: f_in.copy(f_in[k], f, k)
+                if k in f_in:
+                    f_in.copy(f_in[k], f, k)
+
 
 def run_integrator(
     filename: str,
@@ -1122,7 +1187,11 @@ def run_integrator(
         B = f["sample/B"][()] if "sample/B" in f else None
         all_R = f["goniometer/R"][()] if "goniometer/R" in f else None
         angles_stack = f["goniometer/angles"][()] if "goniometer/angles" in f else None
-        sample_offset = f["goniometer/translations"][()] if "goniometer/translations" in f else np.zeros(3)
+        sample_offset = (
+            f["goniometer/translations"][()]
+            if "goniometer/translations" in f
+            else np.zeros(3)
+        )
         ki_vec = (
             f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
         )
@@ -1173,7 +1242,6 @@ def run_integrator(
         RUB=RUB,
         R_stack=all_R,
         angles_stack=angles_stack,
-        gonio_axes=gonio_axes,
         sample_offset=sample_offset,
         ki_vec=ki_vec,
         create_visualizations=create_visualizations,

@@ -292,18 +292,16 @@ def predict_single_bank(
     R_bank=None,
     gonio_axes=None,
     gonio_angles=None,
-    gonio_offsets=None,   # <-- NEW
+    gonio_offsets=None,  # <-- NEW
 ):
     """
     Worker function for predicting peaks on a single detector bank.
     Generates HKLs locally (lazy generation) to reduce IPC overhead.
     """
     a, b, c, alpha, beta, gamma, space_group, d_min = unit_cell_params
-    from subhkl.core.crystallography import generate_reflections
     h, k, l = generate_reflections(a, b, c, alpha, beta, gamma, space_group, d_min)
 
     from subhkl.instrument.detector import Detector
-    from subhkl.instrument.physics import predict_reflections_on_panel
 
     det = Detector(det_config)
 
@@ -312,7 +310,7 @@ def predict_single_bank(
         h=h,
         k=k,
         l=l,
-        UB=UB,             # <-- Pass UB
+        UB=UB,  # <-- Pass UB
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
         sample_offset=sample_offset,
@@ -320,11 +318,12 @@ def predict_single_bank(
         R_all=R_bank,
         gonio_axes=gonio_axes,
         gonio_angles=gonio_angles,
-        gonio_offsets=gonio_offsets, # <-- Pass Down
+        gonio_offsets=gonio_offsets,  # <-- Pass Down
     )
     if len(row) > 0:
         return bank_id, [row, col, h_f, k_f, l_f, wl_f]
-    return img_key, None 
+    return img_key, None
+
 
 def integrate_single_bank(
     bank_id,
