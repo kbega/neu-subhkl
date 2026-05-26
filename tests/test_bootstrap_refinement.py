@@ -111,11 +111,11 @@ def test_u_absorbs_gonio_offset(tmp_path):
 
         # --- WRITE GROUP INSTEAD OF DATASET ---
         if isinstance(fu.goniometer_offsets, dict):
-            grp = f.create_group("optimization/goniometer_offsets")
+            grp = f.create_group("goniometer/offsets")
             for k, v in fu.goniometer_offsets.items():
                 grp[k] = v
         else:
-            f["optimization/goniometer_offsets"] = fu.goniometer_offsets
+            f["goniometer/offsets"] = fu.goniometer_offsets
         f["optimization/best_params"] = fu.x
         # --------------------------------------
 
@@ -130,6 +130,8 @@ def test_u_absorbs_gonio_offset(tmp_path):
     assert isinstance(fu.goniometer_offsets, dict), "Dict mapping failed to initialize!"
     expected_offset = np.array([fu.goniometer_offsets["omega"]])
 
+    print(fu2.base_gonio_offset)
+    print(expected_offset)
     assert np.allclose(fu2.base_gonio_offset, expected_offset), (
         "Bootstrap failed to load dict offset!"
     )

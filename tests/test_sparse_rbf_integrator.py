@@ -216,7 +216,6 @@ def test_integrate_peaks_rbf_ssn_orchestrator():
         sigmas=[1.0, 2.0, 3.0],
         alpha=0.5,
         gamma=2.0,
-        max_peaks=3,
         show_progress=False,
     )
 
@@ -717,7 +716,6 @@ def test_large_sensor_basic_integration():
         sigmas=[1.0, 2.0, 4.0],
         alpha=4.0,
         gamma=1.0,
-        max_peaks=5,
         show_progress=False,
     )
 
@@ -830,7 +828,6 @@ def test_integrator_large_sensor_halo_suppression():
         sigmas=[1.0, 2.0, 4.0],
         alpha=5.0,
         gamma=1.0,
-        max_peaks=10,
         show_progress=False,
     )
 
