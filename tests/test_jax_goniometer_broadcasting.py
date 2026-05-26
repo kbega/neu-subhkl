@@ -64,13 +64,14 @@ def test_jax_1_to_n_broadcasting_bug():
         # TypeError: add got incompatible shapes for broadcasting: (2, 4, 1), (1, 5, 3)
         results = obj._get_physical_params_jax(x)
 
-        offsets_total = results[4]
-        R = results[5]
+        offsets_total = results[5]
+        R = results[6]
 
     except Exception as e:
         pytest.fail(f"Broadcasting bug triggered! JAX raised: {e}")
 
     # 1. The optimizer should have allocated exactly 4 offset parameters
+    print(offsets_total)
     assert offsets_total.shape == (2, 4), (
         "Optimizer failed to collapse to 4 refinement parameters!"
     )

@@ -103,7 +103,6 @@ def prepare_harvest_tasks(
             loss=harvest_peaks_kwargs.get("loss", "gaussian"),
             min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
             max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
-            max_peaks=harvest_peaks_kwargs.get("max_peaks", 500),
             border_width=int(border_width),
             chunk_size=harvest_peaks_kwargs.get("chunk_size", 128),
             show_steps=harvest_peaks_kwargs.get("show_steps", False),
@@ -198,11 +197,14 @@ def prepare_predict_tasks(
     beta: float,
     gamma: float,
     d_min: float,
-    RUB: np.ndarray,
+    UB: np.ndarray,
     space_group: str = "P 1",
     sample_offset: Optional[np.ndarray] = None,
     ki_vec: Optional[np.ndarray] = None,
     R_all: Optional[np.ndarray] = None,
+    gonio_axes: Optional[Any] = None,
+    gonio_angles: Optional[np.ndarray] = None,
+    gonio_offsets: Optional[np.ndarray] = None,
 ) -> List[Tuple[Any, ...]]:
     bank_mapping = image_data.bank_mapping
     tasks = []
@@ -220,19 +222,60 @@ def prepare_predict_tasks(
         bank_id = bank_mapping.get(img_key, img_key)
         det_config = beamlines[instrument][str(int(bank_id))]
 
+        run_id = image_data.get_run_id(img_key)
+
+        # 1. Extract single R matrix (Legacy Fallback)
+        R_bank = None
+        if R_all is not None:
+            if R_all.ndim == 3:
+                if len(R_all) == total_images:
+                    R_bank = R_all[img_index]
+                else:
+                    R_bank = R_all[run_id] if run_id < len(R_all) else R_all[0]
+            else:
+                R_bank = R_all
+
+        # 2. Extract single goniometer angle state
+        angles_bank = None
+        if gonio_angles is not None:
+            if gonio_angles.ndim == 2:
+                num_axes = len(gonio_axes) if gonio_axes is not None else 1
+                if gonio_angles.shape[1] == num_axes:
+                    if gonio_angles.shape[0] == total_images:
+                        angles_bank = gonio_angles[img_index, :]
+                    else:
+                        angles_bank = (
+                            gonio_angles[run_id, :]
+                            if run_id < gonio_angles.shape[0]
+                            else gonio_angles[0, :]
+                        )
+                else:
+                    if gonio_angles.shape[1] == total_images:
+                        angles_bank = gonio_angles[:, img_index]
+                    else:
+                        angles_bank = (
+                            gonio_angles[:, run_id]
+                            if run_id < gonio_angles.shape[1]
+                            else gonio_angles[:, 0]
+                        )
+            else:
+                angles_bank = gonio_angles
+
         tasks.append(
             (
-                img_key,  # The HDF5 array index (e.g., 0, 1, 2)
-                bank_id,  # The physical name (e.g., 52, 53)
-                det_config,  # Geometry dict from beamlines.json
+                img_key,
+                bank_id,
+                det_config,
                 unit_cell_params,
-                RUB,  # The full RUB stack
+                UB,  # <-- Pass constant UB!
                 wavelength_min,
                 wavelength_max,
                 sample_offset,
                 ki_vec,
-                R_all,  # The full R_all stack
-                img_index,  # The sequential index for matrix extraction
+                R_bank,
+                gonio_axes,
+                angles_bank,
+                gonio_offsets,  # <-- NEW
             )
         )
     return tasks

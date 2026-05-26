@@ -63,11 +63,15 @@ def extract_xyz_from_file(file_path, instrument=None):
         if "detector_calibration" in f:
             calib_grp = f["detector_calibration"]
             for b_key in calib_grp.keys():
-                calibration_dict[b_key] = {
+                calib = {
                     "center": calib_grp[b_key]["center"][()],
                     "uhat": calib_grp[b_key]["uhat"][()],
                     "vhat": calib_grp[b_key]["vhat"][()],
                 }
+                if "width" in calib_grp[b_key] and "height" in calib_grp[b_key]:
+                    calib["width"] = float(calib_grp[b_key]["width"][()])
+                    calib["height"] = float(calib_grp[b_key]["height"][()])
+                calibration_dict[b_key] = calib
 
         # 1. Coordinate array reconstruction (Finder, Indexer, Integrator)
         if "peaks/pixel_r" in f and "peaks/pixel_c" in f:
@@ -100,6 +104,9 @@ def extract_xyz_from_file(file_path, instrument=None):
                         det.center = calibration_dict[bank_str]["center"]
                         det.uhat = calibration_dict[bank_str]["uhat"]
                         det.vhat = calibration_dict[bank_str]["vhat"]
+                        if "width" in calibration_dict[bank_str]:
+                            det.width = calibration_dict[bank_str]["width"]
+                            det.height = calibration_dict[bank_str]["height"]
 
                     xyz[mask] = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
                 except KeyError:
@@ -133,6 +140,9 @@ def extract_xyz_from_file(file_path, instrument=None):
                         det.center = calibration_dict[bank_str]["center"]
                         det.uhat = calibration_dict[bank_str]["uhat"]
                         det.vhat = calibration_dict[bank_str]["vhat"]
+                        if "width" in calibration_dict[bank_str]:
+                            det.width = calibration_dict[bank_str]["width"]
+                            det.height = calibration_dict[bank_str]["height"]
 
                     xyz = det.pixel_to_lab(i_p, j_p)
                     if xyz.ndim == 1:
@@ -168,9 +178,36 @@ def compute_metrics(
             ub_helper.gamma = f["sample/gamma"][()]
             B_mat = ub_helper.reciprocal_lattice_B()
             U = f["sample/U"][()] if "sample/U" in f else np.eye(3)
-            sample_offset = (
-                f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
+            if "goniometer/translations" in f:
+                sample_offset = f["goniometer/translations"][()]
+            else:
+                sample_offset = np.zeros(3)
+
+            gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
+            gonio_angles = (
+                f["goniometer/angles"][()] if "goniometer/angles" in f else None
             )
+
+            gonio_offsets = None
+            off_data = f.get("goniometer/offsets")
+            if off_data is not None:
+                gonio_names = (
+                    f["goniometer/names"][()] if "goniometer/names" in f else None
+                )
+                if gonio_names is not None:
+                    gonio_names = [
+                        n.decode("utf-8") if isinstance(n, bytes) else str(n)
+                        for n in gonio_names
+                    ]
+                if isinstance(off_data, h5py.Group) and gonio_names is not None:
+                    gonio_offsets = np.zeros(len(gonio_names), dtype=np.float32)
+                    for i, name in enumerate(gonio_names):
+                        if name in off_data:
+                            gonio_offsets[i] = float(off_data[name][()])
+                else:
+                    raw_offs = off_data[()]
+                    gonio_offsets = np.zeros(len(raw_offs), dtype=np.float32)
+                    gonio_offsets[: len(raw_offs)] = raw_offs
 
             if ki_vec_override is not None:
                 ki_vec = ki_vec_override
@@ -346,13 +383,31 @@ def compute_metrics(
             d_filter_message = f"Filtered to {len(h)} peaks with d >= {d_min} A."
 
         UB = U @ B_mat
-        if R_all.ndim == 3:
-            RUB = np.matmul(R_all, UB)
+        if gonio_angles is not None:
+            if gonio_angles.ndim == 2:
+                num_axes = len(gonio_axes) if gonio_axes is not None else 1
+                if gonio_angles.shape[1] == num_axes:
+                    gonio_angles_mapped = gonio_angles[run_index, :]
+                else:
+                    gonio_angles_mapped = gonio_angles[:, run_index].T
+            else:
+                gonio_angles_mapped = gonio_angles
         else:
-            RUB = R_all @ UB
+            gonio_angles_mapped = None
 
         d_err, ang_err = calculate_angular_error(
-            xyz_det, h, k, l, lam, RUB, sample_offset, ki_vec, R_all
+            xyz_det,
+            h,
+            k,
+            l,
+            lam,
+            UB,
+            sample_offset,
+            ki_vec,
+            R_all,
+            gonio_axes=gonio_axes,
+            gonio_angles=gonio_angles_mapped,
+            gonio_offsets=gonio_offsets,  # <-- Pass Down
         )
 
         result = {

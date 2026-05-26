@@ -20,8 +20,9 @@ import pytest
 
 from subhkl.io.parser import indexer
 from subhkl.commands import (
+    run_reduce as reduce,
     run_finder as finder,
-    run_integrator as integrator,
+    run_rbf_integrator as integrator,
     run_mtz_exporter as mtz_exporter,
     run_peak_predictor as peak_predictor,
 )
@@ -43,7 +44,9 @@ LATTICE_PARAMS = {
 SPACE_GROUP = "F d d 2"
 
 # Integration parameters (from bash script)
-INTEGRATOR_PARAMS = {
+FINDER_PARAMS = {
+    "finder_algorithm": "thresholding",
+    "thresholding_noise_cutoff_quantile": 0.99,
     "region_growth_minimum_intensity": 25.0,
     "region_growth_maximum_pixel_radius": 6.0,
     "peak_center_box_size": 3,
@@ -66,9 +69,9 @@ INDEXER_DEFAULTS = {
     "lattice_bound_frac": 0.05,
     "refine_goniometer": False,
     "refine_goniometer_axes": None,
-    "goniometer_bound_deg": 5.0,
-    "refine_sample": False,
-    "sample_bound_meters": 2.0,
+    "goniometer_bound_deg": str(5.0),
+    "refine_goniometer_trans": False,
+    "goniometer_trans_bound_meters": str(2.0),
     "refine_beam": False,
     "beam_bound_deg": 1.0,
     "bootstrap_filename": None,
@@ -84,7 +87,18 @@ def fixture__mesolite_input_file(test_data_dir):
     if not filepath.exists():
         pytest.skip(f"Mesolite test file not found: {filepath}")
 
-    return str(filepath)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_reduce = os.path.join(tmpdir, "mesolite.im.h5")
+
+        reduce(
+            nexus_filename=filepath,
+            output_filename=output_reduce,
+            instrument=INSTRUMENT,
+            wavelength_min=2.0,
+            wavelength_max=4.5,
+        )
+
+        yield str(output_reduce)
 
 
 @pytest.fixture(name="temp_output_dir")
@@ -115,9 +129,7 @@ class TestMandiMesoliteSingleRun:
             filename=mesolite_input_file,
             instrument=INSTRUMENT,
             output_filename=finder_output,
-            finder_algorithm="thresholding",
-            thresholding_noise_cutoff_quantile=0.99,
-            **INTEGRATOR_PARAMS,
+            **FINDER_PARAMS,
         )
         assert os.path.exists(finder_output), "Finder failed to create output file"
 
@@ -133,8 +145,6 @@ class TestMandiMesoliteSingleRun:
             beta=LATTICE_PARAMS["beta"],
             gamma=LATTICE_PARAMS["gamma"],
             space_group=SPACE_GROUP,
-            wavelength_min=2.0,
-            wavelength_max=4.5,
             **INDEXER_DEFAULTS,
         )
         assert os.path.exists(indexer_output), "Indexer failed to create output file"
@@ -165,7 +175,6 @@ class TestMandiMesoliteSingleRun:
             instrument=INSTRUMENT,
             integration_peaks_filename=predictor_output,
             output_filename=integrator_output,
-            **INTEGRATOR_PARAMS,
         )
         assert os.path.exists(integrator_output), (
             "Integrator failed to create output file"

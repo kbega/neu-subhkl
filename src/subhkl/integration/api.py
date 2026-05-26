@@ -187,13 +187,16 @@ class Peaks:
         beta,
         gamma,
         d_min,
-        RUB,
+        UB,
         space_group="P 1",
         sample_offset=None,
         ki_vec=None,
         R_all=None,
         max_workers: int = None,
         show_progress: bool = False,
+        gonio_axes=None,
+        gonio_angles=None,
+        gonio_offsets=None,
     ) -> dict:
         peak_dict = {}
         tasks = orchestrator.prepare_predict_tasks(
@@ -208,11 +211,14 @@ class Peaks:
             beta=beta,
             gamma=gamma,
             d_min=d_min,
-            RUB=RUB,
+            UB=UB,
             space_group=space_group,
             sample_offset=sample_offset,
             ki_vec=ki_vec,
             R_all=R_all,
+            gonio_axes=gonio_axes,
+            gonio_angles=gonio_angles,
+            gonio_offsets=gonio_offsets,
         )
 
         ctx = multiprocessing.get_context("spawn")
