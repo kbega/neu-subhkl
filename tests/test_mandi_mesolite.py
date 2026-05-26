@@ -90,14 +90,16 @@ def fixture__mesolite_input_file(test_data_dir):
     with tempfile.TemporaryDirectory() as tmpdir:
         output_reduce = os.path.join(tmpdir, "mesolite.im.h5")
 
-        reduce(nexus_filename=filepath,
-               output_filename=output_reduce,
-               instrument=INSTRUMENT,
-               wavelength_min=2.0,
-               wavelength_max=4.5,
-               )
+        reduce(
+            nexus_filename=filepath,
+            output_filename=output_reduce,
+            instrument=INSTRUMENT,
+            wavelength_min=2.0,
+            wavelength_max=4.5,
+        )
 
         yield str(output_reduce)
+
 
 @pytest.fixture(name="temp_output_dir")
 def fixture__temp_output_dir():
