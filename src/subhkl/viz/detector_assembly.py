@@ -404,17 +404,23 @@ def plot_unrolled_detector(
     ax.set_ylabel("Lab Vertical (Y) [m]")
 
     import os
+
     # Extract the raw filename without the extension
     base_name = os.path.splitext(os.path.basename(out_name))[0]
-    
+
     # Clean up standard pipeline suffixes to isolate the run name/label
-    run_name = base_name.replace('-pred', '').replace('-found', '').replace('_finder', '').replace('_int', '')
-    
+    run_name = (
+        base_name.replace("-pred", "")
+        .replace("-found", "")
+        .replace("_finder", "")
+        .replace("_int", "")
+    )
+
     # Format the new title
     title_str = f"Run: {run_name}"
     if instrument is not None:
         title_str = f"{instrument} | {title_str}"
-        
+
     ax.set_title(title_str)
 
     if mesh_handle is not None:

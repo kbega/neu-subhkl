@@ -1514,7 +1514,7 @@ def integrate_peaks_rbf_ssn(
                 else:
                     return all_R[run_id] if run_id < len(all_R) else all_R[0]
             return all_R
-            
+
         # Dynamic fallback using exact goniometer kinematics
         if gonio_axes is not None and gonio_angles is not None:
             # 1. Extract the specific angle array for this run
@@ -1537,26 +1537,29 @@ def integrate_peaks_rbf_ssn(
 
             # 2. Compute the exact Rotation matrix
             from scipy.spatial.transform import Rotation
+
             R_cum = np.eye(3)
             num_axes = len(gonio_axes)
-            
-            safe_offsets = gonio_offsets if gonio_offsets is not None else np.zeros(num_axes)
-            
+
+            safe_offsets = (
+                gonio_offsets if gonio_offsets is not None else np.zeros(num_axes)
+            )
+
             # Compose rotation from innermost to outermost
             for i in range(num_axes):
                 direction = gonio_axes[i][:3]
                 direction_mult = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
-                
+
                 axis_norm = np.linalg.norm(direction)
                 if axis_norm > 0:
                     direction = direction / axis_norm
-                    
+
                 true_angle = ang[i] + safe_offsets[i]
                 theta_rad = np.radians(true_angle * direction_mult)
-                
+
                 R_i = Rotation.from_rotvec(theta_rad * direction).as_matrix()
                 R_cum = R_cum @ R_i
-                
+
             return R_cum
 
         return np.eye(3)
@@ -1729,8 +1732,8 @@ def integrate_peaks_rbf_ssn(
     for idx, img_key in enumerate(meta_keys):
         det = peaks_obj.get_detector_by_img(img_key)
         seq_idx = frames[idx]  # frames stores the image sequence index
-        run_id = peaks_obj.image.get_run_id(img_key) # Get the real run_id
-        
+        run_id = peaks_obj.image.get_run_id(img_key)  # Get the real run_id
+
         current_R = get_safe_R(img_key, seq_idx, run_id)
         s_lab = get_s_lab_for_img(img_key, run_id, current_R)
 
@@ -1907,7 +1910,7 @@ def integrate_peaks_rbf_ssn(
     ):
         physical_bank = peaks_obj.image.bank_mapping.get(img_key, img_key)
         det = peaks_obj.get_detector_by_img(img_key)
-        run_id = peaks_obj.image.get_run_id(img_key) # Safely use .image here
+        run_id = peaks_obj.image.get_run_id(img_key)  # Safely use .image here
 
         image_raw = np.nan_to_num(
             peaks_obj.image.ims[img_key], nan=0.0, posinf=0.0, neginf=0.0
