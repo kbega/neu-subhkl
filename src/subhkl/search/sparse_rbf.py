@@ -1505,8 +1505,7 @@ def integrate_peaks_rbf_ssn(
     img_keys_ordered = sorted(peak_dict.keys())
     total_images = len(img_keys_ordered)
 
-    def get_safe_R(img_key, seq_idx):
-        run_id = peaks_obj.image.get_run_id(img_key)
+    def get_safe_R(img_key, seq_idx, run_id):
         if all_R is not None:
             if all_R.ndim == 3:
                 # Safely handle uncompressed (per-image) vs compressed (per-run) arrays
@@ -1515,6 +1514,54 @@ def integrate_peaks_rbf_ssn(
                 else:
                     return all_R[run_id] if run_id < len(all_R) else all_R[0]
             return all_R
+
+        # Dynamic fallback using exact goniometer kinematics
+        if gonio_axes is not None and gonio_angles is not None:
+            # 1. Extract the specific angle array for this run
+            if gonio_angles.ndim == 2:
+                num_axes = len(gonio_axes)
+                if gonio_angles.shape[1] == num_axes:
+                    ang = (
+                        gonio_angles[run_id, :]
+                        if run_id < gonio_angles.shape[0]
+                        else gonio_angles[0, :]
+                    )
+                else:
+                    ang = (
+                        gonio_angles[:, run_id]
+                        if run_id < gonio_angles.shape[1]
+                        else gonio_angles[:, 0]
+                    )
+            else:
+                ang = gonio_angles
+
+            # 2. Compute the exact Rotation matrix
+            from scipy.spatial.transform import Rotation
+
+            R_cum = np.eye(3)
+            num_axes = len(gonio_axes)
+
+            safe_offsets = (
+                gonio_offsets if gonio_offsets is not None else np.zeros(num_axes)
+            )
+
+            # Compose rotation from innermost to outermost
+            for i in range(num_axes):
+                direction = gonio_axes[i][:3]
+                direction_mult = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
+
+                axis_norm = np.linalg.norm(direction)
+                if axis_norm > 0:
+                    direction = direction / axis_norm
+
+                true_angle = ang[i] + safe_offsets[i]
+                theta_rad = np.radians(true_angle * direction_mult)
+
+                R_i = Rotation.from_rotvec(theta_rad * direction).as_matrix()
+                R_cum = R_cum @ R_i
+
+            return R_cum
+
         return np.eye(3)
 
     from subhkl.instrument.goniometer import sample_to_lab
@@ -1633,7 +1680,7 @@ def integrate_peaks_rbf_ssn(
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = peaks_obj.image.get_run_id(img_key)
 
-        current_R = get_safe_R(img_key, seq_idx)
+        current_R = get_safe_R(img_key, seq_idx, run_id)
         s_lab = get_s_lab_for_img(img_key, run_id, current_R)
 
         batch_rs = np.array([i_arr[d["rep_idx"]] for d in keep_data])
@@ -1684,8 +1731,10 @@ def integrate_peaks_rbf_ssn(
 
     for idx, img_key in enumerate(meta_keys):
         det = peaks_obj.get_detector_by_img(img_key)
-        run_id = frames[idx]
-        current_R = get_safe_R(img_key, idx)
+        seq_idx = frames[idx]  # frames stores the image sequence index
+        run_id = peaks_obj.image.get_run_id(img_key)  # Get the real run_id
+
+        current_R = get_safe_R(img_key, seq_idx, run_id)
         s_lab = get_s_lab_for_img(img_key, run_id, current_R)
 
         pixel_xyz = det.pixel_to_lab(all_rs[idx], all_cs[idx])
@@ -1861,7 +1910,7 @@ def integrate_peaks_rbf_ssn(
     ):
         physical_bank = peaks_obj.image.bank_mapping.get(img_key, img_key)
         det = peaks_obj.get_detector_by_img(img_key)
-        run_id = peaks_obj.get_run_id(img_key)
+        run_id = peaks_obj.image.get_run_id(img_key)  # Safely use .image here
 
         image_raw = np.nan_to_num(
             peaks_obj.image.ims[img_key], nan=0.0, posinf=0.0, neginf=0.0
@@ -1870,7 +1919,7 @@ def integrate_peaks_rbf_ssn(
         bw = border_width
 
         seq_idx = img_keys_ordered.index(img_key)
-        current_R = get_safe_R(img_key, seq_idx)
+        current_R = get_safe_R(img_key, seq_idx, run_id)
         s_lab = get_s_lab_for_img(img_key, run_id, current_R)
 
         img_rs = [all_rs[idx] for idx in indices]
