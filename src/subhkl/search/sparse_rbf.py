@@ -883,11 +883,13 @@ def build_3d_cov(params):
             [params[3], params[4], params[5]],
         ]
     )
-    # The safety floor is now 1 micrometer in MILLIMETERS
-    L = L.at[0, 0].set(jnp.abs(L[0, 0]) + 1e-3)
-    L = L.at[1, 1].set(jnp.abs(L[1, 1]) + 1e-3)
-    L = L.at[2, 2].set(jnp.abs(L[2, 2]) + 1e-3)
+    # The safety floor is now 1 micrometer (1e-6 meters)
+    # instead of 100 millimeters!
+    L = L.at[0, 0].set(jnp.abs(L[0, 0]) + 1e-6)
+    L = L.at[1, 1].set(jnp.abs(L[1, 1]) + 1e-6)
+    L = L.at[2, 2].set(jnp.abs(L[2, 2]) + 1e-6)
     return L @ L.T
+
 
 @partial(jit, static_argnames=["patch_size", "fit_mosaicity"])
 def global_shape_objective(
@@ -958,15 +960,14 @@ val_and_grad_fn = jit(
 def optimize_global_crystal(
     patches, bgs, drs, dcs, P_mats, distances, R_mats, fit_mosaicity=False
 ):
-    # 1. Dynamically size the optimizer state based on MILLIMETERS
+    # 1. Dynamically size the optimizer state based on the configuration
     if fit_mosaicity:
-        scales = np.array([1.0] * 7)
-        # 1.0 mm shape, 1 mrad initial mosaicity
-        x0_phys = np.array([1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1e-3])
+        scales = np.array([1e-3] * 7)
+        x0_phys = np.array([1e-3, 0.0, 1e-3, 0.0, 0.0, 1e-3, 1e-3])
         print("\n  > Optimizing 3D Crystal Tensor + Distance-Dependent Mosaicity...")
     else:
-        scales = np.array([1.0] * 6)
-        x0_phys = np.array([1.0, 0.0, 1.0, 0.0, 0.0, 1.0])
+        scales = np.array([1e-3] * 6)
+        x0_phys = np.array([1e-3, 0.0, 1e-3, 0.0, 0.0, 1e-3])
         print("\n  > Optimizing 3D Global Effective Tensor (Constant Distance)...")
 
     def scipy_objective(x_opt):
@@ -988,21 +989,21 @@ def optimize_global_crystal(
 
     bounds = [(None, None)] * (7 if fit_mosaicity else 6)
 
-    # 1. Physical bounds (in MILLIMETERS). 3.0 mm.
-    max_radius_mm = 3.0
+    # 1. Physical bounds (in METERS). 3.0 mm = 0.003 meters.
+    max_radius_meters = 0.003
 
     # 2. Diagonals (Indices 0, 2, 5) -> Must be positive, capped at max radius
     for idx in [0, 2, 5]:
-        bounds[idx] = (1e-3, max_radius_mm / scales[idx])
+        bounds[idx] = (1e-6, max_radius_meters / scales[idx])
 
-    # 3. Off-diagonals (Indices 1, 3, 4) -> Symmetric bounds
+    # 3. Off-diagonals (Indices 1, 3, 4) -> Symmetric bounds to prevent extreme skew
     for idx in [1, 3, 4]:
         bounds[idx] = (
-            -max_radius_mm / scales[idx],
-            max_radius_mm / scales[idx],
+            -max_radius_meters / scales[idx],
+            max_radius_meters / scales[idx],
         )
 
-    # 4. Mosaicity bound
+    # 4. Mosaicity bound (if active, e.g., max 10 mrad = 0.010 rad)
     if fit_mosaicity:
         bounds[6] = (1e-6, 0.010 / scales[6])
 
@@ -1022,9 +1023,7 @@ def optimize_global_crystal(
     # --- EXTRACT PHYSICAL DIMENSIONS ---
     Sigma_shape_opt = np.array(build_3d_cov(jnp.array(x_final_phys[:6])))
     eigvals = np.linalg.eigvalsh(Sigma_shape_opt)
-    
-    # Values are already in millimeters, so remove the `* 1000.0` multiplier
-    principal_axes_mm = np.sqrt(np.maximum(eigvals, 0.0))
+    principal_axes_mm = np.sqrt(np.maximum(eigvals, 0.0)) * 1000.0
 
     if fit_mosaicity:
         print("  [Separated Sample Properties]")
@@ -1039,6 +1038,7 @@ def optimize_global_crystal(
     print(f"      Major: {principal_axes_mm[2]:.4f} mm\n")
 
     return x_final_phys
+
 
 class SparseLaueIntegrator(SparseRBFPeakFinder):
     """
