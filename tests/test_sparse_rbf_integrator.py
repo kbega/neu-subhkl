@@ -856,6 +856,7 @@ def test_integrator_large_sensor_halo_suppression():
         f"Halo Debias failed: {found_intensity} vs {expected_intensity}"
     )
 
+
 def test_poisson_local_variance_suppression():
     """
     Regression test for exact Poisson local variance.
@@ -888,8 +889,12 @@ def test_poisson_local_variance_suppression():
 
     def generate_erf_peak(y, x, r, c, sig, amp):
         sig_sq2 = sig * np.sqrt(2.0) + 1e-6
-        erf_y = scipy.special.erf((y + 0.5 - r) / sig_sq2) - scipy.special.erf((y - 0.5 - r) / sig_sq2)
-        erf_x = scipy.special.erf((x + 0.5 - c) / sig_sq2) - scipy.special.erf((x - 0.5 - c) / sig_sq2)
+        erf_y = scipy.special.erf((y + 0.5 - r) / sig_sq2) - scipy.special.erf(
+            (y - 0.5 - r) / sig_sq2
+        )
+        erf_x = scipy.special.erf((x + 0.5 - c) / sig_sq2) - scipy.special.erf(
+            (x - 0.5 - c) / sig_sq2
+        )
         return amp * (np.pi / 2.0) * (sig**2) * erf_y * erf_x
 
     # 3. Inject two IDENTICAL weak peaks
@@ -899,8 +904,12 @@ def test_poisson_local_variance_suppression():
     test_amp = 60.0
     test_sig = 1.5
 
-    image += generate_erf_peak(y_coords, x_coords, peak_a_r, peak_a_c, test_sig, test_amp)
-    image += generate_erf_peak(y_coords, x_coords, peak_b_r, peak_b_c, test_sig, test_amp)
+    image += generate_erf_peak(
+        y_coords, x_coords, peak_a_r, peak_a_c, test_sig, test_amp
+    )
+    image += generate_erf_peak(
+        y_coords, x_coords, peak_b_r, peak_b_c, test_sig, test_amp
+    )
 
     # Apply true Poisson noise
     image = np.random.poisson(image).astype(np.float32)
@@ -927,13 +936,16 @@ def test_poisson_local_variance_suppression():
 
     for p in peaks:
         # p = [intensity, r, c, sigma]
-        if np.sqrt((p[1] - peak_a_r)**2 + (p[2] - peak_a_c)**2) < 2.0:
+        if np.sqrt((p[1] - peak_a_r) ** 2 + (p[2] - peak_a_c) ** 2) < 2.0:
             found_a = True
-        if np.sqrt((p[1] - peak_b_r)**2 + (p[2] - peak_b_c)**2) < 2.0:
+        if np.sqrt((p[1] - peak_b_r) ** 2 + (p[2] - peak_b_c) ** 2) < 2.0:
             found_b = True
 
     assert found_a, "Failed to find the weak peak in the low-variance (dark) region."
-    assert not found_b, "Incorrectly found the weak peak in the high-variance (bright) region! The local variance map did not suppress it."
+    assert not found_b, (
+        "Incorrectly found the weak peak in the high-variance (bright) region! The local variance map did not suppress it."
+    )
+
 
 def test_poisson_subpatch_variance_suppression():
     """
@@ -971,8 +983,12 @@ def test_poisson_subpatch_variance_suppression():
 
     def generate_erf_peak(y, x, r, c, sig, amp):
         sig_sq2 = sig * np.sqrt(2.0) + 1e-6
-        erf_y = scipy.special.erf((y + 0.5 - r) / sig_sq2) - scipy.special.erf((y - 0.5 - r) / sig_sq2)
-        erf_x = scipy.special.erf((x + 0.5 - c) / sig_sq2) - scipy.special.erf((x - 0.5 - c) / sig_sq2)
+        erf_y = scipy.special.erf((y + 0.5 - r) / sig_sq2) - scipy.special.erf(
+            (y - 0.5 - r) / sig_sq2
+        )
+        erf_x = scipy.special.erf((x + 0.5 - c) / sig_sq2) - scipy.special.erf(
+            (x - 0.5 - c) / sig_sq2
+        )
         return amp * (np.pi / 2.0) * (sig**2) * erf_y * erf_x
 
     # 3. Inject two IDENTICAL weak peaks
@@ -982,8 +998,12 @@ def test_poisson_subpatch_variance_suppression():
     test_amp = 60.0
     test_sig = 1.5
 
-    image += generate_erf_peak(y_coords, x_coords, peak_a_r, peak_a_c, test_sig, test_amp)
-    image += generate_erf_peak(y_coords, x_coords, peak_b_r, peak_b_c, test_sig, test_amp)
+    image += generate_erf_peak(
+        y_coords, x_coords, peak_a_r, peak_a_c, test_sig, test_amp
+    )
+    image += generate_erf_peak(
+        y_coords, x_coords, peak_b_r, peak_b_c, test_sig, test_amp
+    )
 
     image = np.random.poisson(image).astype(np.float32)
     image_batch = image[np.newaxis, ...]
@@ -1009,10 +1029,12 @@ def test_poisson_subpatch_variance_suppression():
 
     for p in peaks:
         # p = [intensity, r, c, sigma]
-        if np.sqrt((p[1] - peak_a_r)**2 + (p[2] - peak_a_c)**2) < 2.0:
+        if np.sqrt((p[1] - peak_a_r) ** 2 + (p[2] - peak_a_c) ** 2) < 2.0:
             found_a = True
-        if np.sqrt((p[1] - peak_b_r)**2 + (p[2] - peak_b_c)**2) < 2.0:
+        if np.sqrt((p[1] - peak_b_r) ** 2 + (p[2] - peak_b_c) ** 2) < 2.0:
             found_b = True
 
     assert found_a, "Failed to find the weak peak in the low-variance (dark) region."
-    assert not found_b, "Regression Failed: Incorrectly found the weak peak on the intense plateau. The exact 1/U_k map did not apply!"
+    assert not found_b, (
+        "Regression Failed: Incorrectly found the weak peak on the intense plateau. The exact 1/U_k map did not apply!"
+    )
