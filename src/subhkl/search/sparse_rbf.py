@@ -290,9 +290,6 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
         loss_code,
         do_merge,
     ):
-        local_bg_med = jnp.maximum(jnp.median(patch_bg), 1e-3)  # [photons/Pixel]
-        local_noise_floor = jnp.sqrt(local_bg_med)  # [photons^0.5 / Pixel^0.5]
-
         (float(H), float(W), self.min_sigma, self.max_sigma)  # [Pixel^0.5]
         yy, xx = jnp.indices((H, W))  # [Pixel^0.5]
         x_grid = jnp.array([yy, xx])  # [Pixel^0.5]
@@ -317,13 +314,13 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
                 k_1d = jax.scipy.special.erf(
                     (k_grid + 0.5) / sig_sq2
                 ) - jax.scipy.special.erf((k_grid - 0.5) / sig_sq2)  # [-]
-                
+
                 k_col = k_1d[:, None]  # [-]
                 k_row = k_1d[None, :]  # [-]
 
                 # Current expected model U_k
                 recon_total = jnp.maximum(recon + patch_bg, 1e-3)  # [photons/Pixel]
-                
+
                 # Exact Poisson Gradient: 1 - (y_k / U_k)
                 poisson_grad = (patch_stat / recon_total) - 1.0  # [-]
 
@@ -337,9 +334,9 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
 
                 # Inverse model for spatially varying variance: 1 / U_k
                 inv_recon = 1.0 / recon_total  # [Pixel/photons]
-                
+
                 # Square the 1D kernels for the variance convolution
-                k_1d_sq = k_1d ** 2
+                k_1d_sq = k_1d**2
                 k_col_sq = k_1d_sq[:, None]
                 k_row_sq = k_1d_sq[None, :]
 
@@ -353,12 +350,14 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
 
                 # Apply analytic volume scaling
                 area_scalar = (jnp.pi / 2.0) * (s**2)  # [Pixel]
-                
+
                 dual_var_signal = dual_var_unscaled * area_scalar  # [photons]
                 dual_var_variance = local_var_unscaled * (area_scalar**2)  # [photons]
 
                 # Compute dimensionless Exact Z-Score Map
-                z_score_map = dual_var_signal / jnp.sqrt(jnp.maximum(dual_var_variance, 1e-12))  # [-]
+                z_score_map = dual_var_signal / jnp.sqrt(
+                    jnp.maximum(dual_var_variance, 1e-12)
+                )  # [-]
 
                 # Find the maximum Z-score coordinate
                 flat_idx = jnp.argmax(z_score_map)
@@ -395,8 +394,10 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
                 # Dimensional recovery of volumetric density for the SSN warm start
                 k_1d_sq_sum = jnp.sum(k_1d_sq)  # [-]
                 kernel_sq_norm = (area_scalar**2) * (k_1d_sq_sum**2)  # [Pixel^2]
-                
-                c_matched = (dual_var_signal[r_valid, c_valid] / kernel_sq_norm)  # [photons / Pixel^2]
+
+                c_matched = (
+                    dual_var_signal[r_valid, c_valid] / kernel_sq_norm
+                )  # [photons / Pixel^2]
                 c_init = jnp.maximum(c_matched, 0.0)  # [photons/Pixel^2]
 
                 best_z_score = z_score_map[r_valid, c_valid]
@@ -410,10 +411,12 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
             s_best = new_peak[3]  # [Pixel^0.5]
 
             # vals array directly holds the exact Z-scores now
-            z_score = vals[best_idx]  
+            z_score = vals[best_idx]
             weight_best = (s_best / self.ref_sigma) ** self.gamma  # [-]
 
-            is_strong = z_score > (alpha_z_score * weight_best)  # True dimensionless threshold check
+            is_strong = z_score > (
+                alpha_z_score * weight_best
+            )  # True dimensionless threshold check
 
             dummy_peak = jnp.array([0.0, 0.0, 0.0, 1.0])
             new_peak = jnp.where(is_strong, new_peak, dummy_peak)
