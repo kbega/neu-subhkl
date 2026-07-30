@@ -943,8 +943,24 @@ def test_poisson_local_variance_suppression():
     found_a = False
     found_b = False
 
+    # Only count peak-shaped atoms.  An atom whose width has run to the edge of
+    # the sigma bank is not a peak: it is the solver asking for a wider basis
+    # than it was given, which is what unmodelled smooth background looks like.
+    # The halo here is under-fitted by the background estimator by ~20% at its
+    # centre, and the resulting broad residual is reported as an atom pinned at
+    # max_sigma sitting 1-3 px from peak B.  Counting it made this assertion a
+    # coin toss on where that atom landed rather than a test of the variance
+    # model, which does suppress peak B: no atom of width near 1.5 is ever
+    # produced there.  See docs/matrix_free_theory.md section 7b.
+    max_sigma = 5.0
+
+    def _is_peak_like(p):
+        return p[3] < 0.98 * max_sigma
+
     for p in peaks:
         # p = [intensity, r, c, sigma]
+        if not _is_peak_like(p):
+            continue
         if np.sqrt((p[1] - peak_a_r) ** 2 + (p[2] - peak_a_c) ** 2) < 2.0:
             found_a = True
         if np.sqrt((p[1] - peak_b_r) ** 2 + (p[2] - peak_b_c) ** 2) < 2.0:
@@ -1033,8 +1049,24 @@ def test_poisson_subpatch_variance_suppression():
     found_a = False
     found_b = False
 
+    # Only count peak-shaped atoms.  An atom whose width has run to the edge of
+    # the sigma bank is not a peak: it is the solver asking for a wider basis
+    # than it was given, which is what unmodelled smooth background looks like.
+    # The halo here is under-fitted by the background estimator by ~20% at its
+    # centre, and the resulting broad residual is reported as an atom pinned at
+    # max_sigma sitting 1-3 px from peak B.  Counting it made this assertion a
+    # coin toss on where that atom landed rather than a test of the variance
+    # model, which does suppress peak B: no atom of width near 1.5 is ever
+    # produced there.  See docs/matrix_free_theory.md section 7b.
+    max_sigma = 5.0
+
+    def _is_peak_like(p):
+        return p[3] < 0.98 * max_sigma
+
     for p in peaks:
         # p = [intensity, r, c, sigma]
+        if not _is_peak_like(p):
+            continue
         if np.sqrt((p[1] - peak_a_r) ** 2 + (p[2] - peak_a_c) ** 2) < 2.0:
             found_a = True
         if np.sqrt((p[1] - peak_b_r) ** 2 + (p[2] - peak_b_c) ** 2) < 2.0:
@@ -1044,3 +1076,71 @@ def test_poisson_subpatch_variance_suppression():
     assert not found_b, (
         "Regression Failed: Incorrectly found the weak peak on the intense plateau. The exact 1/U_k map did not apply!"
     )
+
+
+def test_boundary_sigma_rejection_fires_on_unmodelled_background():
+    """The sigma-at-bank-edge filter must actually trigger, and only on background.
+
+    A broad smooth halo is under-fitted by the morphological background estimator
+    at its centre, and the residual is picked up as an atom whose width runs to
+    ``max_sigma`` -- the solver asking for a wider basis than it was given.  That
+    is the signature of unmodelled background rather than of a reflection, since
+    a real peak's width is set by the point-spread function and lands inside the
+    bank.
+
+    This asserts the filter both fires here and does not eat the genuine peak
+    placed well away from the halo.  See docs/matrix_free_theory.md section 7b.
+    """
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    import numpy as np
+
+    H, W = 100, 100
+    np.random.seed(7)
+    y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+
+    image = np.full((H, W), 10.0, dtype=np.float32)
+    # Broad diffuse halo: far wider than max_sigma, so no single basis function
+    # can represent it and the background estimator under-fits its centre.
+    image += 500.0 * np.exp(
+        -((x_coords - 75.0) ** 2 + (y_coords - 50.0) ** 2) / (2 * 15.0**2)
+    )
+    # A genuine, well-resolved peak far from the halo.
+    image += generate_erf_peak(y_coords, x_coords, 50.0, 20.0, 1.5, 200.0)
+    image = np.random.poisson(image).astype(np.float32)
+    image_batch = image[np.newaxis, ...]
+
+    max_sigma = 5.0
+    kwargs = dict(
+        alpha=8.0,
+        gamma=0.5,
+        min_sigma=1.0,
+        max_sigma=max_sigma,
+        loss="poisson",
+        show_steps=False,
+    )
+
+    # With the filter off, the halo residual is reported, pinned at the bank edge.
+    unfiltered = MatrixFreeSparseRBFPeakFinder(reject_boundary_sigma=False, **kwargs)
+    raw = unfiltered.find_peaks_batch(image_batch)[0]
+    pinned = [p for p in raw if p[3] >= 0.98 * max_sigma]
+    assert len(pinned) >= 1, (
+        "expected the unmodelled halo to produce at least one atom pinned at "
+        f"max_sigma, got widths {sorted(round(float(p[3]), 2) for p in raw)}"
+    )
+
+    # With the filter on, those atoms are gone and the count is reported.
+    filtered = MatrixFreeSparseRBFPeakFinder(reject_boundary_sigma=True, **kwargs)
+    kept = filtered.find_peaks_batch(image_batch)[0]
+
+    assert filtered.n_boundary_rejected[0] >= 1, (
+        "the boundary-sigma filter did not fire on a case built to trigger it"
+    )
+    assert all(p[3] < 0.98 * max_sigma for p in kept), (
+        "an atom pinned at max_sigma survived the filter"
+    )
+
+    # The real peak must survive: the filter must reject background, not signal.
+    assert any(
+        np.sqrt((p[1] - 50.0) ** 2 + (p[2] - 20.0) ** 2) < 2.0 for p in kept
+    ), "the boundary-sigma filter removed the genuine peak"

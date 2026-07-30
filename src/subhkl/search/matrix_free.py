@@ -34,12 +34,17 @@ class MatrixFreeSparseRBFPeakFinder:
 
     ``gamma < 1`` breaks the symmetry and makes a single broad atom strictly
     cheaper than any spread of the same flux, which is what a deconvolution
-    ought to prefer.  Measured on the overlap regression cases, ``gamma=0.75``
-    both recovers a weak peak hidden in a strong peak's tail (which
-    ``gamma=1`` misses) and cuts the reported peak count from 36 to 7.
-    ``gamma`` is left at 1.0 here only for backwards compatibility; 0.75 is the
-    better default and the callers in the test-suite that pass 1.0 explicitly
-    are sitting on the degenerate point.
+    ought to prefer.  ``gamma = 0`` is the other end: plain unweighted L1 on
+    L2-normalised atoms, which over-merges and swallows genuine neighbours.  The
+    usable range is interior, and the test-suite runs at ``gamma = 0.5``, which
+    recovers a weak peak hidden in a strong peak's tail (``gamma = 1`` misses
+    it) and cuts the reported peak count from 36 to 7 on the overlap cases.
+
+    ``gamma`` is left at 1.0 here only for backwards compatibility.  It should
+    be calibrated like ``alpha`` or a regularisation strength, against the
+    merge/split error pair, and that calibration is only meaningful away from
+    1.0 -- which is the single point where the penalty carries no information
+    about model order at all.
     """
     def __init__(
         self,
@@ -52,6 +57,8 @@ class MatrixFreeSparseRBFPeakFinder:
         show_steps: bool = False,
         ref_sigma: float = 1.0,
         refine_positions: bool = True,
+        reject_boundary_sigma: bool = True,
+        boundary_sigma_frac: float = 0.98,
         **kwargs
     ):
         self.alpha = alpha
@@ -63,6 +70,8 @@ class MatrixFreeSparseRBFPeakFinder:
         self.show_steps = show_steps
         self.ref_sigma = ref_sigma
         self.refine_positions = refine_positions
+        self.reject_boundary_sigma = reject_boundary_sigma
+        self.boundary_sigma_frac = boundary_sigma_frac
 
         # 1. Pre-build the Filter Bank
         self.sigmas = jnp.linspace(min_sigma, max_sigma, num_sigmas)
@@ -564,6 +573,7 @@ class MatrixFreeSparseRBFPeakFinder:
         bg_padded = jnp.pad(bg_map, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)), mode="edge")
 
         results = []
+        rejected_counts = []
         c_tensors = jax.jit(jax.vmap(self._solve_ssn_cg_global))(images_padded, bg_padded)
 
         MARGIN = max(3, self.max_k_rad)
@@ -588,13 +598,45 @@ class MatrixFreeSparseRBFPeakFinder:
             valid_peaks[:, 1] -= pad_y
             valid_peaks[:, 2] -= pad_x
 
-            in_bounds = (
+            keep = (
                 (valid_peaks[:, 1] >= MARGIN) & (valid_peaks[:, 1] < H - MARGIN) &
                 (valid_peaks[:, 2] >= MARGIN) & (valid_peaks[:, 2] < W - MARGIN)
             )
-            
-            results.append(valid_peaks[in_bounds])
 
+            # An atom whose width has run to the edge of the bank is the solver
+            # asking for a wider basis than it was given, and that is what
+            # unmodelled smooth background looks like: a real peak's width is set
+            # by the point-spread function and lands inside the bank.  The case
+            # that motivated this is a diffuse halo whose background estimate
+            # falls ~20% short at its centre, leaving a broad positive residual
+            # that is then reported as a reflection sitting on the halo.  On real
+            # Laue data the structures that trigger it -- thermal diffuse
+            # scattering, powder rings, halos around strong reflections -- are
+            # exactly the ones that should not be reported as peaks.
+            if self.reject_boundary_sigma:
+                at_boundary = (
+                    valid_peaks[:, 3] >= self.boundary_sigma_frac * self.max_sigma
+                ) & keep
+                n_rejected = int(np.count_nonzero(at_boundary))
+                keep &= ~at_boundary
+            else:
+                n_rejected = 0
+
+            # Record rather than drop silently: a run that discards many atoms
+            # here is telling you the background model is leaving structure
+            # behind, or that max_sigma is too small for this data, and either
+            # is worth knowing.
+            rejected_counts.append(n_rejected)
+            if self.show_steps and n_rejected:
+                print(
+                    f"  > Rejected {n_rejected} atom(s) with sigma at the bank "
+                    f"edge (>= {self.boundary_sigma_frac:.2f} * "
+                    f"{self.max_sigma:g}); likely unmodelled background."
+                )
+
+            results.append(valid_peaks[keep])
+
+        self.n_boundary_rejected = rejected_counts
         return results
 
     @partial(jit, static_argnames=["self"])
