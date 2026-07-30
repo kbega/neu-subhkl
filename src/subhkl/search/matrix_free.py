@@ -307,7 +307,7 @@ class MatrixFreeSparseRBFPeakFinder:
 
         def debias_body(state):
             step, c_deb, _ = state
-            _, grad, W_diag = get_loss_grad_hess(c_deb)
+            nll_curr, grad, W_diag = get_loss_grad_hess(c_deb)
 
             # For the Gaussian loss W_diag is identically one, so this reduces to
             # the H_diag computed above; sharing one expression keeps the two
@@ -337,13 +337,40 @@ class MatrixFreeSparseRBFPeakFinder:
             )
             dc = jnp.where(jnp.isfinite(dc), dc, 0.0)
 
-            c_new = jnp.maximum(0.0, c_deb + tau_debias * dc * active_mask)
-            # Never let a non-finite iterate propagate: it would wipe out every
-            # coefficient and the run would silently report no peaks at all.
-            c_new = jnp.where(jnp.isfinite(c_new), c_new, c_deb)
+            def trial(scale):
+                cand = jnp.maximum(0.0, c_deb + scale * dc * active_mask)
+                cand = jnp.where(jnp.isfinite(cand), cand, c_deb)
+                return cand, get_loss_grad_hess(cand)[0]
 
-            actual_step = c_new - c_deb
-            return (step + 1, c_new, jnp.linalg.norm(actual_step))
+            # Debiasing drops the L1 term, which is the only thing holding the
+            # near-null-space directions of the active set in check.  On a large,
+            # heavily overlapping support that system is close to singular, CG
+            # returns a direction it has not solved for, and an unguarded Newton
+            # step then runs away: measured on two overlapping broad peaks, the
+            # likelihood got worse on every iteration and the fit went from an
+            # rms residual of 3.3 to 60, i.e. an order of magnitude worse than
+            # reporting no peaks at all.  Backtrack, and refuse the step outright
+            # if no decrease is found, so debiasing can only ever improve on the
+            # L1 solution it started from.
+            def bt_cond(bt_state):
+                bt_i, _, _, j_test = bt_state
+                return (bt_i < 10) & ((j_test > nll_curr) | ~jnp.isfinite(j_test))
+
+            def bt_body(bt_state):
+                bt_i, scale, _, _ = bt_state
+                scale = scale * 0.5
+                cand, j_cand = trial(scale)
+                return (bt_i + 1, scale, cand, j_cand)
+
+            c0, j0 = trial(tau_debias)
+            _, _, c_try, j_try = lax.while_loop(
+                bt_cond, bt_body, (0, tau_debias, c0, j0)
+            )
+
+            accept = jnp.isfinite(j_try) & (j_try <= nll_curr)
+            c_new = jnp.where(accept, c_try, c_deb)
+            step_norm = jnp.where(accept, jnp.linalg.norm(c_new - c_deb), 0.0)
+            return (step + 1, c_new, step_norm)
 
         debias_state = lax.while_loop(debias_cond, debias_body, (0, c_l1, jnp.float32(1e9)))
         _, c_final, _ = debias_state

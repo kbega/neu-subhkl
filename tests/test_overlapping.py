@@ -12,7 +12,6 @@ docs/matrix_free_theory.md Theorem 1.
 """
 
 import numpy as np
-import pytest
 import scipy.special
 
 def generate_erf_peak(y_coords, x_coords, r, c, sig, amp):
@@ -29,20 +28,6 @@ def generate_erf_peak(y_coords, x_coords, r, c, sig, amp):
     )
     return amp * (np.pi / 2.0) * (sig**2) * erf_y * erf_x
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Still unsolved, and now attributable.  Two sigma=6 peaks 16 px apart is "
-        "2.67 sigma of separation -- the near-colliding regime, where the Gram "
-        "matrix of the two atoms is ill-conditioned and their amplitudes are only "
-        "weakly determined.  The solver is correspondingly unstable here: repeated "
-        "runs on identical input return either the correct two atoms or those plus "
-        "a spurious one at the composite centre, and the recovered flux ranges from "
-        "0.77x to 2.6x the truth.  Not strict, because it does sometimes pass.  "
-        "The fix is better conditioning of near-colliding amplitudes, not a "
-        "parameter: see docs/matrix_free_theory.md section 6."
-    ),
-)
 def test_overlapping_ghost_center_shift_failure():
     """
     EXPOSES: Ghost Center Shifts / Mutual Energy Swapping.

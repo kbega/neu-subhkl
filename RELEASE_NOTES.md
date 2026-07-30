@@ -66,10 +66,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   smallest permitted step, leaving the solve stalled far from the optimum.
 - The line search accepted a step that increased the objective when its
   backtracking budget ran out, instead of rejecting it.
+- The debiasing phase diverged on large, heavily overlapping supports. It drops
+  the L1 term, which is the only thing holding the near-null-space directions of
+  the active set in check, so on a near-singular support CG returned a direction
+  it had not solved for and the unguarded Newton step ran away. Measured on two
+  overlapping broad peaks, the likelihood got *worse* on every iteration and the
+  rms residual went from 3.3 to 60 — an order of magnitude worse than reporting
+  no peaks at all, while the L1 phase that preceded it had fitted the data well.
+  Debiasing now backtracks and refuses a step that does not improve the
+  likelihood, so it can only ever improve on the L1 solution it starts from.
 - The outer convergence test measured the raw Newton direction rather than the
   step actually taken, so it never triggered.
 - `subhkl finder --finder-algorithm sparse_rbf` returned no peaks on its own
   integration test. It now passes.
+- Two heavily overlapping broad peaks at 2.67 sigma of separation were
+  reconstructed with a spurious atom at the composite centre and up to 2.6x the
+  true flux (`test_overlapping_ghost_center_shift_failure`). This was the
+  debiasing divergence above, not a resolution limit: the condition number of
+  the true pair is 1.40. The test now passes.
 - Removed `src/subhkl/:q`, a stray editor buffer saved under the wrong name.
 
 ### Deprecated
@@ -87,19 +101,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not deterministic; `XLA_FLAGS=--xla_gpu_deterministic_ops=true` makes it
   bit-reproducible at about 2.1x wall clock. Tracked in #13. Tests whose
   assertions sit near a threshold will flap accordingly.
-- Two heavily overlapping broad peaks — 2.67 sigma of separation in
-  `test_overlapping_ghost_center_shift_failure`, marked `xfail` — are not
-  reconstructed reliably: repeated runs return either the correct two atoms or
-  those plus a spurious one at the composite centre, with recovered flux from
-  0.77x to 2.6x truth. This is *not* a conditioning limit; the Gram matrix of
-  the true pair has a condition number of 1.40 and that of the realised support
-  1.5. The reported model simply does not fit the data there, with an rms
-  residual of 23.8 against 7.7 for the background alone.
-- The global `Deviance/DoF` statistic does not detect the case above (1.21,
-  against 1.12 for a well-behaved control) because it is diluted across the
-  whole image. Evaluated over a peak's own footprint the same statistic gives
-  26.9 against 1.04, so a per-peak goodness-of-fit check would catch it. Not yet
-  wired to anything.
+- `test_poisson_local_variance_suppression` and
+  `test_poisson_subpatch_variance_suppression` each pass in isolation (six runs
+  out of six) but fail roughly one run in three when the whole file is run, so
+  their outcome depends on what executed before them. That is the
+  non-determinism above expressing itself through JIT and GPU state rather than
+  through the test inputs.
+- The global `Deviance/DoF` statistic is too diluted to detect a locally bad
+  fit: on a case where the reported model was worse than reporting no peaks at
+  all it read 1.21, against 1.12 for a well-behaved control. Evaluated over a
+  peak's own footprint the same statistic gave 26.9 against 1.04. A per-peak
+  goodness-of-fit check would therefore catch what the global one misses, and is
+  not yet wired to anything.
 - The morphological background estimator under-fits smooth extended structure at
   its centre — by about 21% on a diffuse halo — leaving a broad positive
   residual. The boundary-sigma rejection above removes the resulting artefacts
