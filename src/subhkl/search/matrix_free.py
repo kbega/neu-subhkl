@@ -73,7 +73,7 @@ class MatrixFreeSparseRBFPeakFinder:
         )
 
     @partial(jit, static_argnames=["self", "max_iter"])
-    def _solve_ssn_cg_global(self, y_img, bg_img, max_iter=20):
+    def _solve_ssn_cg_global(self, y_img, bg_img, max_iter=100):
         H, W = y_img.shape
         y = y_img[None, None, :, :]
         bg = bg_img[None, None, :, :]
@@ -86,21 +86,75 @@ class MatrixFreeSparseRBFPeakFinder:
 
         # 1. Exact Spatially Varying Variance Map & Lipschitz Bounds
         if self.loss == "gaussian":
-            H_diag = self._adjoint_op(jnp.ones_like(bg), self.K_sq)
-            L_spatial = jnp.max(H_diag, axis=1, keepdims=True) + 1e-4
-            tau_local = 1.0 / L_spatial
-            var_c = bg_med * tau_local
+            W_ref = jnp.ones_like(bg)
         else:
-            H_diag = self._adjoint_op(1.0 / jnp.maximum(bg, 1e-3), self.K_sq)
-            L_spatial = jnp.max(H_diag, axis=1, keepdims=True) + 1e-4
-            tau_local = 1.0 / L_spatial
-            var_c = tau_local  
+            W_ref = 1.0 / jnp.maximum(bg, 1e-3)
+
+        H_diag = self._adjoint_op(W_ref, self.K_sq)
+        H_diag_safe = jnp.maximum(H_diag, 1e-6)
+
+        # Variance of each channel's coefficient estimate.  This has to be the
+        # channel's own curvature: taking the across-channel maximum instead
+        # understates the noise on every channel but the broadest -- by a factor
+        # of ~11 for the narrowest basis in a typical bank -- so the fine scales
+        # get thresholded far too weakly and fit noise into a smear of shifted
+        # basis copies rather than one coefficient per peak.
+        if self.loss == "gaussian":
+            var_c = bg_med / H_diag_safe
+        else:
+            var_c = 1.0 / H_diag_safe
 
         weights = (self.sigmas / self.ref_sigma) ** self.gamma
         alpha_vec = self.alpha * weights
-        
-        # 2. Exact Spatially Varying L1 Threshold
-        tau_alpha = alpha_vec[None, :, None, None] * jnp.sqrt(var_c)
+
+        # Multiplicity correction.  In the greedy predecessor `alpha` gated one
+        # candidate per search window, so it really was a per-peak significance
+        # level.  Solving globally tests every (pixel, scale) coefficient at
+        # once, and the noise maximum over N independent tests sits at about
+        # sqrt(2 log N) standard deviations, so a bare `alpha` of a few sigma no
+        # longer controls the false-alarm rate at all -- the narrowest basis is
+        # both the most numerous and, under a Besov weight below ref_sigma, the
+        # most permissive, so it fits noise spikes everywhere.  Counting
+        # resolution elements per scale restores the intended meaning of alpha
+        # without changing it where the user has already asked for more.
+        n_tests = jnp.maximum(
+            (H * W) / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6)), 2.0
+        )
+        alpha_floor = jnp.sqrt(2.0 * jnp.log(n_tests))
+        alpha_vec = jnp.maximum(alpha_vec, alpha_floor)
+
+        # 2. L1 penalty weight, in units of the objective rather than of the
+        # prox step.  Soft-thresholding at lam/H_diag recovers the intended
+        # "alpha standard deviations of coefficient noise" cut, so lam must be
+        # alpha * weight * H_diag * sqrt(var_c).  Deriving the penalty from the
+        # step size instead makes the objective itself move whenever the step
+        # does, which leaves the line search minimising a different problem on
+        # every iteration.
+        lam = alpha_vec[None, :, None, None] * H_diag_safe * jnp.sqrt(var_c)
+
+        # 3. Step size.  A prox-gradient step is only guaranteed to descend for
+        # tau <= 1/lambda_max(A^T W A).  The diagonal of that operator is not a
+        # bound on its largest eigenvalue: these basis functions overlap heavily,
+        # and for a typical bank lambda_max exceeds max(diag) by ~400x, so a step
+        # built from the diagonal overshoots by that factor and collapses the
+        # line search onto its smallest permitted step every iteration.  A few
+        # power iterations give the bound directly; the kernels and weights are
+        # positive, so a constant vector is a good starting guess.
+        def power_step(_, v):
+            Av = self._adjoint_op(
+                W_ref * self._forward_op(v, self.K_weights), self.K_weights
+            )
+            return Av / (jnp.linalg.norm(Av) + 1e-12)
+
+        v0 = jnp.ones((1, K, H, W), dtype=jnp.float32)
+        v_top = lax.fori_loop(0, 15, power_step, v0 / jnp.linalg.norm(v0))
+        Av_top = self._adjoint_op(
+            W_ref * self._forward_op(v_top, self.K_weights), self.K_weights
+        )
+        L_max = jnp.sum(v_top * Av_top) / jnp.maximum(jnp.sum(v_top * v_top), 1e-12)
+        tau_local = 1.0 / (L_max + 1e-4)
+
+        tau_alpha = tau_local * lam
 
         def get_loss_grad_hess(c_curr):
             u = self._forward_op(c_curr, self.K_weights) + bg
@@ -118,8 +172,8 @@ class MatrixFreeSparseRBFPeakFinder:
             return nll, grad, W_diag
 
         def cond_fn(state):
-            step, _, _, dq_norm = state
-            return (step < max_iter) & (dq_norm > 1e-3)
+            step, _, _, step_norm = state
+            return (step < max_iter) & (step_norm > 1e-3)
 
         def body_fn(state):
             step, q, c, _ = state
@@ -129,45 +183,76 @@ class MatrixFreeSparseRBFPeakFinder:
             # Strict Independent L1 Block Soft-Thresholding
             D_mat = (q > tau_alpha).astype(jnp.float32)
 
-            def apply_DG_precond(v):
+            # Semi-smooth Newton system for G(q) = (q - c(q))/tau + grad(c(q)).
+            # Since c(q) = max(0, q - tau_alpha), the generalised Jacobian is the
+            # Gauss-Newton Hessian A^T W A on the active set (D_mat == 1) and
+            # 1/tau_local on the inactive set.  Both blocks are carried in a
+            # single operator that is symmetric by construction: CG is only
+            # valid for symmetric positive-definite operators, so the Jacobi
+            # scaling is supplied through the preconditioner argument rather
+            # than multiplied into the operator, which would break symmetry and
+            # leave CG returning a direction that is not a descent direction.
+            eta = 1.0 / jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
+
+            def apply_jacobian(v):
                 v_active = v * D_mat
                 Av = self._forward_op(v_active, self.K_weights)
-                W_Av = W_diag * Av
-                At_W_Av = self._adjoint_op(W_Av, self.K_weights)
-                # Precondition the CG solve by multiplying both sides by tau_local
-                return (1.0 - D_mat) * v + tau_local * (At_W_Av * D_mat) + 1e-4 * tau_local * v
+                At_W_Av = self._adjoint_op(W_diag * Av, self.K_weights)
+                return (At_W_Av + 1e-4 * v_active) * D_mat + (1.0 - D_mat) * v
 
-            dq, cg_info = jax.scipy.sparse.linalg.cg(apply_DG_precond, -tau_local * Gq, tol=1e-3, maxiter=20)
+            def jacobi(v):
+                return eta * v * D_mat + (1.0 - D_mat) * v
+
+            # Active rows solve A^T W A dq = -G; inactive rows reduce to the
+            # explicit prox-gradient step dq = -tau_local * G.
+            rhs = -Gq * D_mat - tau_local * Gq * (1.0 - D_mat)
+            dq, _ = jax.scipy.sparse.linalg.cg(
+                apply_jacobian, rhs, M=jacobi, tol=1e-3, maxiter=20
+            )
+            dq = jnp.where(jnp.isfinite(dq), dq, 0.0)
+
+            def objective(c_test):
+                j_test, _, _ = get_loss_grad_hess(c_test)
+                return j_test + jnp.sum(lam * c_test)
 
             def bt_cond(bt_state):
                 bt_i, step_size, _, _, j_test, j_curr = bt_state
                 is_valid = jnp.isfinite(j_test)
-                return (bt_i < 8) & ((j_test > j_curr) | ~is_valid)
+                return (bt_i < 12) & ((j_test > j_curr) | ~is_valid)
 
             def bt_body(bt_state):
                 bt_i, step_size, _, _, _, j_curr = bt_state
                 step_size = jnp.float32(step_size * 0.5)
-                
+
                 q_test = q + step_size * dq
                 c_test = jnp.maximum(0.0, q_test - tau_alpha)
-                
-                j_test, _, _ = get_loss_grad_hess(c_test)
-                reg_penalty = jnp.sum((tau_alpha / tau_local) * c_test)
-                return (bt_i + 1, step_size, q_test, c_test, j_test + reg_penalty, j_curr)
+
+                return (bt_i + 1, step_size, q_test, c_test, objective(c_test), j_curr)
 
             q_test_init = q + dq
             c_test_init = jnp.maximum(0.0, q_test_init - tau_alpha)
-            
-            j_test_init, _, _ = get_loss_grad_hess(c_test_init)
-            reg_penalty_init = jnp.sum((tau_alpha / tau_local) * c_test_init)
-            
-            obj_val_curr = nll + jnp.sum((tau_alpha / tau_local) * c)
+            obj_val_curr = nll + jnp.sum(lam * c)
 
-            bt_init = (0, jnp.float32(1.0), q_test_init, c_test_init, j_test_init + reg_penalty_init, obj_val_curr)
-            bt_final = lax.while_loop(bt_cond, bt_body, bt_init)
-            _, _, q_final, c_final, _, _ = bt_final
+            bt_init = (
+                0,
+                jnp.float32(1.0),
+                q_test_init,
+                c_test_init,
+                objective(c_test_init),
+                obj_val_curr,
+            )
+            _, _, q_try, c_try, j_try, _ = lax.while_loop(bt_cond, bt_body, bt_init)
 
-            return (step + 1, q_final, c_final, jnp.linalg.norm(dq))
+            # If the backtracking budget ran out without finding a decrease the
+            # trial point is worse than where we started, so reject it instead
+            # of stepping uphill.  A rejected step reports a zero step norm,
+            # which stops the outer loop rather than letting it thrash.
+            accept = jnp.isfinite(j_try) & (j_try <= obj_val_curr)
+            q_final = jnp.where(accept, q_try, q)
+            c_final = jnp.where(accept, c_try, c)
+            step_norm = jnp.where(accept, jnp.linalg.norm(q_final - q), 0.0)
+
+            return (step + 1, q_final, c_final, step_norm)
 
         init_state = (0, q_init, c_init, jnp.float32(1e9))
         final_state = lax.while_loop(cond_fn, body_fn, init_state)
@@ -180,34 +265,45 @@ class MatrixFreeSparseRBFPeakFinder:
             step, _, actual_step_norm = state
             return (step < 50) & (actual_step_norm > 1e-4)
 
+        tau_debias = jnp.float32(0.8 if self.loss == "poisson" else 1.0)
+
         def debias_body(state):
             step, c_deb, _ = state
             _, grad, W_diag = get_loss_grad_hess(c_deb)
 
-            if self.loss == "gaussian":
-                current_H_diag = H_diag 
-            else:
-                current_H_diag = self._adjoint_op(W_diag, self.K_sq)
-                
-            eta = 1.0 / jnp.maximum(current_H_diag, 1e-6)
+            # For the Gaussian loss W_diag is identically one, so this reduces to
+            # the H_diag computed above; sharing one expression keeps the two
+            # branches from drifting apart.
+            eta = 1.0 / jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
 
-            def apply_Hessian_precond(v):
+            # Same requirement as the SSN solve above: the operator handed to CG
+            # must be symmetric, so eta enters as a preconditioner and the
+            # right-hand side stays -grad rather than -eta * grad.
+            def apply_hessian(v):
                 v_active = v * active_mask
                 Av = self._forward_op(v_active, self.K_weights)
-                W_Av = W_diag * Av
-                At_W_Av = self._adjoint_op(W_Av, self.K_weights)
-                return (eta * At_W_Av + 1e-4 * v_active) * active_mask + (1.0 - active_mask) * v
+                At_W_Av = self._adjoint_op(W_diag * Av, self.K_weights)
+                return (At_W_Av + 1e-4 * v_active) * active_mask + (
+                    1.0 - active_mask
+                ) * v
+
+            def jacobi(v):
+                return eta * v * active_mask + (1.0 - active_mask) * v
 
             dc, _ = jax.scipy.sparse.linalg.cg(
-                apply_Hessian_precond, 
-                -eta * grad * active_mask, 
-                tol=1e-4, 
-                maxiter=50
+                apply_hessian,
+                -grad * active_mask,
+                M=jacobi,
+                tol=1e-4,
+                maxiter=50,
             )
+            dc = jnp.where(jnp.isfinite(dc), dc, 0.0)
 
-            tau_debias = jnp.where(self.loss == "poisson", jnp.float32(0.8), jnp.float32(1.0))
             c_new = jnp.maximum(0.0, c_deb + tau_debias * dc * active_mask)
-            
+            # Never let a non-finite iterate propagate: it would wipe out every
+            # coefficient and the run would silently report no peaks at all.
+            c_new = jnp.where(jnp.isfinite(c_new), c_new, c_deb)
+
             actual_step = c_new - c_deb
             return (step + 1, c_new, jnp.linalg.norm(actual_step))
 
@@ -216,13 +312,20 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return c_final[0]
 
-    @partial(jit, static_argnames=["self"])
-    def _extract_peaks(self, c_tensor):
+    @partial(jit, static_argnames=["self", "border"])
+    def _extract_peaks(self, c_tensor, border=0):
         c_tot = jnp.sum(c_tensor, axis=0) # [H, W]
         
-        # Smooth the discrete L1 coefficients to recover true continuous center of mass
-        sig_sq2 = 1.0 * jnp.sqrt(2.0) + 1e-6
-        k_grid = jnp.arange(-2, 3)
+        # Smooth the discrete L1 coefficients to recover true continuous center
+        # of mass.  L1 splinters a peak across adjacent pixels, so this only
+        # needs to span that one-pixel scale: a wider kernel throws away exactly
+        # the separation the fine basis channels were there to resolve, merging
+        # neighbouring peaks a few pixels apart into one maximum.  Cap it at the
+        # finest scale in the bank.
+        smooth_sigma = min(1.0, float(self.min_sigma))
+        sig_sq2 = smooth_sigma * jnp.sqrt(2.0) + 1e-6
+        k_half = max(1, round(2.0 * smooth_sigma))
+        k_grid = jnp.arange(-k_half, k_half + 1)
         k_1d = jax.scipy.special.erf((k_grid + 0.5) / sig_sq2) - jax.scipy.special.erf((k_grid - 0.5) / sig_sq2)
         
         c_smooth_temp = jax.scipy.signal.correlate2d(c_tot, k_1d[:, None], mode="same")
@@ -231,9 +334,19 @@ class MatrixFreeSparseRBFPeakFinder:
         window = (3, 3)
         c_max = lax.reduce_window(c_smooth, -jnp.inf, jax.lax.max, window, (1, 1), 'SAME')
         is_max = (c_smooth == c_max) & (c_smooth > 1e-5)
-        
+
+        # Discard maxima in the replicated border before ranking, not after.
+        # The edge padding is a constant strip that the finest basis fits
+        # readily, so it carries many strong spurious maxima; leaving them in
+        # until after the top-MAX_PEAKS cut lets them consume the whole budget
+        # and silently drop the real peaks from the interior.
+        if border > 0:
+            interior = jnp.zeros_like(is_max)
+            interior = interior.at[border:-border, border:-border].set(True)
+            is_max = is_max & interior
+
         c_flat = jnp.where(is_max.flatten(), c_smooth.flatten(), -1.0)
-        
+
         MAX_PEAKS = 100
         top_indices = jnp.argsort(c_flat)[::-1][:MAX_PEAKS]
         valid_mask = c_flat[top_indices] > 1e-5
@@ -242,40 +355,46 @@ class MatrixFreeSparseRBFPeakFinder:
             r = idx // c_smooth.shape[1]
             c = idx % c_smooth.shape[1]
             
-            r_safe = jnp.clip(r, 1, c_smooth.shape[0]-2)
-            c_safe = jnp.clip(c, 1, c_smooth.shape[1]-2)
-            
-            val = jnp.log(jnp.maximum(c_smooth[r_safe, c_safe], 1e-9))
-            val_up = jnp.log(jnp.maximum(c_smooth[r_safe - 1, c_safe], 1e-9))
-            val_dn = jnp.log(jnp.maximum(c_smooth[r_safe + 1, c_safe], 1e-9))
-            val_lf = jnp.log(jnp.maximum(c_smooth[r_safe, c_safe - 1], 1e-9))
-            val_rt = jnp.log(jnp.maximum(c_smooth[r_safe, c_safe + 1], 1e-9))
+            r_safe = jnp.clip(r, 1, c_smooth.shape[0] - 2)
+            c_safe = jnp.clip(c, 1, c_smooth.shape[1] - 2)
 
-            den_r = jnp.minimum(val_up - 2.0 * val + val_dn, -1e-6)
-            dr = 0.5 * (val_up - val_dn) / den_r
-
-            den_c = jnp.minimum(val_lf - 2.0 * val + val_rt, -1e-6)
-            dc = 0.5 * (val_lf - val_rt) / den_c
-            
-            r_cont = r_safe + jnp.clip(dr, -1.0, 1.0)
-            c_cont = c_safe + jnp.clip(dc, -1.0, 1.0)
-            
             # Extract 3x3 patch to integrate splintered coefficients
             c_patch = lax.dynamic_slice(c_tensor, (0, r_safe - 1, c_safe - 1), (c_tensor.shape[0], 3, 3))
-            c_channels = jnp.sum(c_patch, axis=(1, 2)) 
-            
+            c_channels = jnp.sum(c_patch, axis=(1, 2))
+
             # Exact Flux & Variance Preservation
             # Flux of basis k is A_k * sigma_k^2
             flux_k = c_channels * (self.sigmas ** 2)
             total_flux_scaled = jnp.sum(flux_k) + 1e-9
-            
+
             # Variance of mixture is sum(Flux_k * sigma_k^2) / sum(Flux_k)
             sigma_sq_eff = jnp.sum(flux_k * (self.sigmas ** 2)) / total_flux_scaled
             sigma_eff = jnp.sqrt(sigma_sq_eff)
-            
+
             # Convert flux back to effective central amplitude
             amp_eff = total_flux_scaled / sigma_sq_eff
-            
+
+            # Localise from the raw coefficients, not from the smoothed map used
+            # to find the maximum.  Those are two different jobs: smoothing helps
+            # decide *whether* there is a peak here, but it also drags the apex
+            # toward any neighbouring peak, so reading the position off it makes
+            # the centre wander.  L1 splinters a peak across the pixels it
+            # straddles, so the coefficient-weighted centroid is the sub-pixel
+            # position, and it is exact for a peak sitting on a pixel.
+            #
+            # The window is kept at the one-pixel splintering scale on purpose.
+            # Widening it to follow the fitted width was tried and is worse: the
+            # broad channels carry diffuse coefficients, so a wider window pulls
+            # the centre off the peak and reaches into close neighbours.
+            patch_tot = jnp.sum(c_patch, axis=0)
+            patch_mass = jnp.sum(patch_tot) + 1e-9
+            offsets = jnp.array([-1.0, 0.0, 1.0])
+            dr = jnp.sum(patch_tot * offsets[:, None]) / patch_mass
+            dc = jnp.sum(patch_tot * offsets[None, :]) / patch_mass
+
+            r_cont = r_safe + jnp.clip(dr, -1.0, 1.0)
+            c_cont = c_safe + jnp.clip(dc, -1.0, 1.0)
+
             return jnp.array([amp_eff, r_cont, c_cont, sigma_eff])
 
         extracted = vmap(process_peak)(top_indices)
@@ -308,18 +427,21 @@ class MatrixFreeSparseRBFPeakFinder:
 
         results = []
         c_tensors = jax.jit(jax.vmap(self._solve_ssn_cg_global))(images_padded, bg_padded)
-            
+
+        MARGIN = max(3, self.max_k_rad)
+
         for i in range(B):
-            peaks_padded, valid_mask = self._extract_peaks(c_tensors[i])
+            peaks_padded, valid_mask = self._extract_peaks(
+                c_tensors[i], border=pad_y + MARGIN
+            )
             peaks_np = np.array(peaks_padded)
             mask_np = np.array(valid_mask)
-            
+
             valid_peaks = peaks_np[mask_np]
-            
+
             valid_peaks[:, 1] -= pad_y
             valid_peaks[:, 2] -= pad_x
-            
-            MARGIN = max(3, self.max_k_rad)
+
             in_bounds = (
                 (valid_peaks[:, 1] >= MARGIN) & (valid_peaks[:, 1] < H - MARGIN) &
                 (valid_peaks[:, 2] >= MARGIN) & (valid_peaks[:, 2] < W - MARGIN)
