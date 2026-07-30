@@ -228,10 +228,7 @@ def test_integrate_peaks_rbf_ssn_orchestrator():
 
 
 def test_peak_finder_multiscale_subpixel_recovery():
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
 
@@ -255,7 +252,7 @@ def test_peak_finder_multiscale_subpixel_recovery():
 
     image_batch = image[np.newaxis, ...]
 
-    finder = SparseRBFPeakFinder(
+    finder = MatrixFreeSparseRBFPeakFinder(
         alpha=2.0, gamma=1.0, min_sigma=0.5, max_sigma=5.0, show_steps=False
     )
 
@@ -284,10 +281,7 @@ def test_peak_finder_multiscale_subpixel_recovery():
 
 
 def test_poisson_vs_gaussian_sparse_flux():
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
 
@@ -306,7 +300,7 @@ def test_poisson_vs_gaussian_sparse_flux():
 
     image_batch = image[np.newaxis, ...]
 
-    finder_l2 = SparseRBFPeakFinder(
+    finder_l2 = MatrixFreeSparseRBFPeakFinder(
         gamma=1.0,
         alpha=1.0,
         min_sigma=1.0,
@@ -314,7 +308,7 @@ def test_poisson_vs_gaussian_sparse_flux():
         loss="gaussian",
         show_steps=False,
     )
-    finder_pois = SparseRBFPeakFinder(
+    finder_pois = MatrixFreeSparseRBFPeakFinder(
         gamma=1.0,
         alpha=1.0,
         min_sigma=1.0,
@@ -351,10 +345,7 @@ def test_poisson_vs_gaussian_sparse_flux():
 
 
 def test_poisson_overlapping_string():
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
 
@@ -378,7 +369,7 @@ def test_poisson_overlapping_string():
     image = np.random.poisson(image).astype(np.float32)
     image_batch = image[np.newaxis, ...]
 
-    finder = SparseRBFPeakFinder(
+    finder = MatrixFreeSparseRBFPeakFinder(
         alpha=2.0,
         gamma=1.0,
         min_sigma=0.5,
@@ -412,10 +403,7 @@ def test_poisson_overlapping_string():
 
 
 def test_real_neutron_structured_background():
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
 
@@ -442,7 +430,7 @@ def test_real_neutron_structured_background():
     image = np.random.poisson(image).astype(np.float32)
     image_batch = image[np.newaxis, ...]
 
-    finder = SparseRBFPeakFinder(
+    finder = MatrixFreeSparseRBFPeakFinder(
         alpha=4.0,
         gamma=1.0,
         min_sigma=0.5,
@@ -515,10 +503,7 @@ def test_large_sensor_basic_recovery_finder():
     This isolates whether the GPU batching, memory, and scaling work on large arrays
     without the confounding variable of morphological halo errors.
     """
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
     import scipy.special
@@ -549,7 +534,7 @@ def test_large_sensor_basic_recovery_finder():
 
     image_batch = image[np.newaxis, ...]
 
-    finder = SparseRBFPeakFinder(
+    finder = MatrixFreeSparseRBFPeakFinder(
         alpha=4.0,
         gamma=1.0,
         min_sigma=1.0,
@@ -578,10 +563,7 @@ def test_large_sensor_artifact_suppression():
     diffuse scattering background (halo) to ensure the solver does NOT
     hallucinate a grid of false peaks to fit the unmodeled background curvature.
     """
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
     import scipy.special
@@ -613,7 +595,7 @@ def test_large_sensor_artifact_suppression():
     image_batch = image[np.newaxis, ...]
 
     # Test Peak Finder robustness to background curvature
-    finder = SparseRBFPeakFinder(
+    finder = MatrixFreeSparseRBFPeakFinder(
         alpha=4.0,
         gamma=1.0,
         min_sigma=1.0,
@@ -865,10 +847,7 @@ def test_poisson_local_variance_suppression():
     The spatially varying 1/U_k variance map MUST suppress the peak on the bright halo
     while preserving the peak on the dark background.
     """
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
     import scipy.special
@@ -919,7 +898,7 @@ def test_poisson_local_variance_suppression():
     # Peak A Z-score ≈ Amp / sqrt(10) ≈ 60 / 3.16 ≈ 19.0
     # Peak B Z-score ≈ Amp / sqrt(510) ≈ 60 / 22.5 ≈ 2.6
     # Setting alpha=8.0 guarantees A easily survives and B is heavily suppressed.
-    finder = SparseRBFPeakFinder(
+    finder = MatrixFreeSparseRBFPeakFinder(
         alpha=8.0,
         gamma=1.0,
         min_sigma=1.0,
@@ -958,10 +937,7 @@ def test_poisson_subpatch_variance_suppression():
     and falsely detect Peak B. The new Poisson model evaluates local variance
     as sqrt(510) and correctly suppresses it.
     """
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
     import scipy.special
@@ -1012,7 +988,7 @@ def test_poisson_subpatch_variance_suppression():
     # Peak A Poisson Z-score ≈ 60 / sqrt(10) ≈ 19.0
     # Peak B Poisson Z-score ≈ 60 / sqrt(510) ≈ 2.6
     # (Old Gaussian Z-score for Peak B would be ≈ 60 / sqrt(patch_median=10) ≈ 19.0)
-    finder = SparseRBFPeakFinder(
+    finder = MatrixFreeSparseRBFPeakFinder(
         alpha=8.0,
         gamma=1.0,
         min_sigma=1.0,
