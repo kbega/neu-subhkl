@@ -56,7 +56,7 @@ class MatrixFreeSparseRBFPeakFinder:
         show_steps: bool = False,
         ref_sigma: float = 1.0,
         refine_positions: bool = True,
-        debias: bool = True,
+        debias: bool = False,
         reject_boundary_sigma: bool = True,
         boundary_sigma_frac: float = 0.98,
         **kwargs
@@ -313,9 +313,21 @@ class MatrixFreeSparseRBFPeakFinder:
 
         # === DEBIASING PHASE ===
         # L1 shrinks every surviving coefficient by the threshold, so amplitudes
-        # come out of the previous phase biased low.  Refitting on the selected
-        # support without the penalty removes that bias.  `self.debias` is a
-        # static flag, so this branch is resolved at trace time.
+        # come out of the previous phase biased low, and refitting on the
+        # selected support without the penalty removes that bias.
+        #
+        # It is off by default because nothing downstream reads the amplitude:
+        # the orchestrator reduces this finder's output to (row, column) before
+        # handing it to the workers, and intensity is measured later by the
+        # integrator, at known positions, where it is a well-posed problem.
+        # Debiasing is also not free.  Dropping the penalty drops the only thing
+        # suppressing whatever the model cannot explain, so an unpenalised refit
+        # will absorb a mis-estimated background into the peaks -- concentrated
+        # in proportion to how sparse the support is, which is why a stricter
+        # threshold made matters worse rather than better.  Turn it on when
+        # amplitudes are actually wanted from the finder itself.
+        #
+        # `self.debias` is a static flag, so this branch resolves at trace time.
         if not self.debias:
             return c_l1[0]
 

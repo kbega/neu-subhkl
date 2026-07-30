@@ -35,8 +35,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   number keeps it as a lower bound on significance, so an explicit request can be
   stricter than false-alarm control requires but not weaker. Exposed as
   `effective_alpha(height, width)`.
-- `debias`, to switch off the post-selection refit. On this suite it is needed
-  by exactly one test, and only for amplitude accuracy: see below.
+- `debias`, to control the post-selection refit. Off by default: see below.
 
 ### Changed
 
@@ -47,6 +46,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scale coordinate and the fit breaks the tie towards splitting. See
   `docs/matrix_free_theory.md` Theorem 1. The legacy finder keeps its historical
   default of 2.0 so that it still reproduces what it always did.
+- **Debiasing is now off by default.** It exists to remove L1 shrinkage from
+  amplitudes, and nothing downstream reads the finder's amplitude — the
+  orchestrator reduces the peak list to `(row, column)` before handing it to the
+  workers, and intensity is measured later by the integrator at known positions,
+  where it is a well-posed problem. It is also not free: dropping the penalty
+  drops the only thing suppressing what the model cannot explain, so an
+  unpenalised refit absorbs a mis-estimated background into the peaks. Turning it
+  off removes two flaky tests and takes a clean full-suite run from roughly 55%
+  of runs to roughly 87%. Set `debias=True` when amplitudes are wanted from the
+  finder itself.
 - **Default `alpha` is now `None`, was 4.0.** The right threshold depends on how
   many coefficients are being tested, so it depends on image size, which a
   constant cannot express. The derived values run from 3.60 on a 64x64 padded
@@ -107,15 +116,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Notes
 
-- Debiasing is load-bearing for amplitude accuracy only. Disabling it leaves 15
-  of the 16 finder tests passing, including every detection, position and
-  overlap case; the one that fails is
-  `test_poisson_vs_gaussian_sparse_flux`, which compares recovered flux against
-  ground truth on a very low-count image (background rate 0.1, peak amplitude
-  5.0, true flux 125.7). Without the refit only 6.4 of that flux survives L1
-  shrinkage — 5% of the truth — which swamps the difference between the Poisson
-  and Gaussian losses that the test exists to measure. Positions and detection
-  are unaffected, as expected: L1 shrinks amplitudes, not centres.
+- Debiasing is load-bearing for amplitude accuracy only, which is why it is no
+  longer the default. The one test that needs it,
+  `test_poisson_vs_gaussian_sparse_flux`, now opts in explicitly: it compares
+  recovered flux against ground truth on a very low-count image (background rate
+  0.1, peak amplitude 5.0, true flux 125.7), and without the refit only 6.4 of
+  that flux survives L1 shrinkage — 5% of the truth — which swamps the
+  difference between the two losses it exists to measure.
+- Measured flake rates, whole file, per test: with debiasing on,
+  `test_poisson_local_variance_suppression` passed 5 runs of 8 and
+  `test_poisson_subpatch_variance_suppression` 7 of 8; with it off both are
+  stable and `test_peak_finder_multiscale_subpixel_recovery` passes 7 of 8
+  instead. Amplitude quality feeds back into position through the sliding
+  refinement's starting point, so the residual flake is not surprising.
 
 ### Deprecated
 

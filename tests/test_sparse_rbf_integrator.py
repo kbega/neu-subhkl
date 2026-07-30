@@ -324,7 +324,13 @@ def test_poisson_vs_gaussian_sparse_flux():
 
     image_batch = image[np.newaxis, ...]
 
+    # This is the one case that asks the finder for a flux rather than a
+    # position, so it opts into debiasing: without it L1 shrinkage leaves ~5% of
+    # the true flux and swamps the difference between the two losses.  The
+    # pipeline itself never reads these amplitudes, which is why debiasing is
+    # not the default.
     finder_l2 = MatrixFreeSparseRBFPeakFinder(
+        debias=True,
         gamma=0.5,
         alpha=1.0,
         min_sigma=1.0,
@@ -333,6 +339,7 @@ def test_poisson_vs_gaussian_sparse_flux():
         show_steps=False,
     )
     finder_pois = MatrixFreeSparseRBFPeakFinder(
+        debias=True,
         gamma=0.5,
         alpha=1.0,
         min_sigma=1.0,
