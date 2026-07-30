@@ -88,7 +88,15 @@ def finder(
     peak_minimum_pixels: int = 30,
     peak_minimum_signal_to_noise: float = 1.0,
     peak_pixel_outlier_threshold: float = 2.0,
-    sparse_rbf_alpha: float = 0.1,
+    sparse_rbf_alpha: Annotated[
+        float | None,
+        typer.Option(
+            help="Significance threshold in units of coefficient noise. Left "
+            "unset it is derived so the expected number of false detections "
+            "over the image is O(1), which depends on the image size; set it "
+            "to demand more evidence than that."
+        ),
+    ] = None,
     sparse_rbf_gamma: float = 0.5,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,

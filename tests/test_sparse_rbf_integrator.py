@@ -1144,3 +1144,76 @@ def test_boundary_sigma_rejection_fires_on_unmodelled_background():
     assert any(
         np.sqrt((p[1] - 50.0) ** 2 + (p[2] - 20.0) ** 2) < 2.0 for p in kept
     ), "the boundary-sigma filter removed the genuine peak"
+
+
+def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
+    """`alpha=None` should set the threshold level from the data, not a constant.
+
+    Solving globally tests every (pixel, scale) coefficient at once, so the
+    level that keeps the expected number of false detections at O(1) over the
+    image is ``sqrt(2 log N_k)`` with ``N_k`` the resolution-element count at
+    that scale.  That level depends on how big the image is, which a hard-coded
+    constant cannot express: the same constant is too strict for a small crop
+    and too permissive for a full detector frame.
+
+    What must be preserved is the ``sigma**gamma`` *shape* of the threshold,
+    since that is what sets the merge/split balance.  Using the floor alone
+    flattens it and over-merges, losing weak peaks in the tails of strong ones.
+    """
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    import numpy as np
+
+    gamma = 0.5
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+    )
+    sigmas = np.array(finder.sigmas)
+    weights = (sigmas / finder.ref_sigma) ** gamma
+
+    def floor_for(side):
+        n = np.maximum((side * side) / (2 * np.pi * sigmas**2), 2.0)
+        return np.sqrt(2 * np.log(n))
+
+    a_small = np.array(finder.effective_alpha(64, 64))
+    a_large = np.array(finder.effective_alpha(4096, 4096))
+
+    # It must never sit below the false-alarm floor at any scale.
+    assert np.all(a_small >= floor_for(64) - 1e-4)
+    assert np.all(a_large >= floor_for(4096) - 1e-4)
+
+    # It must be the *smallest* such level, i.e. touching the floor somewhere,
+    # otherwise it is needlessly throwing away real peaks.
+    assert np.isclose(np.min(a_small - floor_for(64)), 0.0, atol=1e-4)
+
+    # The sigma**gamma shape must survive: alpha_eff / w is one constant.
+    assert np.allclose(a_small / weights, (a_small / weights)[0])
+
+    # A bigger image tests more coefficients, so it must demand more evidence.
+    assert np.all(a_large > a_small)
+
+    # An explicit alpha is a lower bound on significance, not a way under the
+    # floor: too small a request is raised, a strict one is honoured.
+    lax_finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+    )
+    assert np.allclose(np.array(lax_finder.effective_alpha(130, 130)), floor_for(130))
+
+    strict = MatrixFreeSparseRBFPeakFinder(
+        alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+    )
+    assert np.all(np.array(strict.effective_alpha(130, 130)) > floor_for(130))
+
+    # And it must still work: a clear peak on a flat background is found.
+    H = W = 60
+    np.random.seed(11)
+    y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    image = np.full((H, W), 20.0, dtype=np.float32)
+    image += generate_erf_peak(y_coords, x_coords, 30.0, 30.0, 2.0, 300.0)
+    image = np.random.poisson(image).astype(np.float32)
+
+    peaks = finder.find_peaks_batch(image[np.newaxis, ...])[0]
+    assert len(peaks) >= 1
+    assert any(
+        np.sqrt((p[1] - 30.0) ** 2 + (p[2] - 30.0) ** 2) < 2.0 for p in peaks
+    ), "alpha=None failed to find an unambiguous peak"

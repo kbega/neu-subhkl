@@ -28,6 +28,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `docs/matrix_free_theory.md`, recording the results behind these changes with
   proofs and the measurements that establish them.
 - `--sparse-rbf-legacy`, to opt back out to the greedy finder.
+- `alpha` may now be left as `None`, which is the new default. The significance
+  threshold is then derived from the data: the level at which the expected
+  number of false detections over the whole image is O(1), from the maximum of a
+  smooth Gaussian field over the resolution elements at each scale. Passing a
+  number keeps it as a lower bound on significance, so an explicit request can be
+  stricter than false-alarm control requires but not weaker. Exposed as
+  `effective_alpha(height, width)`.
 - `debias`, to switch off the post-selection refit. On this suite it is needed
   by exactly one test, and only for amplitude accuracy: see below.
 
@@ -40,6 +47,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scale coordinate and the fit breaks the tie towards splitting. See
   `docs/matrix_free_theory.md` Theorem 1. The legacy finder keeps its historical
   default of 2.0 so that it still reproduces what it always did.
+- **Default `alpha` is now `None`, was 4.0.** The right threshold depends on how
+  many coefficients are being tested, so it depends on image size, which a
+  constant cannot express. The derived values run from 3.60 on a 64x64 padded
+  crop to 5.44 on a 4096x4096 frame, so the old constant was about right for a
+  mid-size image but ~26% below the floor on a full detector — under-thresholded
+  exactly where it matters. The `sigma**gamma` shape of the threshold is kept,
+  since that is what sets the merge/split balance; deriving the level from the
+  floor *alone* flattens that shape into the over-merging regime and loses weak
+  peaks in the tails of strong ones, which was measured and rejected.
 - Peak positions are now reported from the coefficient-weighted centroid of the
   raw coefficients rather than a log-parabola on the smoothed map, which was
   dragging centres toward neighbouring peaks.
@@ -86,7 +102,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   true flux (`test_overlapping_ghost_center_shift_failure`). This was the
   debiasing divergence above, not a resolution limit: the condition number of
   the true pair is 1.40. The test now passes.
-- Removed `src/subhkl/:q`, a stray editor buffer saved under the wrong name.
+- Removed `src/subhkl/:q`, a stray editor buffer saved under the wrong name, and
+  added editor swap files to `.gitignore` so that cannot recur.
 
 ### Notes
 

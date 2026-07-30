@@ -102,8 +102,11 @@ def prepare_harvest_tasks(
         # matching-pursuit one is kept behind `legacy` while it is retired.
         # Both return [amplitude, row, column, sigma] per peak.
         if harvest_peaks_kwargs.get("legacy", False):
+            legacy_alpha = harvest_peaks_kwargs.get("alpha")
             alg = SparseRBFPeakFinder(
-                alpha=harvest_peaks_kwargs.get("alpha", 0.1),
+                # The greedy finder has no notion of the false-alarm floor, so
+                # it keeps its historical constant when none is given.
+                alpha=0.1 if legacy_alpha is None else legacy_alpha,
                 gamma=harvest_peaks_kwargs.get("gamma", 2.0),
                 loss=harvest_peaks_kwargs.get("loss", "gaussian"),
                 min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
@@ -116,7 +119,9 @@ def prepare_harvest_tasks(
             )
         else:
             alg = MatrixFreeSparseRBFPeakFinder(
-                alpha=harvest_peaks_kwargs.get("alpha", 0.1),
+                # None means "derive it from the image size"; see
+                # MatrixFreeSparseRBFPeakFinder.effective_alpha.
+                alpha=harvest_peaks_kwargs.get("alpha"),
                 # 0.5, not the historical 2.0: see the class docstring.  The
                 # legacy branch above keeps 2.0 so that it still reproduces what
                 # it always did.

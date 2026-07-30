@@ -47,7 +47,7 @@ class MatrixFreeSparseRBFPeakFinder:
     """
     def __init__(
         self,
-        alpha: float = 4.0,
+        alpha: float | None = None,
         gamma: float = 0.5,
         min_sigma: float = 1.0,
         max_sigma: float = 5.0,
@@ -81,6 +81,36 @@ class MatrixFreeSparseRBFPeakFinder:
         # Use strictly unnormalized physical bases to preserve flux relationships
         self.K_weights, self.kernel_sq_norms = self._build_kernel_bank()
         self.K_sq = self.K_weights ** 2
+
+    def effective_alpha(self, height, width):
+        """Per-scale significance threshold, in units of coefficient noise.
+
+        Solving globally tests every (pixel, scale) coefficient at once, so a
+        bare significance level does not control the false-alarm rate.  The
+        maximum of a smooth Gaussian field over ``N_k`` resolution elements sits
+        near ``sqrt(2 log N_k)``, and that is the level at which the expected
+        number of false detections over the whole image is O(1).
+
+        With ``alpha=None`` the threshold is derived from that floor: the
+        smallest level whose weighted profile clears it at every scale.  The
+        ``(sigma/sigma_ref)**gamma`` shape is kept, because that shape is what
+        sets the merge/split balance -- using the floor alone flattens it into
+        the over-merging regime and loses weak peaks in the tails of strong
+        ones.  Only the *level* is taken from the data.
+
+        Passing a number instead keeps it as a lower bound on significance,
+        still floored, so an explicit request can be stricter but not weaker
+        than false-alarm control allows.
+        """
+        weights = (self.sigmas / self.ref_sigma) ** self.gamma
+        n_tests = jnp.maximum(
+            (height * width) / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6)),
+            2.0,
+        )
+        floor = jnp.sqrt(2.0 * jnp.log(n_tests))
+        if self.alpha is None:
+            return jnp.max(floor / weights) * weights
+        return jnp.maximum(self.alpha * weights, floor)
 
     def _build_kernel_bank(self):
         k_grid = jnp.arange(-self.max_k_rad, self.max_k_rad + 1)
@@ -144,24 +174,7 @@ class MatrixFreeSparseRBFPeakFinder:
         else:
             var_c = 1.0 / H_diag_safe
 
-        weights = (self.sigmas / self.ref_sigma) ** self.gamma
-        alpha_vec = self.alpha * weights
-
-        # Multiplicity correction.  In the greedy predecessor `alpha` gated one
-        # candidate per search window, so it really was a per-peak significance
-        # level.  Solving globally tests every (pixel, scale) coefficient at
-        # once, and the noise maximum over N independent tests sits at about
-        # sqrt(2 log N) standard deviations, so a bare `alpha` of a few sigma no
-        # longer controls the false-alarm rate at all -- the narrowest basis is
-        # both the most numerous and, under a Besov weight below ref_sigma, the
-        # most permissive, so it fits noise spikes everywhere.  Counting
-        # resolution elements per scale restores the intended meaning of alpha
-        # without changing it where the user has already asked for more.
-        n_tests = jnp.maximum(
-            (H * W) / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6)), 2.0
-        )
-        alpha_floor = jnp.sqrt(2.0 * jnp.log(n_tests))
-        alpha_vec = jnp.maximum(alpha_vec, alpha_floor)
+        alpha_vec = self.effective_alpha(H, W)
 
         # 2. L1 penalty weight, in units of the objective rather than of the
         # prox step.  Soft-thresholding at lam/H_diag recovers the intended
