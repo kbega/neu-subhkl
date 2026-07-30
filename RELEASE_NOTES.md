@@ -104,6 +104,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   likelihood, so it can only ever improve on the L1 solution it starts from.
 - The outer convergence test measured the raw Newton direction rather than the
   step actually taken, so it never triggered.
+- The sliding refinement was a silent no-op. A reporting slot that matched
+  nothing has zero flux in every channel, so its fitted width came out as zero
+  and its amplitude as an infinity; the refinement neutralised unused slots by
+  multiplying them by a zero mask, and `inf * 0` is `NaN`. One such row made the
+  objective and every gradient `NaN`, and the guard against non-finite gradients
+  then turned the whole step into a no-op instead of reporting anything. Whether
+  it happened at all depended on whether a slot's flux was *exactly* zero, so
+  refinement silently ran on some images and not others. Widths are now floored
+  at the finest basis and unused slots are replaced rather than multiplied out.
+  On the two-peak multiscale case the narrow peak's fitted width goes from 1.587
+  to 0.924 against a true 1.0, its position to within 0.03 px, and its amplitude
+  from 49.2 to 134.9 against a true 120.
 - `subhkl finder --finder-algorithm sparse_rbf` returned no peaks on its own
   integration test. It now passes.
 - Two heavily overlapping broad peaks at 2.67 sigma of separation were
@@ -123,12 +135,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   0.1, peak amplitude 5.0, true flux 125.7), and without the refit only 6.4 of
   that flux survives L1 shrinkage — 5% of the truth — which swamps the
   difference between the two losses it exists to measure.
-- Measured flake rates, whole file, per test: with debiasing on,
-  `test_poisson_local_variance_suppression` passed 5 runs of 8 and
-  `test_poisson_subpatch_variance_suppression` 7 of 8; with it off both are
-  stable and `test_peak_finder_multiscale_subpixel_recovery` passes 7 of 8
-  instead. Amplitude quality feeds back into position through the sliding
-  refinement's starting point, so the residual flake is not surprising.
+- The finder suite is currently stable: 20 of 20 on three consecutive whole-file
+  runs, and 6 of 6 in isolation for each of the three tests that used to flap.
+  That is after the refinement no-op above was fixed; before it, a clean run was
+  roughly 55% likely.
 
 ### Deprecated
 

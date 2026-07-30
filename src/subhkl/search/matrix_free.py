@@ -466,8 +466,16 @@ class MatrixFreeSparseRBFPeakFinder:
             flux_k = c_channels * (self.sigmas ** 2)
             total_flux_scaled = jnp.sum(flux_k) + 1e-9
 
-            # Variance of mixture is sum(Flux_k * sigma_k^2) / sum(Flux_k)
-            sigma_sq_eff = jnp.sum(flux_k * (self.sigmas ** 2)) / total_flux_scaled
+            # Variance of mixture is sum(Flux_k * sigma_k^2) / sum(Flux_k).
+            # Floor it at the finest basis: a slot that matched nothing has zero
+            # flux in every channel, and dividing by a zero width below turns its
+            # amplitude into an infinity.  Those slots are discarded by the
+            # validity mask, but an infinity multiplied by a zero mask is a NaN,
+            # which then contaminates anything that consumes the whole array.
+            sigma_sq_eff = jnp.maximum(
+                jnp.sum(flux_k * (self.sigmas ** 2)) / total_flux_scaled,
+                float(self.min_sigma) ** 2,
+            )
             sigma_eff = jnp.sqrt(sigma_sq_eff)
 
             # Convert flux back to effective central amplitude
@@ -520,6 +528,25 @@ class MatrixFreeSparseRBFPeakFinder:
         P = 2 * self.max_k_rad + 1
         off = jnp.arange(P, dtype=jnp.float32)
         mask = active.astype(jnp.float32)
+
+        # Replace unused slots outright instead of relying on the mask to cancel
+        # them.  Masking by multiplication cannot neutralise a non-finite value
+        # -- inf * 0 is NaN -- and one such row is enough to make the objective,
+        # and therefore every gradient, NaN.  The guard against non-finite
+        # gradients further down would then silently turn refinement into a
+        # no-op rather than reporting anything.
+        safe = jnp.stack(
+            [
+                jnp.ones_like(peaks[:, 0]),
+                jnp.full_like(peaks[:, 1], float(self.max_k_rad)),
+                jnp.full_like(peaks[:, 2], float(self.max_k_rad)),
+                jnp.full_like(peaks[:, 3], float(self.min_sigma)),
+            ],
+            axis=1,
+        )
+        finite = jnp.all(jnp.isfinite(peaks), axis=1) & active
+        peaks = jnp.where(finite[:, None], peaks, safe)
+        mask = finite.astype(jnp.float32)
 
         # Unconstrained parameterisation keeps amplitude positive and sigma
         # inside the bank's range without needing a projection each step.
