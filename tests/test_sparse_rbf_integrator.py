@@ -1,3 +1,24 @@
+"""Sparse-RBF finder and integrator regression tests.
+
+All peak-*finding* cases here run at ``gamma=0.5``.  ``gamma=1`` must not be
+used: it is the point at which the penalty per unit flux becomes independent of
+scale, so one broad atom and a mass-preserving spread of narrower ones have the
+same cost and the same predicted image.  The minimiser is then not unique in the
+scale coordinate, and because extra atoms always absorb a little more noise the
+fit breaks the tie towards splitting -- a single peak is reported as a cluster.
+See docs/matrix_free_theory.md, Theorem 1.
+
+``gamma=0.5`` is used uniformly so that no test depends on its own tuning.  It
+sits inside the usable range on both sides: ``gamma=1`` fragments, while
+``gamma=0`` over-merges and swallows genuine neighbours.  A case needing a
+different value should say why at its own call site.
+
+Integrator call sites keep their original gamma deliberately.  The degeneracy
+above requires unknown positions *and* unknown scale at once; integration is
+handed positions from the lattice and performs no model selection over them, so
+scale is identified there and the argument does not apply.
+"""
+
 import numpy as np
 import scipy.special
 
@@ -54,6 +75,9 @@ def test_single_isolated_peak():
         alpha=4.0,  # 4-sigma detection threshold
         min_sigma=1.0,
         max_sigma=5.0,
+        # gamma=1 is safe here, unlike in the finder: integration is given the
+        # peak positions and does no model selection over them, so the scale
+        # degeneracy of docs/matrix_free_theory.md Theorem 1 does not apply.
         gamma=1.0,
         loss="gaussian",
     )
@@ -253,7 +277,7 @@ def test_peak_finder_multiscale_subpixel_recovery():
     image_batch = image[np.newaxis, ...]
 
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=2.0, gamma=1.0, min_sigma=0.5, max_sigma=5.0, show_steps=False
+        alpha=2.0, gamma=0.5, min_sigma=0.5, max_sigma=5.0, show_steps=False
     )
 
     results = finder.find_peaks_batch(image_batch)
@@ -301,7 +325,7 @@ def test_poisson_vs_gaussian_sparse_flux():
     image_batch = image[np.newaxis, ...]
 
     finder_l2 = MatrixFreeSparseRBFPeakFinder(
-        gamma=1.0,
+        gamma=0.5,
         alpha=1.0,
         min_sigma=1.0,
         max_sigma=4.0,
@@ -309,7 +333,7 @@ def test_poisson_vs_gaussian_sparse_flux():
         show_steps=False,
     )
     finder_pois = MatrixFreeSparseRBFPeakFinder(
-        gamma=1.0,
+        gamma=0.5,
         alpha=1.0,
         min_sigma=1.0,
         max_sigma=4.0,
@@ -371,7 +395,7 @@ def test_poisson_overlapping_string():
 
     finder = MatrixFreeSparseRBFPeakFinder(
         alpha=2.0,
-        gamma=1.0,
+        gamma=0.5,
         min_sigma=0.5,
         max_sigma=5.0,
         loss="poisson",
@@ -432,7 +456,7 @@ def test_real_neutron_structured_background():
 
     finder = MatrixFreeSparseRBFPeakFinder(
         alpha=4.0,
-        gamma=1.0,
+        gamma=0.5,
         min_sigma=0.5,
         max_sigma=5.0,
         loss="poisson",
@@ -536,7 +560,7 @@ def test_large_sensor_basic_recovery_finder():
 
     finder = MatrixFreeSparseRBFPeakFinder(
         alpha=4.0,
-        gamma=1.0,
+        gamma=0.5,
         min_sigma=1.0,
         max_sigma=5.0,
         loss="poisson",
@@ -597,7 +621,7 @@ def test_large_sensor_artifact_suppression():
     # Test Peak Finder robustness to background curvature
     finder = MatrixFreeSparseRBFPeakFinder(
         alpha=4.0,
-        gamma=1.0,
+        gamma=0.5,
         min_sigma=1.0,
         max_sigma=5.0,
         loss="poisson",
@@ -697,6 +721,9 @@ def test_large_sensor_basic_integration():
         peaks_obj=MockPeaks({0: image}),
         sigmas=[1.0, 2.0, 4.0],
         alpha=4.0,
+        # gamma=1 is safe here, unlike in the finder: integration is given the
+        # peak positions and does no model selection over them, so the scale
+        # degeneracy of docs/matrix_free_theory.md Theorem 1 does not apply.
         gamma=1.0,
         show_progress=False,
     )
@@ -809,6 +836,9 @@ def test_integrator_large_sensor_halo_suppression():
         peaks_obj=MockPeaks({0: image}),
         sigmas=[1.0, 2.0, 4.0],
         alpha=5.0,
+        # gamma=1 is safe here, unlike in the finder: integration is given the
+        # peak positions and does no model selection over them, so the scale
+        # degeneracy of docs/matrix_free_theory.md Theorem 1 does not apply.
         gamma=1.0,
         show_progress=False,
     )
@@ -900,7 +930,7 @@ def test_poisson_local_variance_suppression():
     # Setting alpha=8.0 guarantees A easily survives and B is heavily suppressed.
     finder = MatrixFreeSparseRBFPeakFinder(
         alpha=8.0,
-        gamma=1.0,
+        gamma=0.5,
         min_sigma=1.0,
         max_sigma=5.0,
         loss="poisson",
@@ -990,7 +1020,7 @@ def test_poisson_subpatch_variance_suppression():
     # (Old Gaussian Z-score for Peak B would be ≈ 60 / sqrt(patch_median=10) ≈ 19.0)
     finder = MatrixFreeSparseRBFPeakFinder(
         alpha=8.0,
-        gamma=1.0,
+        gamma=0.5,
         min_sigma=1.0,
         max_sigma=5.0,
         loss="poisson",
