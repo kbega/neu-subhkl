@@ -56,6 +56,7 @@ class MatrixFreeSparseRBFPeakFinder:
         show_steps: bool = False,
         ref_sigma: float = 1.0,
         refine_positions: bool = True,
+        debias: bool = True,
         reject_boundary_sigma: bool = True,
         boundary_sigma_frac: float = 0.98,
         **kwargs
@@ -69,6 +70,7 @@ class MatrixFreeSparseRBFPeakFinder:
         self.show_steps = show_steps
         self.ref_sigma = ref_sigma
         self.refine_positions = refine_positions
+        self.debias = debias
         self.reject_boundary_sigma = reject_boundary_sigma
         self.boundary_sigma_frac = boundary_sigma_frac
 
@@ -297,6 +299,13 @@ class MatrixFreeSparseRBFPeakFinder:
         _, _, c_l1, _ = final_state
 
         # === DEBIASING PHASE ===
+        # L1 shrinks every surviving coefficient by the threshold, so amplitudes
+        # come out of the previous phase biased low.  Refitting on the selected
+        # support without the penalty removes that bias.  `self.debias` is a
+        # static flag, so this branch is resolved at trace time.
+        if not self.debias:
+            return c_l1[0]
+
         active_mask = (c_l1 > 1e-5).astype(jnp.float32)
 
         def debias_cond(state):

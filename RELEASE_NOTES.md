@@ -28,6 +28,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `docs/matrix_free_theory.md`, recording the results behind these changes with
   proofs and the measurements that establish them.
 - `--sparse-rbf-legacy`, to opt back out to the greedy finder.
+- `debias`, to switch off the post-selection refit. On this suite it is needed
+  by exactly one test, and only for amplitude accuracy: see below.
 
 ### Changed
 
@@ -85,6 +87,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   debiasing divergence above, not a resolution limit: the condition number of
   the true pair is 1.40. The test now passes.
 - Removed `src/subhkl/:q`, a stray editor buffer saved under the wrong name.
+
+### Notes
+
+- Debiasing is load-bearing for amplitude accuracy only. Disabling it leaves 15
+  of the 16 finder tests passing, including every detection, position and
+  overlap case; the one that fails is
+  `test_poisson_vs_gaussian_sparse_flux`, which compares recovered flux against
+  ground truth on a very low-count image (background rate 0.1, peak amplitude
+  5.0, true flux 125.7). Without the refit only 6.4 of that flux survives L1
+  shrinkage — 5% of the truth — which swamps the difference between the Poisson
+  and Gaussian losses that the test exists to measure. Positions and detection
+  are unaffected, as expected: L1 shrinks amplitudes, not centres.
 
 ### Deprecated
 
