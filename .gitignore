@@ -177,3 +177,6 @@ ADVERSARY.md
 ruff.toml
 sum_complexity.py
 tools/
+
+# direnv
+.envrc
