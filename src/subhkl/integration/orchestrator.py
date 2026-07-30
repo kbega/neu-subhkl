@@ -117,7 +117,10 @@ def prepare_harvest_tasks(
         else:
             alg = MatrixFreeSparseRBFPeakFinder(
                 alpha=harvest_peaks_kwargs.get("alpha", 0.1),
-                gamma=harvest_peaks_kwargs.get("gamma", 2.0),
+                # 0.5, not the historical 2.0: see the class docstring.  The
+                # legacy branch above keeps 2.0 so that it still reproduces what
+                # it always did.
+                gamma=harvest_peaks_kwargs.get("gamma", 0.5),
                 loss=harvest_peaks_kwargs.get("loss", "gaussian"),
                 min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
                 max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),

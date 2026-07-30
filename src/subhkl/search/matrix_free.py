@@ -40,16 +40,15 @@ class MatrixFreeSparseRBFPeakFinder:
     recovers a weak peak hidden in a strong peak's tail (``gamma = 1`` misses
     it) and cuts the reported peak count from 36 to 7 on the overlap cases.
 
-    ``gamma`` is left at 1.0 here only for backwards compatibility.  It should
-    be calibrated like ``alpha`` or a regularisation strength, against the
-    merge/split error pair, and that calibration is only meaningful away from
-    1.0 -- which is the single point where the penalty carries no information
-    about model order at all.
+    The default is 0.5.  It should still be calibrated like ``alpha`` or a
+    regularisation strength, against the merge/split error pair, and that
+    calibration is only meaningful away from 1.0 -- the single point where the
+    penalty carries no information about model order at all.
     """
     def __init__(
         self,
         alpha: float = 4.0,
-        gamma: float = 1.0,
+        gamma: float = 0.5,
         min_sigma: float = 1.0,
         max_sigma: float = 5.0,
         num_sigmas: int = 5,

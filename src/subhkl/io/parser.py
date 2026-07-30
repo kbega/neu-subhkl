@@ -89,7 +89,7 @@ def finder(
     peak_minimum_signal_to_noise: float = 1.0,
     peak_pixel_outlier_threshold: float = 2.0,
     sparse_rbf_alpha: float = 0.1,
-    sparse_rbf_gamma: float = 1.0,
+    sparse_rbf_gamma: float = 0.5,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
     sparse_rbf_chunk_size: int = 512,
