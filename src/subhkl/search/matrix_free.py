@@ -23,6 +23,7 @@ class MatrixFreeSparseRBFPeakFinder:
         loss: str = "poisson",
         show_steps: bool = False,
         ref_sigma: float = 1.0,
+        refine_positions: bool = True,
         **kwargs
     ):
         self.alpha = alpha
@@ -33,6 +34,7 @@ class MatrixFreeSparseRBFPeakFinder:
         self.loss = loss
         self.show_steps = show_steps
         self.ref_sigma = ref_sigma
+        self.refine_positions = refine_positions
 
         # 1. Pre-build the Filter Bank
         self.sigmas = jnp.linspace(min_sigma, max_sigma, num_sigmas)
@@ -400,6 +402,114 @@ class MatrixFreeSparseRBFPeakFinder:
         extracted = vmap(process_peak)(top_indices)
         return extracted, valid_mask
 
+    @partial(jit, static_argnames=["self", "n_steps"])
+    def _refine_peaks(self, y_img, bg_img, peaks, active, n_steps=200):
+        """Continuous ("sliding") refinement of the selected support.
+
+        The convex solve picks *which* atoms are present, but it can only place
+        them on the integer grid the dictionary is built on, so a peak that sits
+        between pixels is split across neighbours and its position is only
+        recoverable to whatever the centroid heuristic manages.  Re-fitting the
+        selected peaks' continuous (amplitude, row, column, sigma) against the
+        same Poisson objective lifts the answer off the grid: this is the
+        sliding step of a Frank-Wolfe scheme over measures, and it is what makes
+        the recovered positions sub-pixel rather than sub-grid.
+
+        Peaks are rendered on their own bounding box and scattered into the
+        model, so cost is O(n_peaks * patch^2) rather than O(n_peaks * H * W)
+        and this stays affordable on full detector images.
+        """
+        H, W = y_img.shape
+        P = 2 * self.max_k_rad + 1
+        off = jnp.arange(P, dtype=jnp.float32)
+        mask = active.astype(jnp.float32)
+
+        # Unconstrained parameterisation keeps amplitude positive and sigma
+        # inside the bank's range without needing a projection each step.
+        lo, hi = float(self.min_sigma), float(self.max_sigma)
+        sig0 = jnp.clip(peaks[:, 3], lo + 1e-3, hi - 1e-3)
+        u_init = jnp.stack(
+            [
+                jnp.log(jnp.maximum(peaks[:, 0], 1e-3)),
+                peaks[:, 1],
+                peaks[:, 2],
+                jnp.log((sig0 - lo) / jnp.maximum(hi - sig0, 1e-6)),
+            ],
+            axis=1,
+        )
+
+        def physical(u):
+            amp = jnp.exp(u[:, 0])
+            sig = lo + (hi - lo) * jax.nn.sigmoid(u[:, 3])
+            return amp, u[:, 1], u[:, 2], sig
+
+        def render(u):
+            amp, r, c, sig = physical(u)
+            s2 = sig * jnp.sqrt(2.0) + 1e-6
+            r0 = jnp.clip(
+                jnp.round(r).astype(jnp.int32) - self.max_k_rad, 0, H - P
+            )
+            c0 = jnp.clip(
+                jnp.round(c).astype(jnp.int32) - self.max_k_rad, 0, W - P
+            )
+            rr = r0[:, None].astype(jnp.float32) + off[None, :]
+            cc = c0[:, None].astype(jnp.float32) + off[None, :]
+
+            def erf_span(grid, centre):
+                d = grid - centre[:, None]
+                return jax.scipy.special.erf(
+                    (d + 0.5) / s2[:, None]
+                ) - jax.scipy.special.erf((d - 0.5) / s2[:, None])
+
+            ey = erf_span(rr, r)
+            ex = erf_span(cc, c)
+            amp_s = amp * (jnp.pi / 2.0) * (sig**2) * mask
+            patch = amp_s[:, None, None] * ey[:, :, None] * ex[:, None, :]
+
+            idx_r = jnp.broadcast_to(
+                (r0[:, None] + jnp.arange(P))[:, :, None], (peaks.shape[0], P, P)
+            )
+            idx_c = jnp.broadcast_to(
+                (c0[:, None] + jnp.arange(P))[:, None, :], (peaks.shape[0], P, P)
+            )
+            return jnp.zeros((H, W)).at[idx_r, idx_c].add(patch)
+
+        def nll(u):
+            model = jnp.maximum(render(u) + bg_img, 1e-6)
+            return jnp.sum(model - y_img * jnp.log(model))
+
+        grad_fn = jax.value_and_grad(nll)
+
+        def adam_step(state, _):
+            u, m, v, t = state
+            _, g = grad_fn(u)
+            g = jnp.where(jnp.isfinite(g), g, 0.0) * mask[:, None]
+            m = 0.9 * m + 0.1 * g
+            v = 0.999 * v + 0.001 * g**2
+            t = t + 1.0
+            upd = (m / (1.0 - 0.9**t)) / (
+                jnp.sqrt(v / (1.0 - 0.999**t)) + 1e-8
+            )
+            return (u - 0.05 * upd, m, v, t), None
+
+        (u_fin, _, _, _), _ = lax.scan(
+            adam_step,
+            (u_init, jnp.zeros_like(u_init), jnp.zeros_like(u_init), 0.0),
+            None,
+            length=n_steps,
+        )
+        u_fin = jnp.where(jnp.isfinite(u_fin), u_fin, u_init)
+
+        amp, r, c, sig = physical(u_fin)
+        refined = jnp.stack([amp, r, c, sig], axis=1)
+        # A refined peak that ran away from its own bounding box is not a
+        # refinement of that peak any more, so keep the pre-fit values there.
+        moved = jnp.sqrt((r - peaks[:, 1]) ** 2 + (c - peaks[:, 2]) ** 2)
+        keep = active & (moved < float(self.max_k_rad)) & jnp.all(
+            jnp.isfinite(refined), axis=1
+        )
+        return jnp.where(keep[:, None], refined, peaks)
+
     def find_peaks_batch(self, images_batch):
         B, H, W = images_batch.shape
         
@@ -434,6 +544,14 @@ class MatrixFreeSparseRBFPeakFinder:
             peaks_padded, valid_mask = self._extract_peaks(
                 c_tensors[i], border=pad_y + MARGIN
             )
+
+            # Slide the selected support off the grid before un-padding, while
+            # the coordinates still match the image the model is rendered on.
+            if self.refine_positions:
+                peaks_padded = self._refine_peaks(
+                    images_padded[i], bg_padded[i], peaks_padded, valid_mask
+                )
+
             peaks_np = np.array(peaks_padded)
             mask_np = np.array(valid_mask)
 
