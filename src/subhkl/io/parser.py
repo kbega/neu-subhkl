@@ -96,6 +96,14 @@ def finder(
     sparse_rbf_loss: Annotated[
         str, typer.Option(help="Likelihood for peak finder.")
     ] = "gaussian",
+    sparse_rbf_legacy: Annotated[
+        bool,
+        typer.Option(
+            help="Use the original greedy matching-pursuit sparse-RBF finder "
+            "instead of the global basis-pursuit one. Opt-out for the new "
+            "default; the greedy path is scheduled for removal."
+        ),
+    ] = False,
     sparse_rbf_auto_tune_alpha: Annotated[
         bool, typer.Option(help="Auto-tune SNR threshold.")
     ] = False,
@@ -139,6 +147,7 @@ def finder(
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
+        sparse_rbf_legacy=sparse_rbf_legacy,
         sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
         sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
         max_workers=max_workers,

@@ -741,6 +741,7 @@ def run_finder(
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
     sparse_rbf_loss: str = "gaussian",
+    sparse_rbf_legacy: bool = False,
     sparse_rbf_auto_tune_alpha: bool = False,
     sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",
     max_workers: int = 16,
@@ -788,6 +789,7 @@ def run_finder(
                 "show_scale": "linear",
                 "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
                 "loss": sparse_rbf_loss,
+                "legacy": sparse_rbf_legacy,
                 "auto_tune_alpha": sparse_rbf_auto_tune_alpha,
                 "candidate_alphas": alpha_list,
             }

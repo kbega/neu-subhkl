@@ -6,6 +6,7 @@ from typing import List, Any, Optional, Dict, Tuple
 from .image_data import ImageData
 from subhkl.config import beamlines
 from subhkl.instrument.goniometer import Goniometer
+from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 from subhkl.search.sparse_rbf import SparseRBFPeakFinder
 
 
@@ -97,18 +98,31 @@ def prepare_harvest_tasks(
             border_width = 0.0
         border_width *= min(img_stack.shape[1], img_stack.shape[2])
 
-        alg = SparseRBFPeakFinder(
-            alpha=harvest_peaks_kwargs.get("alpha", 0.1),
-            gamma=harvest_peaks_kwargs.get("gamma", 2.0),
-            loss=harvest_peaks_kwargs.get("loss", "gaussian"),
-            min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
-            max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
-            border_width=int(border_width),
-            chunk_size=harvest_peaks_kwargs.get("chunk_size", 128),
-            show_steps=harvest_peaks_kwargs.get("show_steps", False),
-            auto_tune_alpha=harvest_peaks_kwargs.get("auto_tune_alpha", False),
-            candidate_alphas=harvest_peaks_kwargs.get("candidate_alphas", None),
-        )
+        # The global basis-pursuit finder is the default; the greedy
+        # matching-pursuit one is kept behind `legacy` while it is retired.
+        # Both return [amplitude, row, column, sigma] per peak.
+        if harvest_peaks_kwargs.get("legacy", False):
+            alg = SparseRBFPeakFinder(
+                alpha=harvest_peaks_kwargs.get("alpha", 0.1),
+                gamma=harvest_peaks_kwargs.get("gamma", 2.0),
+                loss=harvest_peaks_kwargs.get("loss", "gaussian"),
+                min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
+                max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
+                border_width=int(border_width),
+                chunk_size=harvest_peaks_kwargs.get("chunk_size", 128),
+                show_steps=harvest_peaks_kwargs.get("show_steps", False),
+                auto_tune_alpha=harvest_peaks_kwargs.get("auto_tune_alpha", False),
+                candidate_alphas=harvest_peaks_kwargs.get("candidate_alphas", None),
+            )
+        else:
+            alg = MatrixFreeSparseRBFPeakFinder(
+                alpha=harvest_peaks_kwargs.get("alpha", 0.1),
+                gamma=harvest_peaks_kwargs.get("gamma", 2.0),
+                loss=harvest_peaks_kwargs.get("loss", "gaussian"),
+                min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
+                max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
+                show_steps=harvest_peaks_kwargs.get("show_steps", False),
+            )
         batch_coords = alg.find_peaks_batch(img_stack)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}
 
