@@ -58,6 +58,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   suppressing what the model cannot explain, so an unpenalised refit absorbed a
   mis-estimated background into the peaks, in proportion to how sparse the
   support was. Removing it settled two flaky tests.
+- **Default `--sparse-rbf-loss` is now `poisson`, was `gaussian`.** Detector
+  frames are photon counts, so Poisson is the matching noise model; the Gaussian
+  likelihood assumes one constant variance across the frame, which is wrong
+  wherever the background varies — exactly the regime the spatially varying
+  threshold exists to handle. The legacy finder's API-level fallback is
+  unchanged so direct callers still get what they always did.
 - **Default `alpha` is now `None`, was 4.0.** The right threshold depends on how
   many coefficients are being tested, so it depends on image size, which a
   constant cannot express. The derived values run from 3.60 on a 64x64 padded

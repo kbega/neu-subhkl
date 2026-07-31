@@ -102,8 +102,13 @@ def finder(
     sparse_rbf_max_sigma: float = 10.0,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_loss: Annotated[
-        str, typer.Option(help="Likelihood for peak finder.")
-    ] = "gaussian",
+        str,
+        typer.Option(
+            help="Likelihood for the peak finder. Detector frames are photon "
+            "counts, so 'poisson' is the matching noise model; 'gaussian' "
+            "assumes a single constant variance across the frame."
+        ),
+    ] = "poisson",
     sparse_rbf_legacy: Annotated[
         bool,
         typer.Option(

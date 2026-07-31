@@ -1,11 +1,11 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
-from jax import lax, jit, vmap
 import jax.scipy.signal
 import jax.scipy.sparse.linalg
 import numpy as np
-from tqdm import tqdm
-from functools import partial
+from jax import jit, lax, vmap
 
 
 class MatrixFreeSparseRBFPeakFinder:
@@ -45,6 +45,7 @@ class MatrixFreeSparseRBFPeakFinder:
     calibration is only meaningful away from 1.0 -- the single point where the
     penalty carries no information about model order at all.
     """
+
     def __init__(
         self,
         alpha: float | None = None,
@@ -59,7 +60,7 @@ class MatrixFreeSparseRBFPeakFinder:
         refine_positions: bool = True,
         reject_boundary_sigma: bool = False,
         boundary_sigma_frac: float = 0.98,
-        **kwargs
+        **kwargs,
     ):
         self.alpha = alpha
         self.gamma = gamma
@@ -77,10 +78,10 @@ class MatrixFreeSparseRBFPeakFinder:
         # 1. Pre-build the Filter Bank
         self.sigmas = jnp.linspace(min_sigma, max_sigma, num_sigmas)
         self.max_k_rad = int(3.0 * max_sigma)
-        
+
         # Use strictly unnormalized physical bases to preserve flux relationships
         self.K_weights, self.kernel_sq_norms = self._build_kernel_bank()
-        self.K_sq = self.K_weights ** 2
+        self.K_sq = self.K_weights**2
 
     def effective_alpha(self, height, width):
         """Per-scale significance threshold, in units of coefficient noise.
@@ -114,32 +115,42 @@ class MatrixFreeSparseRBFPeakFinder:
 
     def _build_kernel_bank(self):
         k_grid = jnp.arange(-self.max_k_rad, self.max_k_rad + 1)
-        yy, xx = jnp.meshgrid(k_grid, k_grid, indexing='ij')
+        yy, xx = jnp.meshgrid(k_grid, k_grid, indexing="ij")
 
         def build_one(s):
             sig_sq2 = s * jnp.sqrt(2.0) + 1e-6
-            erf_y = jax.scipy.special.erf((yy + 0.5) / sig_sq2) - jax.scipy.special.erf((yy - 0.5) / sig_sq2)
-            erf_x = jax.scipy.special.erf((xx + 0.5) / sig_sq2) - jax.scipy.special.erf((xx - 0.5) / sig_sq2)
+            erf_y = jax.scipy.special.erf((yy + 0.5) / sig_sq2) - jax.scipy.special.erf(
+                (yy - 0.5) / sig_sq2
+            )
+            erf_x = jax.scipy.special.erf((xx + 0.5) / sig_sq2) - jax.scipy.special.erf(
+                (xx - 0.5) / sig_sq2
+            )
             k_2d = (jnp.pi / 2.0) * (s**2) * erf_y * erf_x
             return k_2d
 
         kernels_2d = vmap(build_one)(self.sigmas)
         sq_norms = jnp.sum(kernels_2d**2, axis=(1, 2))
         return kernels_2d[:, None, :, :], sq_norms
-        
+
     @staticmethod
     def _forward_op(c, weights):
-        weights_fwd = weights.transpose(1, 0, 2, 3) 
+        weights_fwd = weights.transpose(1, 0, 2, 3)
         return lax.conv_general_dilated(
-            c, weights_fwd, window_strides=(1, 1), padding='SAME',
-            dimension_numbers=('NCHW', 'OIHW', 'NCHW')
+            c,
+            weights_fwd,
+            window_strides=(1, 1),
+            padding="SAME",
+            dimension_numbers=("NCHW", "OIHW", "NCHW"),
         )
 
     @staticmethod
     def _adjoint_op(u, weights):
         return lax.conv_general_dilated(
-            u, weights, window_strides=(1, 1), padding='SAME',
-            dimension_numbers=('NCHW', 'OIHW', 'NCHW')
+            u,
+            weights,
+            window_strides=(1, 1),
+            padding="SAME",
+            dimension_numbers=("NCHW", "OIHW", "NCHW"),
         )
 
     @partial(jit, static_argnames=["self", "max_iter"])
@@ -147,7 +158,7 @@ class MatrixFreeSparseRBFPeakFinder:
         H, W = y_img.shape
         y = y_img[None, None, :, :]
         bg = bg_img[None, None, :, :]
-        
+
         K = self.num_sigmas
         c_init = jnp.zeros((1, K, H, W))
         q_init = jnp.zeros((1, K, H, W))
@@ -216,7 +227,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 nll = 0.5 * jnp.sum(res**2)
                 grad = self._adjoint_op(res, self.K_weights)
                 W_diag = jnp.ones_like(u)
-            else: 
+            else:
                 u_safe = jnp.maximum(u, 1e-6)
                 nll = jnp.sum(u_safe - y * jnp.log(u_safe))
                 res_1d = 1.0 - (y / u_safe)
@@ -269,7 +280,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 return j_test + jnp.sum(lam * c_test)
 
             def bt_cond(bt_state):
-                bt_i, step_size, _, _, j_test, j_curr = bt_state
+                bt_i, _step_size, _, _, j_test, j_curr = bt_state
                 is_valid = jnp.isfinite(j_test)
                 return (bt_i < 12) & ((j_test > j_curr) | ~is_valid)
 
@@ -315,8 +326,8 @@ class MatrixFreeSparseRBFPeakFinder:
 
     @partial(jit, static_argnames=["self", "border"])
     def _extract_peaks(self, c_tensor, border=0):
-        c_tot = jnp.sum(c_tensor, axis=0) # [H, W]
-        
+        c_tot = jnp.sum(c_tensor, axis=0)  # [H, W]
+
         # Smooth the discrete L1 coefficients to recover true continuous center
         # of mass.  L1 splinters a peak across adjacent pixels, so this only
         # needs to span that one-pixel scale: a wider kernel throws away exactly
@@ -327,13 +338,19 @@ class MatrixFreeSparseRBFPeakFinder:
         sig_sq2 = smooth_sigma * jnp.sqrt(2.0) + 1e-6
         k_half = max(1, round(2.0 * smooth_sigma))
         k_grid = jnp.arange(-k_half, k_half + 1)
-        k_1d = jax.scipy.special.erf((k_grid + 0.5) / sig_sq2) - jax.scipy.special.erf((k_grid - 0.5) / sig_sq2)
-        
+        k_1d = jax.scipy.special.erf((k_grid + 0.5) / sig_sq2) - jax.scipy.special.erf(
+            (k_grid - 0.5) / sig_sq2
+        )
+
         c_smooth_temp = jax.scipy.signal.correlate2d(c_tot, k_1d[:, None], mode="same")
-        c_smooth = jax.scipy.signal.correlate2d(c_smooth_temp, k_1d[None, :], mode="same")
-        
+        c_smooth = jax.scipy.signal.correlate2d(
+            c_smooth_temp, k_1d[None, :], mode="same"
+        )
+
         window = (3, 3)
-        c_max = lax.reduce_window(c_smooth, -jnp.inf, jax.lax.max, window, (1, 1), 'SAME')
+        c_max = lax.reduce_window(
+            c_smooth, -jnp.inf, jax.lax.max, window, (1, 1), "SAME"
+        )
         is_max = (c_smooth == c_max) & (c_smooth > 1e-5)
 
         # Discard maxima in the replicated border before ranking, not after.
@@ -351,21 +368,23 @@ class MatrixFreeSparseRBFPeakFinder:
         MAX_PEAKS = 100
         top_indices = jnp.argsort(c_flat)[::-1][:MAX_PEAKS]
         valid_mask = c_flat[top_indices] > 1e-5
-        
+
         def process_peak(idx):
             r = idx // c_smooth.shape[1]
             c = idx % c_smooth.shape[1]
-            
+
             r_safe = jnp.clip(r, 1, c_smooth.shape[0] - 2)
             c_safe = jnp.clip(c, 1, c_smooth.shape[1] - 2)
 
             # Extract 3x3 patch to integrate splintered coefficients
-            c_patch = lax.dynamic_slice(c_tensor, (0, r_safe - 1, c_safe - 1), (c_tensor.shape[0], 3, 3))
+            c_patch = lax.dynamic_slice(
+                c_tensor, (0, r_safe - 1, c_safe - 1), (c_tensor.shape[0], 3, 3)
+            )
             c_channels = jnp.sum(c_patch, axis=(1, 2))
 
             # Exact Flux & Variance Preservation
             # Flux of basis k is A_k * sigma_k^2
-            flux_k = c_channels * (self.sigmas ** 2)
+            flux_k = c_channels * (self.sigmas**2)
             total_flux_scaled = jnp.sum(flux_k) + 1e-9
 
             # Variance of mixture is sum(Flux_k * sigma_k^2) / sum(Flux_k).
@@ -375,7 +394,7 @@ class MatrixFreeSparseRBFPeakFinder:
             # validity mask, but an infinity multiplied by a zero mask is a NaN,
             # which then contaminates anything that consumes the whole array.
             sigma_sq_eff = jnp.maximum(
-                jnp.sum(flux_k * (self.sigmas ** 2)) / total_flux_scaled,
+                jnp.sum(flux_k * (self.sigmas**2)) / total_flux_scaled,
                 float(self.min_sigma) ** 2,
             )
             sigma_eff = jnp.sqrt(sigma_sq_eff)
@@ -472,12 +491,8 @@ class MatrixFreeSparseRBFPeakFinder:
         def render(u):
             amp, r, c, sig = physical(u)
             s2 = sig * jnp.sqrt(2.0) + 1e-6
-            r0 = jnp.clip(
-                jnp.round(r).astype(jnp.int32) - self.max_k_rad, 0, H - P
-            )
-            c0 = jnp.clip(
-                jnp.round(c).astype(jnp.int32) - self.max_k_rad, 0, W - P
-            )
+            r0 = jnp.clip(jnp.round(r).astype(jnp.int32) - self.max_k_rad, 0, H - P)
+            c0 = jnp.clip(jnp.round(c).astype(jnp.int32) - self.max_k_rad, 0, W - P)
             rr = r0[:, None].astype(jnp.float32) + off[None, :]
             cc = c0[:, None].astype(jnp.float32) + off[None, :]
 
@@ -513,9 +528,7 @@ class MatrixFreeSparseRBFPeakFinder:
             m = 0.9 * m + 0.1 * g
             v = 0.999 * v + 0.001 * g**2
             t = t + 1.0
-            upd = (m / (1.0 - 0.9**t)) / (
-                jnp.sqrt(v / (1.0 - 0.999**t)) + 1e-8
-            )
+            upd = (m / (1.0 - 0.9**t)) / (jnp.sqrt(v / (1.0 - 0.999**t)) + 1e-8)
             return (u - 0.05 * upd, m, v, t), None
 
         (u_fin, _, _, _), _ = lax.scan(
@@ -531,8 +544,10 @@ class MatrixFreeSparseRBFPeakFinder:
         # A refined peak that ran away from its own bounding box is not a
         # refinement of that peak any more, so keep the pre-fit values there.
         moved = jnp.sqrt((r - peaks[:, 1]) ** 2 + (c - peaks[:, 2]) ** 2)
-        keep = active & (moved < float(self.max_k_rad)) & jnp.all(
-            jnp.isfinite(refined), axis=1
+        keep = (
+            active
+            & (moved < float(self.max_k_rad))
+            & jnp.all(jnp.isfinite(refined), axis=1)
         )
         return jnp.where(keep[:, None], refined, peaks)
 
@@ -555,8 +570,9 @@ class MatrixFreeSparseRBFPeakFinder:
             pieces = []
             for start in range(0, B, bg_chunk):
                 piece = compute_bg_batch(
-                    jnp.asarray(images_batch[start : start + bg_chunk],
-                                dtype=jnp.float32),
+                    jnp.asarray(
+                        images_batch[start : start + bg_chunk], dtype=jnp.float32
+                    ),
                     filter_size,
                 )
                 piece.block_until_ready()
@@ -576,12 +592,18 @@ class MatrixFreeSparseRBFPeakFinder:
         pad_y = PAD // 2
         pad_x = PAD // 2
 
-        images_padded = jnp.pad(images_batch, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)), mode="edge")
-        bg_padded = jnp.pad(bg_map, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+        images_padded = jnp.pad(
+            images_batch, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)), mode="edge"
+        )
+        bg_padded = jnp.pad(
+            bg_map, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)), mode="edge"
+        )
 
         results = []
         rejected_counts = []
-        c_tensors = jax.jit(jax.vmap(self._solve_ssn_cg_global))(images_padded, bg_padded)
+        c_tensors = jax.jit(jax.vmap(self._solve_ssn_cg_global))(
+            images_padded, bg_padded
+        )
 
         MARGIN = max(3, self.max_k_rad)
 
@@ -606,8 +628,10 @@ class MatrixFreeSparseRBFPeakFinder:
             valid_peaks[:, 2] -= pad_x
 
             keep = (
-                (valid_peaks[:, 1] >= MARGIN) & (valid_peaks[:, 1] < H - MARGIN) &
-                (valid_peaks[:, 2] >= MARGIN) & (valid_peaks[:, 2] < W - MARGIN)
+                (valid_peaks[:, 1] >= MARGIN)
+                & (valid_peaks[:, 1] < H - MARGIN)
+                & (valid_peaks[:, 2] >= MARGIN)
+                & (valid_peaks[:, 2] < W - MARGIN)
             )
 
             # An atom whose width has run to the edge of the bank is the solver
@@ -656,8 +680,12 @@ class MatrixFreeSparseRBFPeakFinder:
         def render_peak(p):
             total_I, r, c, sigma = p[0], p[1], p[2], p[3]
             sig_sq2 = sigma * jnp.sqrt(2.0) + 1e-6
-            erf_y = jax.scipy.special.erf((x_grid[0] - r + 0.5) / sig_sq2) - jax.scipy.special.erf((x_grid[0] - r - 0.5) / sig_sq2)
-            erf_x = jax.scipy.special.erf((x_grid[1] - c + 0.5) / sig_sq2) - jax.scipy.special.erf((x_grid[1] - c - 0.5) / sig_sq2)
+            erf_y = jax.scipy.special.erf(
+                (x_grid[0] - r + 0.5) / sig_sq2
+            ) - jax.scipy.special.erf((x_grid[0] - r - 0.5) / sig_sq2)
+            erf_x = jax.scipy.special.erf(
+                (x_grid[1] - c + 0.5) / sig_sq2
+            ) - jax.scipy.special.erf((x_grid[1] - c - 0.5) / sig_sq2)
             return total_I * (jnp.pi / 2.0) * (sigma**2) * erf_y * erf_x * (total_I > 0)
 
         def render_image(peaks_img):
@@ -711,7 +739,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 term = jax.scipy.special.xlogy(target_raw, target_raw / recon_total) - (
                     target_raw - recon_total
                 )
-                dev = 2 * jnp.sum(term)  
+                dev = 2 * jnp.sum(term)
             else:
                 diff = recon_total - target_raw  # [photons/Pixel]
                 nll = 0.5 * jnp.sum(diff**2)  # [photons^2 / Pixel^2]

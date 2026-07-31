@@ -276,24 +276,38 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
         return final_image  # [photons/Pixel]
 
     @staticmethod
-    def _joint_patch_objective(flat_params_unconstrained, patch_stat, patch_bg, x_grid, H, W, min_s, max_s, loss_code):
+    def _joint_patch_objective(
+        flat_params_unconstrained,
+        patch_stat,
+        patch_bg,
+        x_grid,
+        H,
+        W,
+        min_s,
+        max_s,
+        loss_code,
+    ):
         """
         Evaluates the joint fit of all K candidates on the local patch.
         """
         # 1. Reshape and map back to physical bounds (positive amp, constrained coords)
-        params_phys = SparseRBFPeakFinder._to_physical(flat_params_unconstrained, H, W, min_s, max_s)
-        
+        params_phys = SparseRBFPeakFinder._to_physical(
+            flat_params_unconstrained, H, W, min_s, max_s
+        )
+
         # 2. Render the combined footprint of all K candidates
-        recon = SparseRBFPeakFinder._predict_batch_physical(params_phys, x_grid) 
+        recon = SparseRBFPeakFinder._predict_batch_physical(params_phys, x_grid)
         recon_total = jnp.maximum(recon + patch_bg, 1e-9)
-        
+
         # 3. Compute target loss (Poisson NLL or Gaussian MSE)
         if loss_code == 1:
             # Exact Poisson NLL
-            loss = jnp.sum(recon_total - jax.scipy.special.xlogy(patch_stat, recon_total))
+            loss = jnp.sum(
+                recon_total - jax.scipy.special.xlogy(patch_stat, recon_total)
+            )
         else:
-            loss = 0.5 * jnp.sum((recon_total - patch_stat)**2)
-            
+            loss = 0.5 * jnp.sum((recon_total - patch_stat) ** 2)
+
         return loss
 
     @partial(
@@ -485,45 +499,51 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
             W=W,
             min_s=self.min_sigma,
             max_s=self.max_sigma,
-            loss_code=loss_code
+            loss_code=loss_code,
         )
 
         # Use JAX's reverse-mode autodiff to get the exact gradients
         grad_fn = jax.value_and_grad(joint_loss_fn)
 
         # Convert physical starting guesses to unconstrained space for unconstrained optimization
-        unconstrained_init = self._to_unconstrained(final_params, H, W, self.min_sigma, self.max_sigma)
+        unconstrained_init = self._to_unconstrained(
+            final_params, H, W, self.min_sigma, self.max_sigma
+        )
 
         # 3. Fixed-iteration Gradient Descent using lax.scan
         # This avoids XLA graph unrolling hangs while pushing overlapping peaks apart
         def refinement_step(state, _):
             current_params, current_lr = state
             loss, grads = grad_fn(current_params)
-            
+
             # Simple Gradient Descent (or upgrade to Adam by tracking momentum in the state)
             # Only update parameters for peaks that were actually active in the greedy phase
-            grad_mask = jnp.repeat(active_mask, 4) 
+            grad_mask = jnp.repeat(active_mask, 4)
             masked_grads = grads * grad_mask
-            
+
             next_params = current_params - current_lr * masked_grads
-            
+
             return (next_params, current_lr * 0.95), loss
 
         # Run for a fixed number of steps (e.g., 25)
         refinement_steps = 25
-        initial_lr = 0.1 
+        initial_lr = 0.1
         (refined_unconstrained, _), loss_history = lax.scan(
-            refinement_step, 
-            (unconstrained_init, initial_lr), 
-            None, 
-            length=refinement_steps
+            refinement_step,
+            (unconstrained_init, initial_lr),
+            None,
+            length=refinement_steps,
         )
 
         # 4. Map back to physical parameters
-        refined_params_phys = self._to_physical(refined_unconstrained, H, W, self.min_sigma, self.max_sigma)
+        refined_params_phys = self._to_physical(
+            refined_unconstrained, H, W, self.min_sigma, self.max_sigma
+        )
 
         # Enforce the mask again so dead peaks stay dead
-        final_params = jnp.where(active_mask[:, None], refined_params_phys, final_params)
+        final_params = jnp.where(
+            active_mask[:, None], refined_params_phys, final_params
+        )
 
         if do_merge:
             c, r, col, sigma = final_params.T

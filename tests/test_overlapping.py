@@ -14,6 +14,7 @@ docs/matrix_free_theory.md Theorem 1.
 import numpy as np
 import scipy.special
 
+
 def generate_erf_peak(y_coords, x_coords, r, c, sig, amp):
     """
     Helper function to generate physically exact subpixel peaks
@@ -28,6 +29,7 @@ def generate_erf_peak(y_coords, x_coords, r, c, sig, amp):
     )
     return amp * (np.pi / 2.0) * (sig**2) * erf_y * erf_x
 
+
 def test_overlapping_ghost_center_shift_failure():
     """
     EXPOSES: Ghost Center Shifts / Mutual Energy Swapping.
@@ -35,9 +37,9 @@ def test_overlapping_ghost_center_shift_failure():
     A naive greedy algorithm will detect a single composite "ghost" peak in the middle,
     leaving artificial residuals.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 100, 100
     bg_level = 10.0
@@ -49,7 +51,7 @@ def test_overlapping_ghost_center_shift_failure():
     # Inject two true peaks physically overlapping to form a single blended maximum
     true_r = 50.0
     center_1, center_2 = 42.0, 58.0
-    
+
     # Large sigmas (6.0) ensure the spatial domains overlap heavily
     image += generate_erf_peak(y_coords, x_coords, true_r, center_1, sig=6.0, amp=50.0)
     image += generate_erf_peak(y_coords, x_coords, true_r, center_2, sig=6.0, amp=50.0)
@@ -73,14 +75,20 @@ def test_overlapping_ghost_center_shift_failure():
 
     # --- ASSERTIONS ---
     # These define the EXPECTED correct behavior and will expose the greedy solver's failure mode.
-    
+
     # 1. It should find at least 2 distinct peaks
-    assert len(extracted_c) >= 2, "Algorithm merged overlapping peaks into a single detection."
-    
+    assert len(extracted_c) >= 2, (
+        "Algorithm merged overlapping peaks into a single detection."
+    )
+
     # 2. It should accurately isolate the two true centers
-    assert any(abs(c - center_1) < 2.0 for c in extracted_c), "Failed to isolate the Left peak."
-    assert any(abs(c - center_2) < 2.0 for c in extracted_c), "Failed to isolate the Right peak."
-    
+    assert any(abs(c - center_1) < 2.0 for c in extracted_c), (
+        "Failed to isolate the Left peak."
+    )
+    assert any(abs(c - center_2) < 2.0 for c in extracted_c), (
+        "Failed to isolate the Right peak."
+    )
+
     # 3. It MUST NOT hallucinate a ghost peak in the exact middle of the composite blob
     ghost_zone = [c for c in extracted_c if 48.0 < c < 52.0]
     assert not ghost_zone, (
@@ -91,13 +99,13 @@ def test_overlapping_ghost_center_shift_failure():
 def test_oversparsification_missing_weak_peak_failure():
     """
     EXPOSES: Over-Sparsification / Missing Weak Overlapping Peaks.
-    A very strong peak overlaps a weak peak. The weak peak's intensity 
-    is often over-subtracted or shifted below the detection threshold 
+    A very strong peak overlaps a weak peak. The weak peak's intensity
+    is often over-subtracted or shifted below the detection threshold
     when the dominant peak is greedily evaluated first.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 100, 100
     bg_level = 10.0
@@ -108,7 +116,7 @@ def test_oversparsification_missing_weak_peak_failure():
 
     true_r = 50.0
     strong_c = 30.0
-    weak_c = 38.0 
+    weak_c = 38.0
 
     # 1. Inject strong primary peak
     image += generate_erf_peak(y_coords, x_coords, true_r, strong_c, sig=4.0, amp=200.0)
@@ -119,12 +127,12 @@ def test_oversparsification_missing_weak_peak_failure():
     image_batch = image[np.newaxis, ...]
 
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=3.0, 
-        gamma=0.5, 
-        min_sigma=1.0, 
-        max_sigma=6.0, 
-        loss="poisson", 
-        show_steps=False
+        alpha=3.0,
+        gamma=0.5,
+        min_sigma=1.0,
+        max_sigma=6.0,
+        loss="poisson",
+        show_steps=False,
     )
 
     results = finder.find_peaks_batch(image_batch)
@@ -137,8 +145,8 @@ def test_oversparsification_missing_weak_peak_failure():
     weak_peak_detected = any(abs(c - weak_c) < 1.5 for c in extracted_c)
 
     assert strong_peak_detected, "Algorithm failed to find the primary strong peak."
-    
-    # This will fail until the over-sparsification bug is fixed (e.g. by implementing 
+
+    # This will fail until the over-sparsification bug is fixed (e.g. by implementing
     # Orthogonal Matching Pursuit (OMP) or Joint Optimization)
     assert weak_peak_detected, (
         "Failure Mode Exposed: Algorithm over-subtracted the strong peak and completely "

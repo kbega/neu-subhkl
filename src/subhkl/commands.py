@@ -740,7 +740,7 @@ def run_finder(
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
-    sparse_rbf_loss: str = "gaussian",
+    sparse_rbf_loss: str = "poisson",
     sparse_rbf_legacy: bool = False,
     sparse_rbf_auto_tune_alpha: bool = False,
     sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",

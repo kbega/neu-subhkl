@@ -126,7 +126,7 @@ def prepare_harvest_tasks(
                 # legacy branch above keeps 2.0 so that it still reproduces what
                 # it always did.
                 gamma=harvest_peaks_kwargs.get("gamma", 0.5),
-                loss=harvest_peaks_kwargs.get("loss", "gaussian"),
+                loss=harvest_peaks_kwargs.get("loss", "poisson"),
                 min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
                 max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
                 show_steps=harvest_peaks_kwargs.get("show_steps", False),

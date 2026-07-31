@@ -252,9 +252,9 @@ def test_integrate_peaks_rbf_ssn_orchestrator():
 
 
 def test_peak_finder_multiscale_subpixel_recovery():
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 60, 60
 
@@ -314,9 +314,9 @@ def test_gaussian_loss_path_finds_peaks():
     only thing keeping the debiasing phase alive.  What still needs covering is
     that ``loss="gaussian"`` runs and localises, which is what this asserts.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 60, 60
     np.random.seed(101)
@@ -346,9 +346,9 @@ def test_gaussian_loss_path_finds_peaks():
 
 
 def test_poisson_overlapping_string():
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 40, 80
     np.random.seed(123)
@@ -404,9 +404,9 @@ def test_poisson_overlapping_string():
 
 
 def test_real_neutron_structured_background():
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 100, 100
     np.random.seed(42)
@@ -504,10 +504,10 @@ def test_large_sensor_basic_recovery_finder():
     This isolates whether the GPU batching, memory, and scaling work on large arrays
     without the confounding variable of morphological halo errors.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
     import scipy.special
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 512, 512
     np.random.seed(42)
@@ -564,10 +564,10 @@ def test_large_sensor_artifact_suppression():
     diffuse scattering background (halo) to ensure the solver does NOT
     hallucinate a grid of false peaks to fit the unmodeled background curvature.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
     import scipy.special
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 512, 512
     np.random.seed(42)
@@ -854,10 +854,10 @@ def test_poisson_local_variance_suppression():
     The spatially varying 1/U_k variance map MUST suppress the peak on the bright halo
     while preserving the peak on the dark background.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
     import scipy.special
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 100, 100
     np.random.seed(42)
@@ -960,10 +960,10 @@ def test_poisson_subpatch_variance_suppression():
     and falsely detect Peak B. The new Poisson model evaluates local variance
     as sqrt(510) and correctly suppresses it.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
     import scipy.special
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 128, 128
     np.random.seed(42)
@@ -1068,9 +1068,9 @@ def test_boundary_sigma_rejection_fires_on_unmodelled_background():
     This asserts the filter both fires here and does not eat the genuine peak
     placed well away from the halo.  See docs/matrix_free_theory.md section 7b.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     H, W = 100, 100
     np.random.seed(7)
@@ -1088,14 +1088,14 @@ def test_boundary_sigma_rejection_fires_on_unmodelled_background():
     image_batch = image[np.newaxis, ...]
 
     max_sigma = 5.0
-    kwargs = dict(
-        alpha=8.0,
-        gamma=0.5,
-        min_sigma=1.0,
-        max_sigma=max_sigma,
-        loss="poisson",
-        show_steps=False,
-    )
+    kwargs = {
+        "alpha": 8.0,
+        "gamma": 0.5,
+        "min_sigma": 1.0,
+        "max_sigma": max_sigma,
+        "loss": "poisson",
+        "show_steps": False,
+    }
 
     # With the filter off, the halo residual is reported, pinned at the bank edge.
     unfiltered = MatrixFreeSparseRBFPeakFinder(reject_boundary_sigma=False, **kwargs)
@@ -1118,9 +1118,9 @@ def test_boundary_sigma_rejection_fires_on_unmodelled_background():
     )
 
     # The real peak must survive: the filter must reject background, not signal.
-    assert any(
-        np.sqrt((p[1] - 50.0) ** 2 + (p[2] - 20.0) ** 2) < 2.0 for p in kept
-    ), "the boundary-sigma filter removed the genuine peak"
+    assert any(np.sqrt((p[1] - 50.0) ** 2 + (p[2] - 20.0) ** 2) < 2.0 for p in kept), (
+        "the boundary-sigma filter removed the genuine peak"
+    )
 
 
 def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
@@ -1137,9 +1137,9 @@ def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
     since that is what sets the merge/split balance.  Using the floor alone
     flattens it and over-merges, losing weak peaks in the tails of strong ones.
     """
-    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
-
     import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     gamma = 0.5
     finder = MatrixFreeSparseRBFPeakFinder(
@@ -1191,6 +1191,6 @@ def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
 
     peaks = finder.find_peaks_batch(image[np.newaxis, ...])[0]
     assert len(peaks) >= 1
-    assert any(
-        np.sqrt((p[1] - 30.0) ** 2 + (p[2] - 30.0) ** 2) < 2.0 for p in peaks
-    ), "alpha=None failed to find an unambiguous peak"
+    assert any(np.sqrt((p[1] - 30.0) ** 2 + (p[2] - 30.0) ** 2) < 2.0 for p in peaks), (
+        "alpha=None failed to find an unambiguous peak"
+    )
