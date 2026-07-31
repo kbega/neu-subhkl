@@ -38,7 +38,11 @@ jobs:
         os:
           - ubuntu-latest
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # A single test, test_1_to_n_goniometer_mapping, is 80-90% of this job: it
+    # runs the indexer with refine_goniometer=True, so a global search dominates.
+    # It measured 28.6 min on main and 46.1 min here, against a whole-job budget
+    # of 35 and 60+ respectively, which left no room for hosted-runner variance.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -50,4 +54,4 @@ jobs:
       - name: Install dependencies
         run: uv sync
       - name: Run tests
-        run: uv run pytest -v -m "not slow and not integration"
+        run: uv run pytest -v -m "not slow and not integration" --durations=25
