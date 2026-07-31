@@ -16,10 +16,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-fitted against the same Poisson objective, so recovered positions are
   sub-pixel rather than sub-grid. Reaches 0.03–0.17 px on an isolated synthetic
   peak. Controlled by `refine_positions`, default on.
-- Rejection of atoms whose fitted width reaches the edge of the sigma bank. Such
-  an atom is the solver asking for a wider basis than it was given, which is
-  what unmodelled smooth background looks like rather than a reflection.
-  Controlled by `reject_boundary_sigma` and `boundary_sigma_frac`, default on.
+- Optional rejection of atoms whose fitted width reaches the edge of the sigma
+  bank, via `reject_boundary_sigma` (default **off**) and `boundary_sigma_frac`.
+  Such an atom is the solver asking for a wider basis than it was given, which
+  can mean unmodelled smooth background — or simply that `max_sigma` is too
+  small, in which case real peaks saturate the bank too. On a real MANDI scan,
+  where peak widths are ~34 px against a `max_sigma` of 5, it removed 87% of
+  genuine detections, so it is a diagnostic to enable once the bank is known to
+  be wide enough rather than a default.
 - The count of atoms rejected that way is recorded on `n_boundary_rejected` and
   reported under `show_steps`, rather than being discarded silently.
 - Multiplicity correction to the significance threshold. Solving globally tests
@@ -167,5 +171,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not yet wired to anything.
 - The morphological background estimator under-fits smooth extended structure at
   its centre — by about 21% on a diffuse halo — leaving a broad positive
-  residual. The boundary-sigma rejection above removes the resulting artefacts
-  from the peak list, but does not fix the estimate itself.
+  residual that is reported as a broad peak.
+- On a real MANDI scan (160 frames, 256×256) the finder returns 466 peaks
+  against the greedy finder's 675, with comparable widths. Whether that shortfall
+  matters is a question for the benchmark suite, not the unit tests: indexing
+  yield and angular residual are the measures that decide it, and this branch has
+  not been run through them.
+- The unit tests do not resemble the data. They build float32 images, densely
+  populated, with backgrounds of 10–50 counts; a real frame is int64, 37% zeros,
+  with a mean of 0.64 counts. An integer-convolution failure that killed every
+  real run was invisible to all 20 of them.

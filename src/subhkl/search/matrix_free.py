@@ -57,7 +57,7 @@ class MatrixFreeSparseRBFPeakFinder:
         ref_sigma: float = 1.0,
         chunk_size: int = 64,
         refine_positions: bool = True,
-        reject_boundary_sigma: bool = True,
+        reject_boundary_sigma: bool = False,
         boundary_sigma_frac: float = 0.98,
         **kwargs
     ):
@@ -611,9 +611,14 @@ class MatrixFreeSparseRBFPeakFinder:
             )
 
             # An atom whose width has run to the edge of the bank is the solver
-            # asking for a wider basis than it was given, and that is what
-            # unmodelled smooth background looks like: a real peak's width is set
-            # by the point-spread function and lands inside the bank.  The case
+            # asking for a wider basis than it was given.  That can mean
+            # unmodelled smooth background -- or simply that max_sigma is too
+            # small for the data, in which case every real peak saturates the
+            # bank too and this discards them.  On a real MANDI scan, where the
+            # peaks have a median width of ~34 px against a max_sigma of 5, it
+            # removed 87% of genuine detections (466 peaks down to 60), so it is
+            # off by default and is a diagnostic to reach for once the bank is
+            # known to be wide enough.  The case
             # that motivated this is a diffuse halo whose background estimate
             # falls ~20% short at its centre, leaving a broad positive residual
             # that is then reported as a reflection sitting on the halo.  On real
