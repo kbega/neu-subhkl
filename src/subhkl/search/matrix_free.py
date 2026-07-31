@@ -55,6 +55,7 @@ class MatrixFreeSparseRBFPeakFinder:
         loss: str = "poisson",
         show_steps: bool = False,
         ref_sigma: float = 1.0,
+        chunk_size: int = 64,
         refine_positions: bool = True,
         reject_boundary_sigma: bool = True,
         boundary_sigma_frac: float = 0.98,
@@ -68,6 +69,7 @@ class MatrixFreeSparseRBFPeakFinder:
         self.loss = loss
         self.show_steps = show_steps
         self.ref_sigma = ref_sigma
+        self.chunk_size = chunk_size
         self.refine_positions = refine_positions
         self.reject_boundary_sigma = reject_boundary_sigma
         self.boundary_sigma_frac = boundary_sigma_frac
@@ -535,13 +537,31 @@ class MatrixFreeSparseRBFPeakFinder:
         return jnp.where(keep[:, None], refined, peaks)
 
     def find_peaks_batch(self, images_batch):
+        # Detector frames arrive as integer counts.  Everything below is a
+        # convolution, and cuDNN will not lower an integer convolution, so the
+        # cast is required rather than cosmetic: without it the background
+        # estimate fails outright on real data.
+        images_batch = np.asarray(images_batch, dtype=np.float32)
         B, H, W = images_batch.shape
-        
+
         filter_size = max(15, int(self.max_sigma * 5))
-        bg_map = np.ones_like(images_batch) * 10.0
+        bg_map = np.full_like(images_batch, 10.0)
         try:
             from subhkl.search.sparse_rbf import compute_bg_batch
-            bg_map = np.array(compute_bg_batch(jnp.array(images_batch), filter_size))
+
+            # Chunked for the same reason the greedy finder chunks it: a full
+            # detector scan is far too much to hold on the device at once.
+            bg_chunk = min(self.chunk_size, max(1, B // 4))
+            pieces = []
+            for start in range(0, B, bg_chunk):
+                piece = compute_bg_batch(
+                    jnp.asarray(images_batch[start : start + bg_chunk],
+                                dtype=jnp.float32),
+                    filter_size,
+                )
+                piece.block_until_ready()
+                pieces.append(np.asarray(piece, dtype=np.float32))
+            bg_map = np.concatenate(pieces, axis=0)
             if bg_map.shape != images_batch.shape:
                 bg_map_fixed = np.zeros_like(images_batch)
                 mh, mw = min(H, bg_map.shape[1]), min(W, bg_map.shape[2])
