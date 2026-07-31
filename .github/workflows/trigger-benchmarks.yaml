@@ -26,10 +26,19 @@ jobs:
       - name: Require triage rights on whoever asked
         if: github.event_name == 'pull_request_target'
         env:
-          GH_TOKEN: ${{ secrets.BENCHMARK_DISPATCH_TOKEN }}
+          # The built-in token is already scoped to this repository, and keeps
+          # Metadata: read even under `permissions: {}`, which is all this
+          # endpoint asks for.  BENCHMARK_DISPATCH_TOKEN is scoped to the
+          # benchmark repository instead, so it cannot read anything here and
+          # this check fails closed with a 403 on every pull request.
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # `|| level=none` belongs outside the substitution: on an error `gh
+          # api` writes the response body to stdout, so folding the fallback
+          # inside appends to that body rather than replacing it, and the
+          # resulting string matches no case arm.
           level=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" \
-                    --jq '.permission' 2>/dev/null || echo none)
+                    --jq '.permission' 2>/dev/null) || level=none
           echo "${{ github.actor }} has '${level}' on ${{ github.repository }}"
           case "$level" in
             admin|maintain|write|triage) ;;
