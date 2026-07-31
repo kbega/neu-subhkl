@@ -304,75 +304,45 @@ def test_peak_finder_multiscale_subpixel_recovery():
     assert sharp_peak[3] < 2.0
 
 
-def test_poisson_vs_gaussian_sparse_flux():
+def test_gaussian_loss_path_finds_peaks():
+    """The Gaussian likelihood path must still detect, since it is the CLI default.
+
+    This replaces a test that compared *recovered flux* between the two losses.
+    The finder no longer promises amplitudes -- the pipeline reduces its output
+    to (row, column) and intensity is measured later by the integrator -- so an
+    assertion on flux was testing a quantity with no consumer, and it was the
+    only thing keeping the debiasing phase alive.  What still needs covering is
+    that ``loss="gaussian"`` runs and localises, which is what this asserts.
+    """
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     import numpy as np
 
-    H, W = 40, 40
+    H, W = 60, 60
     np.random.seed(101)
 
-    gt_c, gt_r = 20.5, 20.5
-    gt_sig = 2.0
-    gt_amp = 5.0
-    gt_flux = gt_amp * 2 * np.pi * gt_sig**2
-
+    truth = [(20.0, 20.0, 2.0, 400.0), (40.0, 42.0, 3.0, 500.0)]
     y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    image = np.full((H, W), 30.0, dtype=np.float32)
+    for r, c, sig, amp in truth:
+        image += generate_erf_peak(y_coords, x_coords, r, c, sig, amp)
+    image = np.random.poisson(image).astype(np.float32)
 
-    true_rate = 0.1 + generate_erf_peak(y_coords, x_coords, gt_r, gt_c, gt_sig, gt_amp)
-    image = np.random.poisson(true_rate).astype(np.float32)
-
-    image_batch = image[np.newaxis, ...]
-
-    # This is the one case that asks the finder for a flux rather than a
-    # position, so it opts into debiasing: without it L1 shrinkage leaves ~5% of
-    # the true flux and swamps the difference between the two losses.  The
-    # pipeline itself never reads these amplitudes, which is why debiasing is
-    # not the default.
-    finder_l2 = MatrixFreeSparseRBFPeakFinder(
-        debias=True,
-        gamma=0.5,
-        alpha=1.0,
-        min_sigma=1.0,
-        max_sigma=4.0,
-        loss="gaussian",
-        show_steps=False,
-    )
-    finder_pois = MatrixFreeSparseRBFPeakFinder(
-        debias=True,
-        gamma=0.5,
-        alpha=1.0,
-        min_sigma=1.0,
-        max_sigma=4.0,
-        loss="poisson",
-        show_steps=False,
-    )
-
-    peaks_l2 = finder_l2.find_peaks_batch(image_batch)[0]
-    peaks_pois = finder_pois.find_peaks_batch(image_batch)[0]
-
-    def get_target_peak(peaks):
-        if len(peaks) == 0:
-            return None
-        dists = np.sqrt((peaks[:, 1] - gt_r) ** 2 + (peaks[:, 2] - gt_c) ** 2)
-        idx = np.argmin(dists)
-        if dists[idx] > 3.0:
-            return None
-        return peaks[idx]
-
-    p_l2 = get_target_peak(peaks_l2)
-    p_pois = get_target_peak(peaks_pois)
-
-    assert p_pois is not None
-
-    if p_l2 is not None:
-        flux_l2 = p_l2[0] * 2 * np.pi * p_l2[3] ** 2
-        flux_pois = p_pois[0] * 2 * np.pi * p_pois[3] ** 2
-
-        error_l2 = abs(flux_l2 - gt_flux)
-        error_pois = abs(flux_pois - gt_flux)
-
-        assert error_pois < error_l2
+    for loss in ("gaussian", "poisson"):
+        finder = MatrixFreeSparseRBFPeakFinder(
+            gamma=0.5,
+            min_sigma=1.0,
+            max_sigma=5.0,
+            loss=loss,
+            show_steps=False,
+        )
+        peaks = finder.find_peaks_batch(image[np.newaxis, ...])[0]
+        assert len(peaks) >= 2, f"{loss} loss found {len(peaks)} peaks, expected 2"
+        for r, c, _sig, _amp in truth:
+            d = np.sqrt((peaks[:, 1] - r) ** 2 + (peaks[:, 2] - c) ** 2)
+            assert d.min() < 1.0, (
+                f"{loss} loss missed the peak at ({r}, {c}); nearest was {d.min():.2f} px"
+            )
 
 
 def test_poisson_overlapping_string():

@@ -35,7 +35,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   number keeps it as a lower bound on significance, so an explicit request can be
   stricter than false-alarm control requires but not weaker. Exposed as
   `effective_alpha(height, width)`.
-- `debias`, to control the post-selection refit. Off by default: see below.
 
 ### Changed
 
@@ -46,16 +45,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scale coordinate and the fit breaks the tie towards splitting. See
   `docs/matrix_free_theory.md` Theorem 1. The legacy finder keeps its historical
   default of 2.0 so that it still reproduces what it always did.
-- **Debiasing is now off by default.** It exists to remove L1 shrinkage from
-  amplitudes, and nothing downstream reads the finder's amplitude — the
-  orchestrator reduces the peak list to `(row, column)` before handing it to the
-  workers, and intensity is measured later by the integrator at known positions,
-  where it is a well-posed problem. It is also not free: dropping the penalty
-  drops the only thing suppressing what the model cannot explain, so an
-  unpenalised refit absorbs a mis-estimated background into the peaks. Turning it
-  off removes two flaky tests and takes a clean full-suite run from roughly 55%
-  of runs to roughly 87%. Set `debias=True` when amplitudes are wanted from the
-  finder itself.
+- **The debiasing phase is removed from the finder** (99 lines). It existed to
+  strip L1 shrinkage from amplitudes, and nothing downstream reads the finder's
+  amplitude: the orchestrator reduces the peak list to `(row, column)` before
+  handing it to the workers, and intensity is measured later by the integrator at
+  known positions, where it is a well-posed problem and where its own debiasing
+  still lives. It was also not free — dropping the penalty drops the only thing
+  suppressing what the model cannot explain, so an unpenalised refit absorbed a
+  mis-estimated background into the peaks, in proportion to how sparse the
+  support was. Removing it settled two flaky tests.
 - **Default `alpha` is now `None`, was 4.0.** The right threshold depends on how
   many coefficients are being tested, so it depends on image size, which a
   constant cannot express. The derived values run from 3.60 on a 64x64 padded
@@ -128,13 +126,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Notes
 
-- Debiasing is load-bearing for amplitude accuracy only, which is why it is no
-  longer the default. The one test that needs it,
-  `test_poisson_vs_gaussian_sparse_flux`, now opts in explicitly: it compares
-  recovered flux against ground truth on a very low-count image (background rate
-  0.1, peak amplitude 5.0, true flux 125.7), and without the refit only 6.4 of
-  that flux survives L1 shrinkage — 5% of the truth — which swamps the
-  difference between the two losses it exists to measure.
+- `test_poisson_vs_gaussian_sparse_flux` is replaced by
+  `test_gaussian_loss_path_finds_peaks`. The old test compared *recovered flux*
+  between the two losses, which is a quantity the finder no longer promises and
+  which no consumer reads; it was also the only thing keeping the debiasing phase
+  alive. The Gaussian likelihood still needs covering, since it is the CLI
+  default for `--sparse-rbf-loss`, so the replacement asserts that both losses
+  detect and localise rather than that either recovers a flux.
 - The finder suite is currently stable: 20 of 20 on three consecutive whole-file
   runs, and 6 of 6 in isolation for each of the three tests that used to flap.
   That is after the refinement no-op above was fixed; before it, a clean run was

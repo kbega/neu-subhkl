@@ -56,7 +56,6 @@ class MatrixFreeSparseRBFPeakFinder:
         show_steps: bool = False,
         ref_sigma: float = 1.0,
         refine_positions: bool = True,
-        debias: bool = False,
         reject_boundary_sigma: bool = True,
         boundary_sigma_frac: float = 0.98,
         **kwargs
@@ -70,7 +69,6 @@ class MatrixFreeSparseRBFPeakFinder:
         self.show_steps = show_steps
         self.ref_sigma = ref_sigma
         self.refine_positions = refine_positions
-        self.debias = debias
         self.reject_boundary_sigma = reject_boundary_sigma
         self.boundary_sigma_frac = boundary_sigma_frac
 
@@ -311,105 +309,7 @@ class MatrixFreeSparseRBFPeakFinder:
         final_state = lax.while_loop(cond_fn, body_fn, init_state)
         _, _, c_l1, _ = final_state
 
-        # === DEBIASING PHASE ===
-        # L1 shrinks every surviving coefficient by the threshold, so amplitudes
-        # come out of the previous phase biased low, and refitting on the
-        # selected support without the penalty removes that bias.
-        #
-        # It is off by default because nothing downstream reads the amplitude:
-        # the orchestrator reduces this finder's output to (row, column) before
-        # handing it to the workers, and intensity is measured later by the
-        # integrator, at known positions, where it is a well-posed problem.
-        # Debiasing is also not free.  Dropping the penalty drops the only thing
-        # suppressing whatever the model cannot explain, so an unpenalised refit
-        # will absorb a mis-estimated background into the peaks -- concentrated
-        # in proportion to how sparse the support is, which is why a stricter
-        # threshold made matters worse rather than better.  Turn it on when
-        # amplitudes are actually wanted from the finder itself.
-        #
-        # `self.debias` is a static flag, so this branch resolves at trace time.
-        if not self.debias:
-            return c_l1[0]
-
-        active_mask = (c_l1 > 1e-5).astype(jnp.float32)
-
-        def debias_cond(state):
-            step, _, actual_step_norm = state
-            return (step < 50) & (actual_step_norm > 1e-4)
-
-        tau_debias = jnp.float32(0.8 if self.loss == "poisson" else 1.0)
-
-        def debias_body(state):
-            step, c_deb, _ = state
-            nll_curr, grad, W_diag = get_loss_grad_hess(c_deb)
-
-            # For the Gaussian loss W_diag is identically one, so this reduces to
-            # the H_diag computed above; sharing one expression keeps the two
-            # branches from drifting apart.
-            eta = 1.0 / jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
-
-            # Same requirement as the SSN solve above: the operator handed to CG
-            # must be symmetric, so eta enters as a preconditioner and the
-            # right-hand side stays -grad rather than -eta * grad.
-            def apply_hessian(v):
-                v_active = v * active_mask
-                Av = self._forward_op(v_active, self.K_weights)
-                At_W_Av = self._adjoint_op(W_diag * Av, self.K_weights)
-                return (At_W_Av + 1e-4 * v_active) * active_mask + (
-                    1.0 - active_mask
-                ) * v
-
-            def jacobi(v):
-                return eta * v * active_mask + (1.0 - active_mask) * v
-
-            dc, _ = jax.scipy.sparse.linalg.cg(
-                apply_hessian,
-                -grad * active_mask,
-                M=jacobi,
-                tol=1e-4,
-                maxiter=50,
-            )
-            dc = jnp.where(jnp.isfinite(dc), dc, 0.0)
-
-            def trial(scale):
-                cand = jnp.maximum(0.0, c_deb + scale * dc * active_mask)
-                cand = jnp.where(jnp.isfinite(cand), cand, c_deb)
-                return cand, get_loss_grad_hess(cand)[0]
-
-            # Debiasing drops the L1 term, which is the only thing holding the
-            # near-null-space directions of the active set in check.  On a large,
-            # heavily overlapping support that system is close to singular, CG
-            # returns a direction it has not solved for, and an unguarded Newton
-            # step then runs away: measured on two overlapping broad peaks, the
-            # likelihood got worse on every iteration and the fit went from an
-            # rms residual of 3.3 to 60, i.e. an order of magnitude worse than
-            # reporting no peaks at all.  Backtrack, and refuse the step outright
-            # if no decrease is found, so debiasing can only ever improve on the
-            # L1 solution it started from.
-            def bt_cond(bt_state):
-                bt_i, _, _, j_test = bt_state
-                return (bt_i < 10) & ((j_test > nll_curr) | ~jnp.isfinite(j_test))
-
-            def bt_body(bt_state):
-                bt_i, scale, _, _ = bt_state
-                scale = scale * 0.5
-                cand, j_cand = trial(scale)
-                return (bt_i + 1, scale, cand, j_cand)
-
-            c0, j0 = trial(tau_debias)
-            _, _, c_try, j_try = lax.while_loop(
-                bt_cond, bt_body, (0, tau_debias, c0, j0)
-            )
-
-            accept = jnp.isfinite(j_try) & (j_try <= nll_curr)
-            c_new = jnp.where(accept, c_try, c_deb)
-            step_norm = jnp.where(accept, jnp.linalg.norm(c_new - c_deb), 0.0)
-            return (step + 1, c_new, step_norm)
-
-        debias_state = lax.while_loop(debias_cond, debias_body, (0, c_l1, jnp.float32(1e9)))
-        _, c_final, _ = debias_state
-
-        return c_final[0]
+        return c_l1[0]
 
     @partial(jit, static_argnames=["self", "border"])
     def _extract_peaks(self, c_tensor, border=0):
