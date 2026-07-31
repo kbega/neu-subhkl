@@ -601,76 +601,105 @@ class MatrixFreeSparseRBFPeakFinder:
 
         results = []
         rejected_counts = []
-        c_tensors = jax.jit(jax.vmap(self._solve_ssn_cg_global))(
-            images_padded, bg_padded
-        )
 
         MARGIN = max(3, self.max_k_rad)
 
-        for i in range(B):
-            peaks_padded, valid_mask = self._extract_peaks(
-                c_tensors[i], border=pad_y + MARGIN
-            )
+        # vmap multiplies the solver's per-image working set by the batch, so a
+        # full detector scan does not fit on the card: on the 1114-frame CG4D
+        # garnet stack XLA asks for an 82 GiB program and the allocator gives up
+        # at 69.8 GiB on a 96 GB H100.  Chunk it for the same reason the
+        # background estimate above is chunked.  Peaks are pulled back to the
+        # host inside the chunk loop, which keeps the coefficient tensors, at
+        # [chunk, num_sigmas, H, W] the largest thing here, from accumulating.
+        #
+        # The images are solved independently, so chunking is not an
+        # approximation -- but it is not bit-identical either.  XLA compiles a
+        # separate kernel per batch shape, and the resulting rounding
+        # differences can carry a coefficient across the selection threshold: on
+        # a 6-frame synthetic case, solving one image at a time rather than all
+        # six moved two frames' peak counts.  A batch of chunk_size or fewer
+        # still takes a single chunk and so matches the unchunked path exactly,
+        # which at the default of 64 covers every unit test here.
+        #
+        # Unlike the background rule this does not also divide by four: the
+        # solver is the expensive stage, chunk_size is the knob documented to
+        # control exactly this, and subdividing a batch that already fits only
+        # gives up vmap parallelism.
+        solve_chunk = max(1, min(self.chunk_size, B))
+        solve_batch = jax.jit(jax.vmap(self._solve_ssn_cg_global))
 
-            # Slide the selected support off the grid before un-padding, while
-            # the coordinates still match the image the model is rendered on.
-            if self.refine_positions:
-                peaks_padded = self._refine_peaks(
-                    images_padded[i], bg_padded[i], peaks_padded, valid_mask
+        for start in range(0, B, solve_chunk):
+            stop = min(start + solve_chunk, B)
+            c_tensors = solve_batch(images_padded[start:stop], bg_padded[start:stop])
+
+            for i in range(start, stop):
+                peaks_padded, valid_mask = self._extract_peaks(
+                    c_tensors[i - start], border=pad_y + MARGIN
                 )
 
-            peaks_np = np.array(peaks_padded)
-            mask_np = np.array(valid_mask)
+                # Slide the selected support off the grid before un-padding, while
+                # the coordinates still match the image the model is rendered on.
+                if self.refine_positions:
+                    peaks_padded = self._refine_peaks(
+                        images_padded[i], bg_padded[i], peaks_padded, valid_mask
+                    )
 
-            valid_peaks = peaks_np[mask_np]
+                peaks_np = np.array(peaks_padded)
+                mask_np = np.array(valid_mask)
 
-            valid_peaks[:, 1] -= pad_y
-            valid_peaks[:, 2] -= pad_x
+                valid_peaks = peaks_np[mask_np]
 
-            keep = (
-                (valid_peaks[:, 1] >= MARGIN)
-                & (valid_peaks[:, 1] < H - MARGIN)
-                & (valid_peaks[:, 2] >= MARGIN)
-                & (valid_peaks[:, 2] < W - MARGIN)
-            )
+                valid_peaks[:, 1] -= pad_y
+                valid_peaks[:, 2] -= pad_x
 
-            # An atom whose width has run to the edge of the bank is the solver
-            # asking for a wider basis than it was given.  That can mean
-            # unmodelled smooth background -- or simply that max_sigma is too
-            # small for the data, in which case every real peak saturates the
-            # bank too and this discards them.  On a real MANDI scan, where the
-            # peaks have a median width of ~34 px against a max_sigma of 5, it
-            # removed 87% of genuine detections (466 peaks down to 60), so it is
-            # off by default and is a diagnostic to reach for once the bank is
-            # known to be wide enough.  The case
-            # that motivated this is a diffuse halo whose background estimate
-            # falls ~20% short at its centre, leaving a broad positive residual
-            # that is then reported as a reflection sitting on the halo.  On real
-            # Laue data the structures that trigger it -- thermal diffuse
-            # scattering, powder rings, halos around strong reflections -- are
-            # exactly the ones that should not be reported as peaks.
-            if self.reject_boundary_sigma:
-                at_boundary = (
-                    valid_peaks[:, 3] >= self.boundary_sigma_frac * self.max_sigma
-                ) & keep
-                n_rejected = int(np.count_nonzero(at_boundary))
-                keep &= ~at_boundary
-            else:
-                n_rejected = 0
-
-            # Record rather than drop silently: a run that discards many atoms
-            # here is telling you the background model is leaving structure
-            # behind, or that max_sigma is too small for this data, and either
-            # is worth knowing.
-            rejected_counts.append(n_rejected)
-            if self.show_steps and n_rejected:
-                print(
-                    f"  > Rejected {n_rejected} atom(s) with sigma at the bank "
-                    f"edge (>= {self.boundary_sigma_frac:.2f} * "
-                    f"{self.max_sigma:g}); likely unmodelled background."
+                keep = (
+                    (valid_peaks[:, 1] >= MARGIN)
+                    & (valid_peaks[:, 1] < H - MARGIN)
+                    & (valid_peaks[:, 2] >= MARGIN)
+                    & (valid_peaks[:, 2] < W - MARGIN)
                 )
 
-            results.append(valid_peaks[keep])
+                # An atom whose width has run to the edge of the bank is the solver
+                # asking for a wider basis than it was given.  That can mean
+                # unmodelled smooth background -- or simply that max_sigma is too
+                # small for the data, in which case every real peak saturates the
+                # bank too and this discards them.  On a real MANDI scan, where the
+                # peaks have a median width of ~34 px against a max_sigma of 5, it
+                # removed 87% of genuine detections (466 peaks down to 60), so it is
+                # off by default and is a diagnostic to reach for once the bank is
+                # known to be wide enough.  The case
+                # that motivated this is a diffuse halo whose background estimate
+                # falls ~20% short at its centre, leaving a broad positive residual
+                # that is then reported as a reflection sitting on the halo.  On real
+                # Laue data the structures that trigger it -- thermal diffuse
+                # scattering, powder rings, halos around strong reflections -- are
+                # exactly the ones that should not be reported as peaks.
+                if self.reject_boundary_sigma:
+                    at_boundary = (
+                        valid_peaks[:, 3] >= self.boundary_sigma_frac * self.max_sigma
+                    ) & keep
+                    n_rejected = int(np.count_nonzero(at_boundary))
+                    keep &= ~at_boundary
+                else:
+                    n_rejected = 0
+
+                # Record rather than drop silently: a run that discards many atoms
+                # here is telling you the background model is leaving structure
+                # behind, or that max_sigma is too small for this data, and either
+                # is worth knowing.
+                rejected_counts.append(n_rejected)
+                if self.show_steps and n_rejected:
+                    print(
+                        f"  > Rejected {n_rejected} atom(s) with sigma at the bank "
+                        f"edge (>= {self.boundary_sigma_frac:.2f} * "
+                        f"{self.max_sigma:g}); likely unmodelled background."
+                    )
+
+                results.append(valid_peaks[keep])
+
+            # Release the chunk before the next one is dispatched, so peak
+            # device memory stays at one chunk rather than two.
+            del c_tensors
 
         self.n_boundary_rejected = rejected_counts
         return results
