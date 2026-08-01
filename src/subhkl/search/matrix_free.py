@@ -256,13 +256,27 @@ class MatrixFreeSparseRBFPeakFinder:
             # scaling is supplied through the preconditioner argument rather
             # than multiplied into the operator, which would break symmetry and
             # leave CG returning a direction that is not a descent direction.
-            eta = 1.0 / jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
+            # H = A^T W A carries [counts]/[c]^2, so a bare additive constant is
+            # not a regularisation strength but whatever fraction of diag(H) the
+            # data makes it: 6.4e-4 of the diagonal at 500 counts and 8.2e-7 at
+            # the 0.64-count mean of a real MANDI frame.  main folds the Jacobi
+            # scaling into the operator (ssn.py, eta[:, None] * hess) so its
+            # 1e-4 * I sits on a unit diagonal and is genuinely relative; that
+            # is only possible there because it solves densely.  Keeping the
+            # operator symmetric for CG moved the scaling out to M=, which left
+            # this ridge absolute.  Scale it by diag(H) to restore the same
+            # meaning, with main's value.
+            RIDGE_REL = 1e-4
+
+            H_diag_local = jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
+            eta = 1.0 / H_diag_local
 
             def apply_jacobian(v):
                 v_active = v * D_mat
                 Av = self._forward_op(v_active, self.K_weights)
                 At_W_Av = self._adjoint_op(W_diag * Av, self.K_weights)
-                return (At_W_Av + 1e-4 * v_active) * D_mat + (1.0 - D_mat) * v
+                ridge = RIDGE_REL * H_diag_local * v_active
+                return (At_W_Av + ridge) * D_mat + (1.0 - D_mat) * v
 
             def jacobi(v):
                 return eta * v * D_mat + (1.0 - D_mat) * v
