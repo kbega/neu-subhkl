@@ -60,7 +60,7 @@ def test_overlapping_ghost_center_shift_failure():
     image_batch = image[np.newaxis, ...]
 
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=3.0,
+        alpha=None,
         gamma=0.5,
         min_sigma=2.0,
         max_sigma=8.0,
@@ -127,7 +127,7 @@ def test_oversparsification_missing_weak_peak_failure():
     image_batch = image[np.newaxis, ...]
 
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=3.0,
+        alpha=None,
         gamma=0.5,
         min_sigma=1.0,
         max_sigma=6.0,
