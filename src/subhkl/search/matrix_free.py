@@ -349,14 +349,23 @@ class MatrixFreeSparseRBFPeakFinder:
             )
             _, _, q_try, c_try, d_try = lax.while_loop(bt_cond, bt_body, bt_init)
 
-            # If the backtracking budget ran out without finding a decrease the
-            # trial point is worse than where we started, so reject it instead
-            # of stepping uphill.  A rejected step reports a zero step norm,
-            # which stops the outer loop rather than letting it thrash.
+            # If the backtracking budget ran out without finding a decrease,
+            # fall back to the forward-backward step q - tau_local * G(q).
+            # The identity q - tau G(q) = c(q) - tau grad(c(q)) makes this the
+            # prox-gradient iteration, and tau <= 1/L holds by construction
+            # (power iteration on A^T W(0) A with W(u) <= W(0) elementwise), so
+            # the descent lemma guarantees this step decreases the objective --
+            # no line search needed.  Terminating on rejection instead, as this
+            # loop previously did, reads "Newton step failed" as "converged":
+            # on a 6-frame synthetic case all 12 solves stopped that way, at
+            # whichever iterate the line search first failed.  The same 12
+            # solves under the pure fallback iteration accept every full step.
             accept = jnp.isfinite(d_try) & (d_try <= 0.0)
-            q_final = jnp.where(accept, q_try, q)
-            c_final = jnp.where(accept, c_try, c)
-            step_norm = jnp.where(accept, jnp.linalg.norm(q_final - q), 0.0)
+            q_fb = q - tau_local * Gq
+            c_fb = jnp.maximum(0.0, q_fb - tau_alpha)
+            q_final = jnp.where(accept, q_try, q_fb)
+            c_final = jnp.where(accept, c_try, c_fb)
+            step_norm = jnp.linalg.norm(q_final - q)
 
             return (step + 1, q_final, c_final, step_norm)
 
