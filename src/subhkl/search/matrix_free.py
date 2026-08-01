@@ -233,7 +233,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 res_1d = 1.0 - (y / u_safe)
                 grad = self._adjoint_op(res_1d, self.K_weights)
                 W_diag = 1.0 / jnp.maximum(u_safe, 1e-3)
-            return nll, grad, W_diag
+            return nll, grad, W_diag, u
 
         def cond_fn(state):
             step, _, _, step_norm = state
@@ -241,7 +241,7 @@ class MatrixFreeSparseRBFPeakFinder:
 
         def body_fn(state):
             step, q, c, _ = state
-            nll, grad, W_diag = get_loss_grad_hess(c)
+            _, grad, W_diag, u_curr = get_loss_grad_hess(c)
             Gq = (q - c) / tau_local + grad
 
             # Strict Independent L1 Block Soft-Thresholding
@@ -275,43 +275,71 @@ class MatrixFreeSparseRBFPeakFinder:
             )
             dq = jnp.where(jnp.isfinite(dq), dq, 0.0)
 
-            def objective(c_test):
-                j_test, _, _ = get_loss_grad_hess(c_test)
-                return j_test + jnp.sum(lam * c_test)
+            # Change in objective from c to c_test, accumulated as a single
+            # reduction over per-pixel *differences*.
+            #
+            # Forming it as j(c_test) - j(c) instead cannot work in float32.
+            # Both are sums over the whole image of magnitude |J|, so their
+            # difference is unresolvable below one ulp, ~6e-8 * |J| -- on a
+            # 126x126 frame that floor is ~9e-3, and on a 542x542 detector
+            # frame it is ~0.2.  The true decrease falls under it long before
+            # the iterate is converged, at which point no amount of
+            # backtracking can show an improvement: every halving looks like an
+            # increase, the budget runs out, the step is rejected and the outer
+            # loop stops.  Measured on a 6-frame synthetic case, all 12 solves
+            # ended that way -- none reached the convergence test or the
+            # iteration cap -- and the stopping iteration then moved with
+            # anything that perturbed the arithmetic.
+            #
+            # Differencing per pixel first ties the accuracy to the decrease
+            # rather than to |J|.  log1p keeps the Poisson term exact when the
+            # trial point is close, which is precisely the regime that matters.
+            # This is the same quantity, not an approximation; it also drops the
+            # adjoint convolution the old objective computed and threw away on
+            # every backtracking trial.
+            def obj_delta(c_test):
+                u_test = self._forward_op(c_test, self.K_weights) + bg
+                if self.loss == "gaussian":
+                    d_nll = 0.5 * jnp.sum(
+                        (u_test - u_curr) * ((u_test - y) + (u_curr - y))
+                    )
+                else:
+                    u_c = jnp.maximum(u_curr, 1e-6)
+                    du = jnp.maximum(u_test, 1e-6) - u_c
+                    d_nll = jnp.sum(du - y * jnp.log1p(du / u_c))
+                return d_nll + jnp.sum(lam * (c_test - c))
 
             def bt_cond(bt_state):
-                bt_i, _step_size, _, _, j_test, j_curr = bt_state
-                is_valid = jnp.isfinite(j_test)
-                return (bt_i < 12) & ((j_test > j_curr) | ~is_valid)
+                bt_i, _step_size, _, _, d_test = bt_state
+                is_valid = jnp.isfinite(d_test)
+                return (bt_i < 12) & ((d_test > 0.0) | ~is_valid)
 
             def bt_body(bt_state):
-                bt_i, step_size, _, _, _, j_curr = bt_state
+                bt_i, step_size, _, _, _ = bt_state
                 step_size = jnp.float32(step_size * 0.5)
 
                 q_test = q + step_size * dq
                 c_test = jnp.maximum(0.0, q_test - tau_alpha)
 
-                return (bt_i + 1, step_size, q_test, c_test, objective(c_test), j_curr)
+                return (bt_i + 1, step_size, q_test, c_test, obj_delta(c_test))
 
             q_test_init = q + dq
             c_test_init = jnp.maximum(0.0, q_test_init - tau_alpha)
-            obj_val_curr = nll + jnp.sum(lam * c)
 
             bt_init = (
                 0,
                 jnp.float32(1.0),
                 q_test_init,
                 c_test_init,
-                objective(c_test_init),
-                obj_val_curr,
+                obj_delta(c_test_init),
             )
-            _, _, q_try, c_try, j_try, _ = lax.while_loop(bt_cond, bt_body, bt_init)
+            _, _, q_try, c_try, d_try = lax.while_loop(bt_cond, bt_body, bt_init)
 
             # If the backtracking budget ran out without finding a decrease the
             # trial point is worse than where we started, so reject it instead
             # of stepping uphill.  A rejected step reports a zero step norm,
             # which stops the outer loop rather than letting it thrash.
-            accept = jnp.isfinite(j_try) & (j_try <= obj_val_curr)
+            accept = jnp.isfinite(d_try) & (d_try <= 0.0)
             q_final = jnp.where(accept, q_try, q)
             c_final = jnp.where(accept, c_try, c)
             step_norm = jnp.where(accept, jnp.linalg.norm(q_final - q), 0.0)
