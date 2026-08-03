@@ -1206,3 +1206,98 @@ def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
     assert any(np.sqrt((p[1] - 30.0) ** 2 + (p[2] - 30.0) ** 2) < 2.0 for p in peaks), (
         "alpha=None failed to find an unambiguous peak"
     )
+
+
+def test_global_solve_reaches_first_order_optimality():
+    """The global solve must return a certified first-order optimum.
+
+    The optimality measure is the per-coordinate residual of the
+    prox-gradient fixed-point map, relative to the local penalty scale:
+
+        r = max_i |c_i - prox_i| / (tau * lam_i),
+        prox = max(0, c - tau * (grad D + lam)),
+
+    which is zero exactly at a KKT point and dimensionless (a residual of
+    r = 1 means the first-order error is as large as the penalty that
+    decides activation).  The solver's internal stopping test certifies
+    max|G|/lam <= 1e-3 in the q-iterate, and the c-space measure asserted
+    here is dominated by it (the soft-threshold is 1-Lipschitz).
+
+    This protects two coupled solver properties against regression:
+    - sufficient-decrease acceptance: the Newton step is taken only when
+      it decreases J at least as much as the certified forward-backward
+      step, so every iteration is provably at least as good as FB;
+    - the relative KKT stopping test: the previous absolute step-norm
+      test (||dq|| <= 1e-3) fired at a residual of the ORDER OF the
+      penalty itself (r ~ 2-7 on this case) once small FB steps appeared,
+      reading "steps got small" as "converged".
+
+    Measured on this case: r = 4.4e-4 at the stop (float32 plateau
+    ~2e-5 with unlimited iterations), versus r ~ 91 at c = 0.  The 2e-3
+    threshold is 2x the internal certificate for float32 slack and still
+    three orders below the pre-fix behaviour.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    from jax import lax
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+    from subhkl.search.sparse_rbf import compute_bg_batch
+
+    rng = np.random.default_rng(0)
+    H, W = 96, 96
+    img = np.full((H, W), 5.0)
+    for _ in range(4):
+        r0, c0 = rng.integers(20, H - 20), rng.integers(20, W - 20)
+        yy, xx = np.ogrid[:H, :W]
+        img += 300.0 * np.exp(-((yy - r0) ** 2 + (xx - c0) ** 2) / (2 * 2.0**2))
+    image = rng.poisson(img).astype(np.float32)
+
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=0.5, max_sigma=5.0, num_sigmas=5, loss="poisson"
+    )
+    filter_size = max(15, int(finder.max_sigma * 5))
+    bg = np.asarray(compute_bg_batch(jnp.asarray(image[None]), filter_size))[0]
+
+    pad = (2 * finder.max_k_rad + 1) // 2
+    ip = jnp.pad(jnp.asarray(image), ((pad, pad), (pad, pad)), mode="edge")
+    bp = jnp.pad(jnp.asarray(bg), ((pad, pad), (pad, pad)), mode="edge")
+
+    c_sol = finder._solve_ssn_cg_global(ip, bp, max_iter=400)[None]
+
+    # The measure is built from first principles with the test's own step
+    # size: c is a KKT point iff c = prox(c - tau grad) for ANY tau > 0,
+    # so an independently derived tau cannot mask a solver regression.
+    y4 = ip[None, None, :, :]
+    bg4 = bp[None, None, :, :]
+    w_ref = 1.0 / jnp.maximum(bg4, 1e-3)
+    h_diag = jnp.maximum(finder._adjoint_op(w_ref, finder.K_sq), 1e-6)
+    lam = (finder.effective_alpha(*ip.shape)[None, :, None, None]
+           * h_diag * jnp.sqrt(1.0 / h_diag))
+
+    def power_step(_, v):
+        av = finder._adjoint_op(
+            w_ref * finder._forward_op(v, finder.K_weights), finder.K_weights
+        )
+        return av / (jnp.linalg.norm(av) + 1e-12)
+
+    v0 = jnp.ones_like(lam)
+    v_top = lax.fori_loop(0, 15, power_step, v0 / jnp.linalg.norm(v0))
+    av_top = finder._adjoint_op(
+        w_ref * finder._forward_op(v_top, finder.K_weights), finder.K_weights
+    )
+    l_max = jnp.sum(v_top * av_top) / jnp.sum(v_top * v_top)
+    tau = 1.0 / (l_max + 1e-4)
+
+    u = jnp.maximum(finder._forward_op(c_sol, finder.K_weights) + bg4, 1e-6)
+    grad = finder._adjoint_op(1.0 - y4 / u, finder.K_weights)
+    prox = jnp.maximum(0.0, c_sol - tau * (grad + lam))
+    kkt_rel = float(jnp.max(jnp.abs(c_sol - prox) / (tau * lam)))
+
+    assert np.isfinite(kkt_rel)
+    assert kkt_rel < 2e-3, (
+        f"first-order optimality regressed: max|c - prox|/(tau*lam) = "
+        f"{kkt_rel:.3e} (certified <= 1e-3, measured 4.4e-4 at the fix)"
+    )
+    # sanity: the certified solution is a sparse peak model, not c = 0
+    assert int(jnp.sum(c_sol > 0)) > 0
