@@ -1304,3 +1304,176 @@ def test_global_solve_reaches_first_order_optimality():
     )
     # sanity: the certified solution is a sparse peak model, not c = 0
     assert int(jnp.sum(c_sol > 0)) > 0
+
+
+def test_sparse_regime_certificate_and_shadow_deactivation():
+    """First-order resolution of the data-shadow degeneracy.
+
+    At background 0.3 counts/pixel, ~74% of pixels record zero counts, so
+    the exact Hessian's null space -- directions whose image lands on
+    empty pixels -- is most of coefficient space.  The augmented-penalty
+    endgame resolves those directions by deactivation (the zero-count
+    fidelity terms are exactly linear and fold into the threshold), with
+    no Hessian regularization.  Protected properties: the solve still
+    reaches its relative-KKT certificate despite the singular Hessian;
+    the dark far corner carries exactly zero coefficients (deactivation,
+    not damping); and the one real peak is recovered.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    from jax import lax
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    rng = np.random.default_rng(3)
+    H, W = 64, 64
+    bg_level = 0.3
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    truth = np.full((H, W), bg_level)
+    truth += 3.0 * np.exp(-((yy - 32) ** 2 + (xx - 32) ** 2) / (2 * 2.0**2))
+    image = rng.poisson(truth).astype(np.float32)
+    assert np.mean(image == 0) > 0.5  # the shadow is most of the frame
+
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=0.5, max_sigma=5.0, num_sigmas=5, loss="poisson"
+    )
+    pad = (2 * finder.max_k_rad + 1) // 2
+    ip = jnp.pad(jnp.asarray(image), ((pad, pad), (pad, pad)), mode="edge")
+    bp = jnp.full_like(ip, bg_level)
+
+    c_sol = finder._solve_ssn_cg_global(ip, bp, max_iter=400)[None]
+
+    # certificate, from first principles with an independent step size
+    y4 = ip[None, None, :, :]
+    bg4 = bp[None, None, :, :]
+    w_ref = 1.0 / jnp.maximum(bg4, 1e-3)
+    h_diag = jnp.maximum(finder._adjoint_op(w_ref, finder.K_sq), 1e-6)
+    lam = (
+        finder.effective_alpha(*ip.shape)[None, :, None, None]
+        * h_diag
+        * jnp.sqrt(1.0 / h_diag)
+    )
+
+    def power_step(_, v):
+        av = finder._adjoint_op(
+            w_ref * finder._forward_op(v, finder.K_weights), finder.K_weights
+        )
+        return av / (jnp.linalg.norm(av) + 1e-12)
+
+    v0 = jnp.ones_like(lam)
+    v_top = lax.fori_loop(0, 15, power_step, v0 / jnp.linalg.norm(v0))
+    av_top = finder._adjoint_op(
+        w_ref * finder._forward_op(v_top, finder.K_weights), finder.K_weights
+    )
+    tau = 1.0 / (jnp.sum(v_top * av_top) / jnp.sum(v_top * v_top) + 1e-4)
+    u = jnp.maximum(finder._forward_op(c_sol, finder.K_weights) + bg4, 1e-6)
+    grad = finder._adjoint_op(1.0 - y4 / u, finder.K_weights)
+    prox = jnp.maximum(0.0, c_sol - tau * (grad + lam))
+    kkt_rel = float(jnp.max(jnp.abs(c_sol - prox) / (tau * lam)))
+    assert kkt_rel < 2e-3, f"sparse-regime certificate regressed: {kkt_rel:.3e}"
+
+    # deactivation across the shadow: the far corner (>= 6 sigma from the
+    # peak) must be exactly zero in every channel
+    corner = np.asarray(c_sol[0, :, pad : pad + 12, pad : pad + 12])
+    assert np.all(corner == 0.0), "dark-region coefficients not deactivated"
+
+    # the real peak is recovered
+    c_tot = np.asarray(jnp.sum(c_sol[0], axis=0))
+    r_hat, c_hat = np.unravel_index(np.argmax(c_tot), c_tot.shape)
+    assert abs(r_hat - pad - 32) <= 1.5 and abs(c_hat - pad - 32) <= 1.5
+
+
+def test_position_certificate_flags_background_saddle():
+    """Second-order: the certificate must flag the background-induced
+    saddle of a statistically significant atom and pass a well-posed one.
+
+    Construction (deterministic, a legal Poisson realization): flat field
+    at the background mean plus a ring of extra counts at d = 2*sigma --
+    the residual geometry a width-mismatched atom leaves behind.  The
+    fitted atom is significant (matched-filter z ~ 6.5 against a floor of
+    ~4.6) yet its position Hessian is indefinite: refinement bifurcates.
+    """
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=0.5, max_sigma=5.0, num_sigmas=5, loss="poisson"
+    )
+    H = W = 33
+    B, sig = 2.0, 2.0
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    dist = np.sqrt((yy - 16.0) ** 2 + (xx - 16.0) ** 2)
+
+    # saddle case: ring counts at d = 2*sigma
+    y_ring = np.full((H, W), B, dtype=np.float32)
+    y_ring[np.abs(dist - 4.0) < 0.5] += 5.0
+    bg = np.full((H, W), B, dtype=np.float32)
+
+    # fit the amplitude at the (symmetric) center by scalar Newton
+    prof = np.exp(-(dist**2) / (2 * sig**2)).astype(np.float32)
+
+    def fit_amp(y):
+        amp = 1.0
+        yj = jnp.asarray(y)
+
+        def nll(a):
+            U = jnp.maximum(jnp.asarray(bg) + a * jnp.asarray(prof), 1e-6)
+            return jnp.sum(U - yj * jnp.log(U))
+
+        g = jax.grad(nll)
+        h = jax.grad(g)
+        for _ in range(60):
+            amp = float(np.clip(amp - g(amp) / max(float(h(amp)), 1e-9), 1e-4, 1e6))
+        return amp
+
+    amp_ring = fit_amp(y_ring)
+    assert amp_ring > 1.5  # significant: z = amp*sqrt(pi sig^2/B) > 4.6
+    peaks = np.array([[amp_ring, 16.0, 16.0, sig]], dtype=np.float32)
+    eig_tot, _ = finder.position_curvature(y_ring, bg, peaks)
+    assert eig_tot[0, 0] < 0.0, (
+        f"background saddle not flagged: min-eig {eig_tot[0, 0]:.3e}"
+    )
+
+    # control: a genuine, well-posed peak at the same background
+    y_good = np.round(B + 6.0 * prof).astype(np.float32)
+    peaks_good = np.array([[6.0, 16.0, 16.0, sig]], dtype=np.float32)
+    eig_tot_g, _ = finder.position_curvature(y_good, bg, peaks_good)
+    assert eig_tot_g[0, 0] > 0.0, (
+        f"well-posed peak wrongly flagged: min-eig {eig_tot_g[0, 0]:.3e}"
+    )
+
+
+def test_dark_wall_transverse_silence_stiffness():
+    """The silence part of the position curvature is the wall mechanism:
+    a straight dark boundary at distance D = sigma contributes transverse
+    stiffness ~ 2*pi*amp*Q''(1) ~ 1.5*amp (measured 1.42 with the exact
+    pixel-integrated kernel), about 24% of the peak's full position
+    Fisher information 2*pi*amp -- and only transverse to the wall.
+    """
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=0.5, max_sigma=5.0, num_sigmas=5, loss="poisson"
+    )
+    H = W = 61
+    sig, amp = 2.0, 1.0
+    y = np.full((H, W), 5.0, dtype=np.float32)
+    y[:, 32:] = 0.0  # dark half-plane: wall at distance D = 2 px = sigma
+    bg = np.full((H, W), 5.0, dtype=np.float32)
+    peaks = np.array([[amp, 30.0, 30.0, sig]], dtype=np.float32)
+
+    _, eig_sil = finder.position_curvature(y, bg, peaks)
+    tangent, transverse = eig_sil[0, 0], eig_sil[0, 1]
+    fisher = 2.0 * np.pi * amp
+    assert 0.15 * fisher < transverse < 0.35 * fisher, (
+        f"wall stiffness off calibration: {transverse / fisher:.3f} of Fisher"
+    )
+    assert abs(tangent) < 0.2 * transverse, (
+        f"wall stiffness not transverse: tangent {tangent:.3e} "
+        f"vs transverse {transverse:.3e}"
+    )
