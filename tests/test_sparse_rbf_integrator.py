@@ -1272,8 +1272,11 @@ def test_global_solve_reaches_first_order_optimality():
     bg4 = bp[None, None, :, :]
     w_ref = 1.0 / jnp.maximum(bg4, 1e-3)
     h_diag = jnp.maximum(finder._adjoint_op(w_ref, finder.K_sq), 1e-6)
-    lam = (finder.effective_alpha(*ip.shape)[None, :, None, None]
-           * h_diag * jnp.sqrt(1.0 / h_diag))
+    lam = (
+        finder.effective_alpha(*ip.shape)[None, :, None, None]
+        * h_diag
+        * jnp.sqrt(1.0 / h_diag)
+    )
 
     def power_step(_, v):
         av = finder._adjoint_op(
