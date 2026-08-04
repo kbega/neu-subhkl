@@ -182,53 +182,39 @@ class MatrixFreeSparseRBFPeakFinder:
             return self._rows_sq, self._cols_sq
         return None
 
-    # Beyond this many taps the operator is applied by FFT instead of by direct
-    # convolution.  Both forms compute the same linear map to float32 round-off:
-    # the transform is zero-padded past the linear-convolution length, so there
-    # is no wraparound being traded away, and the two agree to 8e-07 relative
-    # over the whole array, borders included, with the adjoint identity holding
-    # to 1e-06.  Their costs scale differently -- a separable pass is O(taps) per
-    # pixel per channel, the transform O(log n) and independent of kernel width
-    # -- and CG dominates the solve, so this carries: at max_sigma = 25 the solve
-    # goes from 5.9 s to 0.78 s per 512x512 frame, the operator itself being
-    # 4.6x faster on a forward+adjoint pair.
+    # The kernel bank is applied by FFT at every width; the separable direct
+    # path below survives as the `use_fft = False` escape hatch and as the
+    # reference the transform is validated against.  The transform computes the
+    # same linear map to float32 round-off: zero-padded past the
+    # linear-convolution length, so there is no wraparound being traded away,
+    # it agrees with the direct path to ~1e-06 relative over the whole array,
+    # borders included, with the adjoint identity holding to the same level.
+    # It is also never slower -- measured on a 512x512 frame with K=5 it is
+    # 2.1x faster at the narrowest bank tried (19 taps) and 4.6x at
+    # max_sigma = 25 (151 taps), where it takes the solve from 5.9 s to 0.78 s
+    # per frame, since a separable pass is O(taps) per pixel per channel while
+    # the transform is O(log n) and independent of kernel width.
     #
-    # The threshold is deliberately well above where the transform starts to
-    # win.  Measured on a 512x512 frame with K=5 it is already 2.1x ahead at 19
-    # taps and never behind at any width tried, so there is a further ~2x
-    # available for the default max_sigma = 5 by lowering this.  That is left
-    # alone on purpose: it would move the default configuration's arithmetic,
-    # and while the shift is ~1e-06, at these settings the low-amplitude tail of
-    # the peak list is chaotic in the last bits (see MEDIAN_MAX_SAMPLES), so it
-    # wants the marginal tests re-validated rather than a silent change here.
-    FFT_MIN_TAPS = 61
+    # An earlier revision gated this behind a minimum tap count so the default
+    # max_sigma = 5 configuration kept its exact previous arithmetic.  The
+    # gate cost a hard-tuned constant and left ~2x on the table at the
+    # default; with the finder's test suite passing under the transform at
+    # every width, it went.  The arithmetic difference is real but last-bit
+    # (~1e-06), and at these settings the low-amplitude tail of the peak list
+    # is chaotic well above that level from run-to-run GPU nondeterminism
+    # alone (see MEDIAN_MAX_SAMPLES).
 
     @staticmethod
     def _fft_len(n):
-        """Smallest 7-smooth length >= n -- the sizes cuFFT has kernels for.
+        """Next power of two >= n.
 
-        Rounding to a power of two instead can nearly double the transform on
-        awkward sizes (a 1100-point transform would go to 2048 rather than
-        1120), and the odd-factor sizes are within a few percent of the
-        power-of-two rate on cuFFT.
+        A smaller 7-smooth length (e.g. 840 rather than 1024 for a 662-pixel
+        frame at max_sigma = 25) was tried and measured no faster at any
+        configuration -- cuFFT's radix-2 kernels beat its mixed-radix ones by
+        more than the extra padding costs, by up to 28% -- so the simplest
+        length wins on both counts.
         """
-        n = max(int(n), 1)
-        best = None
-        p7 = 1
-        while p7 < 2 * n:
-            p5 = p7
-            while p5 < 2 * n:
-                p3 = p5
-                while p3 < 2 * n:
-                    v = p3
-                    while v < n:
-                        v *= 2
-                    if best is None or v < best:
-                        best = v
-                    p3 *= 3
-                p5 *= 5
-            p7 *= 7
-        return int(best)
+        return 1 << (max(int(n), 1) - 1).bit_length()
 
     def _fft_kernels(self, weights, nf):
         """Transform of the kernel bank, centred at the origin.  Cached per shape.
@@ -254,9 +240,11 @@ class MatrixFreeSparseRBFPeakFinder:
         return cache[key]
 
     def _use_fft(self, weights):
+        # The shape test keeps any weights that are not the full bank (nothing
+        # passes one today) on the general direct path rather than through a
+        # transform built for the bank's dimensions.
         return (
             getattr(self, "use_fft", True)
-            and 2 * self.max_k_rad + 1 >= self.FFT_MIN_TAPS
             and weights.shape[-1] == 2 * self.max_k_rad + 1
         )
 
