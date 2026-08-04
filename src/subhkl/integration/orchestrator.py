@@ -38,10 +38,11 @@ class DetectorPeaks:
     gonio_names: Optional[List[str]]
     peak_rows: Optional[List[int]]
     peak_cols: Optional[List[int]]
-    # Per-peak leave-one-out deviance from the finder, when it reports one.
+    # Per-peak quality metrics from the finder, when it reports them.
     # Trailing and defaulted so that positional construction and unpacking of
     # the fields above are unaffected.
     deviance: Optional[List[float]] = None
+    residual_deviance: Optional[List[float]] = None
 
     def __iter__(self):
         """Allows tuple unpacking"""
@@ -93,6 +94,7 @@ def prepare_harvest_tasks(
     # --- BATCH PRE-PROCESSING (SparseRBF) ---
     precomputed_peaks = {}
     precomputed_deviance = {}
+    precomputed_residual = {}
     if finder_algorithm == "sparse_rbf":
         img_keys = sorted(ims.keys())
         images_list = [ims[k] for k in img_keys]
@@ -138,12 +140,17 @@ def prepare_harvest_tasks(
             )
         batch_coords = alg.find_peaks_batch(img_stack)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}
-        # Per-peak leave-one-out deviance, when the finder reports it (the
+        # Per-peak quality metrics, when the finder reports them (the
         # matrix-free finder does; the legacy greedy one does not).
         batch_deviance = getattr(alg, "peak_deviance", None)
         if batch_deviance is not None:
             precomputed_deviance = {
                 k: d for k, d in zip(img_keys, batch_deviance, strict=False)
+            }
+        batch_residual = getattr(alg, "peak_residual_deviance", None)
+        if batch_residual is not None:
+            precomputed_residual = {
+                k: d for k, d in zip(img_keys, batch_residual, strict=False)
             }
 
     tasks = []
@@ -188,15 +195,21 @@ def prepare_harvest_tasks(
             # harvest output can record it (peaks/sigma) for --max-sigma
             # tuning diagnostics; the fourth carries the per-peak leave-one-out
             # deviance (peaks/deviance), the significance of that atom against
-            # chi^2 on its four parameters.
+            # chi^2 on its four parameters; the fifth the local residual
+            # deviance per degree of freedom (peaks/residual_deviance), which
+            # says whether the neighbourhood is actually explained -- a
+            # mis-sized sigma scores high on the fourth and badly on the fifth.
             dev = precomputed_deviance.get(img_key)
+            res = precomputed_residual.get(img_key)
             if len(coords) > 0:
                 if dev is None or len(dev) != len(coords):
                     dev = np.zeros(len(coords))
-                pre_coords = (coords[:, 1], coords[:, 2], coords[:, 3], dev)
+                if res is None or len(res) != len(coords):
+                    res = np.zeros(len(coords))
+                pre_coords = (coords[:, 1], coords[:, 2], coords[:, 3], dev, res)
             else:
                 empty = np.array([])
-                pre_coords = (empty, empty, empty, empty)
+                pre_coords = (empty, empty, empty, empty, empty)
 
         finder_info = (finder_algorithm, harvest_peaks_kwargs, pre_coords)
         mask_info = (

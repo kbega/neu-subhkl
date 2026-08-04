@@ -334,15 +334,24 @@ class Peaks:
             f["peaks/sigma"] = detector_peaks.sigma
             f["peaks/radius"] = detector_peaks.radii
 
-            # Per-peak quality metric: the leave-one-out deviance, i.e. the
-            # likelihood-ratio statistic for that peak's presence in the
-            # finder's model.  Same units as the global Deviance/DoF report,
-            # calibrated against chi^2 with four degrees of freedom.  Written
-            # only when the finder supplies it.
-            if detector_peaks.deviance is not None and len(
-                detector_peaks.deviance
-            ) == len(detector_peaks.intensity):
+            # Per-peak quality metrics, written only when the finder supplies
+            # them.  `deviance` is the leave-one-out likelihood-ratio statistic
+            # for that peak's presence (is it real?), calibrated against chi^2
+            # with four degrees of freedom; `residual_deviance` is the local
+            # goodness of fit per degree of freedom over the peak's own
+            # footprint (is it fitted correctly?), calibrated near 1.  A
+            # mis-sized peak scores high on the first and badly on the second.
+            n_peaks = len(detector_peaks.intensity)
+            if (
+                detector_peaks.deviance is not None
+                and len(detector_peaks.deviance) == n_peaks
+            ):
                 f["peaks/deviance"] = detector_peaks.deviance
+            if (
+                detector_peaks.residual_deviance is not None
+                and len(detector_peaks.residual_deviance) == n_peaks
+            ):
+                f["peaks/residual_deviance"] = detector_peaks.residual_deviance
 
             # Use pixel coordinates exclusively
             f["peaks/pixel_r"] = detector_peaks.peak_rows
@@ -372,6 +381,7 @@ class Peaks:
         intensity: list[float] = []
         sigma: list[float] = []
         deviance: list[float] = []
+        residual_deviance: list[float] = []
         radii: list[float] = []
         xyz_out: list[list[float]] = []
         banks: list[int] = []
@@ -392,6 +402,9 @@ class Peaks:
                 intensity.extend(res["intensity"])
                 sigma.extend(res["sigma"])
                 deviance.extend(res.get("deviance", [0.0] * res["count"]))
+                residual_deviance.extend(
+                    res.get("residual_deviance", [0.0] * res["count"])
+                )
                 radii.extend(res["radii"])
                 xyz_out.extend(res["xyz"])
                 banks.extend(res["banks"])
@@ -422,6 +435,7 @@ class Peaks:
             peak_rows,
             peak_cols,
             deviance,
+            residual_deviance,
         )
 
         if visualize:
