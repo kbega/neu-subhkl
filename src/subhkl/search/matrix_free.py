@@ -182,7 +182,92 @@ class MatrixFreeSparseRBFPeakFinder:
             return self._rows_sq, self._cols_sq
         return None
 
+    # Beyond this many taps the operator is applied by FFT instead of by direct
+    # convolution.  Both forms compute the same linear map to float32 round-off:
+    # the transform is zero-padded past the linear-convolution length, so there
+    # is no wraparound being traded away, and the two agree to 8e-07 relative
+    # over the whole array, borders included, with the adjoint identity holding
+    # to 1e-06.  Their costs scale differently -- a separable pass is O(taps) per
+    # pixel per channel, the transform O(log n) and independent of kernel width
+    # -- and CG dominates the solve, so this carries: at max_sigma = 25 the solve
+    # goes from 5.9 s to 0.78 s per 512x512 frame, the operator itself being
+    # 4.6x faster on a forward+adjoint pair.
+    #
+    # The threshold is deliberately well above where the transform starts to
+    # win.  Measured on a 512x512 frame with K=5 it is already 2.1x ahead at 19
+    # taps and never behind at any width tried, so there is a further ~2x
+    # available for the default max_sigma = 5 by lowering this.  That is left
+    # alone on purpose: it would move the default configuration's arithmetic,
+    # and while the shift is ~1e-06, at these settings the low-amplitude tail of
+    # the peak list is chaotic in the last bits (see MEDIAN_MAX_SAMPLES), so it
+    # wants the marginal tests re-validated rather than a silent change here.
+    FFT_MIN_TAPS = 61
+
+    @staticmethod
+    def _fft_len(n):
+        """Smallest 7-smooth length >= n -- the sizes cuFFT has kernels for.
+
+        Rounding to a power of two instead can nearly double the transform on
+        awkward sizes (a 1100-point transform would go to 2048 rather than
+        1120), and the odd-factor sizes are within a few percent of the
+        power-of-two rate on cuFFT.
+        """
+        n = max(int(n), 1)
+        best = None
+        p7 = 1
+        while p7 < 2 * n:
+            p5 = p7
+            while p5 < 2 * n:
+                p3 = p5
+                while p3 < 2 * n:
+                    v = p3
+                    while v < n:
+                        v *= 2
+                    if best is None or v < best:
+                        best = v
+                    p3 *= 3
+                p5 *= 5
+            p7 *= 7
+        return int(best)
+
+    def _fft_kernels(self, weights, nf):
+        """Transform of the kernel bank, centred at the origin.  Cached per shape.
+
+        Held in the cache as a numpy array, not a device array.  Anything
+        produced by a jnp call inside the solve is a tracer belonging to that
+        trace, so caching one would leak it out of the enclosing ``fori_loop``
+        and fail on the next call; the numpy value is converted at each use
+        site instead and lands in the compiled program as a constant.
+        """
+        cache = self.__dict__.setdefault("_fft_cache", {})
+        key = (id(weights), nf)
+        if key not in cache:
+            # Convert the whole bank before indexing: slicing a captured array
+            # inside a trace is itself a JAX operation and would hand back a
+            # tracer, concrete though the bank is.
+            k2d = np.asarray(weights, dtype=np.float64)[:, 0, :, :]  # [K, taps, taps]
+            r = self.max_k_rad
+            ker = np.zeros((k2d.shape[0], nf, nf), dtype=np.float64)
+            ker[:, : 2 * r + 1, : 2 * r + 1] = k2d
+            ker = np.roll(ker, (-r, -r), axis=(1, 2))
+            cache[key] = np.fft.rfft2(ker).astype(np.complex64)
+        return cache[key]
+
+    def _use_fft(self, weights):
+        return (
+            getattr(self, "use_fft", True)
+            and 2 * self.max_k_rad + 1 >= self.FFT_MIN_TAPS
+            and weights.shape[-1] == 2 * self.max_k_rad + 1
+        )
+
     def _forward_op(self, c, weights):
+        if self._use_fft(weights):
+            H, W = c.shape[-2:]
+            nf = self._fft_len(max(H, W) + 2 * self.max_k_rad)
+            Kf = jnp.asarray(self._fft_kernels(weights, nf))
+            Cf = jnp.fft.rfft2(c[0], s=(nf, nf))
+            out = jnp.fft.irfft2(jnp.sum(Cf * Kf, axis=0), s=(nf, nf))
+            return out[None, None, :H, :W]
         factors = self._sep_factors(weights)
         if factors is not None:
             filtered = self._sep_depthwise(c, *factors)
@@ -197,6 +282,13 @@ class MatrixFreeSparseRBFPeakFinder:
         )
 
     def _adjoint_op(self, u, weights):
+        if self._use_fft(weights):
+            H, W = u.shape[-2:]
+            nf = self._fft_len(max(H, W) + 2 * self.max_k_rad)
+            Kf = jnp.asarray(self._fft_kernels(weights, nf))
+            Uf = jnp.fft.rfft2(u[0, 0], s=(nf, nf))
+            out = jnp.fft.irfft2(Uf[None] * jnp.conj(Kf), s=(nf, nf))
+            return out[None, :, :H, :W]
         factors = self._sep_factors(weights)
         if factors is not None:
             K = weights.shape[0]
@@ -857,21 +949,35 @@ class MatrixFreeSparseRBFPeakFinder:
         images_batch = np.asarray(images_batch, dtype=np.float32)
         B, H, W = images_batch.shape
 
+        # Odd, as the greedy path already forces it (sparse_rbf.py).  An even
+        # window has no centre pixel: the old exact filter then returned an
+        # H+1 x W+1 map that the shape guard below silently cropped, which is a
+        # half-pixel shift of the background against the image rather than a
+        # harmless size mismatch.  max_sigma = 8 (window 40) hits this.
         filter_size = max(15, int(self.max_sigma * 5))
+        if filter_size % 2 == 0:
+            filter_size += 1
         bg_map = np.full_like(images_batch, 10.0)
         try:
-            from subhkl.search.sparse_rbf import compute_bg_batch
+            from subhkl.search.sparse_rbf import MEDIAN_MAX_SAMPLES, compute_bg_batch
 
             # Chunked for the same reason the greedy finder chunks it: a full
             # detector scan is far too much to hold on the device at once.
             bg_chunk = min(self.chunk_size, max(1, B // 4))
             pieces = []
             for start in range(0, B, bg_chunk):
+                # Subsample the median window past MEDIAN_MAX_SAMPLES.  The
+                # exact filter is what makes a large max_sigma unusable: 86 s
+                # per frame of the 92 s total at max_sigma = 25, against 45 ms
+                # subsampled.  See the constant's definition for what it costs
+                # in accuracy.  The greedy finder does not pass this and so is
+                # left on the exact filter.
                 piece = compute_bg_batch(
                     jnp.asarray(
                         images_batch[start : start + bg_chunk], dtype=jnp.float32
                     ),
                     filter_size,
+                    MEDIAN_MAX_SAMPLES,
                 )
                 piece.block_until_ready()
                 pieces.append(np.asarray(piece, dtype=np.float32))
