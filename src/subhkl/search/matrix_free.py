@@ -943,6 +943,17 @@ class MatrixFreeSparseRBFPeakFinder:
             del c_tensors
 
         self.n_boundary_rejected = rejected_counts
+
+        # Goodness-of-fit exit report, matching the greedy pipeline
+        # (sparse_rbf calls compute_metrics on its final peaks): total NLL,
+        # BIC, and residual deviance per degree of freedom
+        # (n_pixels - 4 * n_atoms).  Deviance/DoF near 1 is a calibrated
+        # Poisson fit; well above 1 flags unmodelled structure (background
+        # or missed peaks), well below 1 flags over-parameterization.
+        # Stored on the instance for programmatic use and printed under
+        # show_steps, exactly as the greedy code did.
+        self.fit_metrics = self.compute_metrics(images_batch, bg_map, results, 1.0)
+
         return results
 
     @partial(jit, static_argnames=["self"])
