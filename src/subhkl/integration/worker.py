@@ -140,13 +140,17 @@ def process_single_image(
 
     # 1. Find Peaks
     finder_widths = None
+    finder_deviance = None
     if algo == "sparse_rbf":
-        # (rows, cols) or (rows, cols, widths): the optional third slot is
-        # the finder's per-peak Gaussian sigma, carried through to the
-        # harvest output for --max-sigma tuning diagnostics.
+        # (rows, cols[, widths[, deviance]]): the optional third slot is the
+        # finder's per-peak Gaussian sigma, carried through to the harvest
+        # output for --max-sigma tuning diagnostics, and the fourth is the
+        # per-peak leave-one-out deviance.
         i, j = pre_coords[0], pre_coords[1]
         if len(pre_coords) > 2:
             finder_widths = np.asarray(pre_coords[2])
+        if len(pre_coords) > 3:
+            finder_deviance = np.asarray(pre_coords[3])
     elif algo == "peak_local_max":
         i, j = _run_harvest_local_max(image, **harvest_kwargs)
     elif algo == "thresholding":
@@ -189,6 +193,8 @@ def process_single_image(
     j = j[valid_indices]
     if finder_widths is not None:
         finder_widths = finder_widths[valid_indices]
+    if finder_deviance is not None:
+        finder_deviance = finder_deviance[valid_indices]
 
     # 3. Integration Setup (Sigma Override)
     # Rebuild integrator from params to avoid sharing state
@@ -219,6 +225,8 @@ def process_single_image(
     i, j = i[keep], j[keep]
     if finder_widths is not None:
         finder_widths = finder_widths[keep]
+    if finder_deviance is not None:
+        finder_deviance = finder_deviance[keep]
 
     # 6. Gather Results
     if sum(keep) > 0:
@@ -276,6 +284,13 @@ def process_single_image(
             # (the lattice path) keeps intensity sigma unchanged.
             "sigma": (
                 finder_widths.tolist() if finder_widths is not None else sigmas.tolist()
+            ),
+            # Per-peak leave-one-out deviance: the likelihood-ratio statistic
+            # for this atom's presence, on the same scale as the global
+            # Deviance/DoF report and calibrated against chi^2 with four
+            # degrees of freedom (95% point 9.49).
+            "deviance": (
+                finder_deviance.tolist() if finder_deviance is not None else [0.0] * num
             ),
             "radii": radii,
             "xyz": lab_coords.tolist(),

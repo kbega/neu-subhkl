@@ -334,6 +334,16 @@ class Peaks:
             f["peaks/sigma"] = detector_peaks.sigma
             f["peaks/radius"] = detector_peaks.radii
 
+            # Per-peak quality metric: the leave-one-out deviance, i.e. the
+            # likelihood-ratio statistic for that peak's presence in the
+            # finder's model.  Same units as the global Deviance/DoF report,
+            # calibrated against chi^2 with four degrees of freedom.  Written
+            # only when the finder supplies it.
+            if detector_peaks.deviance is not None and len(
+                detector_peaks.deviance
+            ) == len(detector_peaks.intensity):
+                f["peaks/deviance"] = detector_peaks.deviance
+
             # Use pixel coordinates exclusively
             f["peaks/pixel_r"] = detector_peaks.peak_rows
             f["peaks/pixel_c"] = detector_peaks.peak_cols
@@ -361,6 +371,7 @@ class Peaks:
         lamda_max: list[float] = []
         intensity: list[float] = []
         sigma: list[float] = []
+        deviance: list[float] = []
         radii: list[float] = []
         xyz_out: list[list[float]] = []
         banks: list[int] = []
@@ -380,6 +391,7 @@ class Peaks:
                 lamda_max.extend(res["lamda_max"])
                 intensity.extend(res["intensity"])
                 sigma.extend(res["sigma"])
+                deviance.extend(res.get("deviance", [0.0] * res["count"]))
                 radii.extend(res["radii"])
                 xyz_out.extend(res["xyz"])
                 banks.extend(res["banks"])
@@ -409,6 +421,7 @@ class Peaks:
             self.goniometer.names_raw,
             peak_rows,
             peak_cols,
+            deviance,
         )
 
         if visualize:

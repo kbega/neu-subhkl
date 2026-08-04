@@ -1477,3 +1477,88 @@ def test_dark_wall_transverse_silence_stiffness():
         f"wall stiffness not transverse: tangent {tangent:.3e} "
         f"vs transverse {transverse:.3e}"
     )
+
+
+def test_peak_deviance_is_exact_and_flags_a_spurious_atom():
+    """Per-peak leave-one-out deviance: exact, and a usable prune criterion.
+
+    ``dD_n = D(model without atom n) - D(model)`` is the likelihood-ratio
+    statistic for atom n's presence.  Two properties are pinned here.
+
+    Exactness: the statistic is defined as a sum over the whole image, and the
+    implementation sums only a (2*max_k_rad + 1)^2 window.  Because the
+    finder's atoms are identically zero outside that radius, the two sums are
+    the same number -- not an approximation to it.  The test recomputes dD by
+    brute force over every pixel and requires agreement to float32 round-off.
+
+    Discrimination: a spurious low-amplitude atom inserted into the model
+    scores below the chi^2_4 95% point (9.49) while the real peaks score
+    orders of magnitude above it, so the number can be thresholded.
+    """
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    H = W = 100
+    rng = np.random.default_rng(42)
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+
+    bg_level = 10.0
+    truth = np.full((H, W), bg_level, dtype=np.float64)
+    truth += generate_erf_peak(yy, xx, 40.0, 40.0, 6.0, 50.0)
+    truth += generate_erf_peak(yy, xx, 60.0, 60.0, 6.0, 50.0)
+    image = rng.poisson(truth).astype(np.float32)
+
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=0.5, loss="poisson", min_sigma=2.0, max_sigma=8.0
+    )
+    peaks = finder.find_peaks_batch(image[np.newaxis, ...])[0]
+    assert len(peaks) >= 2
+
+    dev = finder.peak_deviance[0]
+    assert dev.shape == (len(peaks),)
+
+    # A spurious atom: weak, wide, and sitting between the two real peaks.
+    ghost = np.array([[3.8, 49.05, 51.05, 5.07]], dtype=np.float32)
+    augmented = np.vstack([peaks, ghost])
+    bg_map = np.asarray(finder._last_bg_map)
+    dev_aug = finder.compute_peak_deviance(image[np.newaxis, ...], bg_map, [augmented])[
+        0
+    ]
+
+    # Brute force over the whole image, using the same truncated atoms.
+    rad = finder.max_k_rad
+
+    def truncated_atom(p):
+        full = generate_erf_peak(yy, xx, p[1], p[2], p[3], p[0])
+        keep = np.zeros((H, W), dtype=bool)
+        r0, c0 = int(round(float(p[1]))), int(round(float(p[2])))
+        keep[
+            max(0, r0 - rad) : min(H, r0 + rad + 1),
+            max(0, c0 - rad) : min(W, c0 + rad + 1),
+        ] = True
+        return np.where(keep, full, 0.0)
+
+    def deviance(model):
+        model = np.maximum(model, 1e-9)
+        counts = np.where(image > 0, image, 1.0)  # the y log y term vanishes at y=0
+        term = np.where(image > 0, image * np.log(counts / model), 0.0) - (
+            image - model
+        )
+        return 2.0 * float(term.sum())
+
+    atoms = [truncated_atom(p) for p in augmented]
+    total = bg_map[0].astype(np.float64) + sum(atoms)
+    d_ref = deviance(total)
+
+    for k, atom in enumerate(atoms):
+        exact = deviance(total - atom) - d_ref
+        assert np.isclose(dev_aug[k], exact, rtol=2e-4, atol=1e-2), (
+            f"atom {k}: windowed dD {dev_aug[k]:.4f} != whole-image {exact:.4f}"
+        )
+
+    chi2_4_95 = 9.49
+    assert dev_aug[-1] < chi2_4_95, f"spurious atom not flagged: dD = {dev_aug[-1]:.3f}"
+    assert max(dev_aug[:-1]) > 100.0 * chi2_4_95, (
+        f"real peaks not separated from the threshold: max dD = {max(dev_aug[:-1]):.3f}"
+    )

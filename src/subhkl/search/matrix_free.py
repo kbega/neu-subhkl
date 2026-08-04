@@ -1011,7 +1011,123 @@ class MatrixFreeSparseRBFPeakFinder:
         # show_steps, exactly as the greedy code did.
         self.fit_metrics = self.compute_metrics(images_batch, bg_map, results, 1.0)
 
+        # Per-peak counterpart of that global number: one significance value
+        # per reported atom, aligned with `results`.
+        self.peak_deviance = self.compute_peak_deviance(images_batch, bg_map, results)
+
         return results
+
+    @partial(jit, static_argnames=["self"])
+    def _peak_deviance_image(self, peaks, target, bg):
+        """Leave-one-out deviance for every atom of one image.
+
+        For each atom n this returns
+
+            dD_n = D(model without n) - D(model) = 2 sum_pix [ y log(U/U_-n) - r_n ]
+
+        with U the full model (background plus every atom), r_n atom n's own
+        contribution and U_-n = U - r_n.  That is the likelihood-ratio
+        statistic for the presence of atom n, holding the other atoms fixed,
+        and it is calibrated against chi^2 on the atom's four parameters
+        (95% point 9.49): dD well above that is a peak the data insist on,
+        dD near zero is one the data are indifferent to, and dD < 0 is an atom
+        that actively degrades the fit at its reported parameters.  It is the
+        per-peak reading of the same currency as the global Deviance/DoF, so
+        the two can be compared directly.
+
+        The sum runs over the whole image by definition, but the finder's
+        atoms are the kernel-bank atoms, which are identically zero outside a
+        radius of ``max_k_rad`` pixels; every term outside that window has
+        r_n = 0 and so contributes exactly nothing.  Summing over the window
+        is therefore not a 3-sigma approximation to the image-wide sum, it *is*
+        the image-wide sum for this model, at a cost of (2 max_k_rad + 1)^2
+        pixels per peak instead of H*W.
+        """
+        R = self.max_k_rad
+        d = jnp.arange(-R, R + 1)
+        dy, dx = jnp.meshgrid(d, d, indexing="ij")
+
+        amp = peaks[:, 0][:, None, None]
+        r_c = peaks[:, 1][:, None, None]
+        c_c = peaks[:, 2][:, None, None]
+        sig = peaks[:, 3][:, None, None]
+
+        H, W = target.shape
+        ri = jnp.round(r_c).astype(jnp.int32) + dy[None]
+        ci = jnp.round(c_c).astype(jnp.int32) + dx[None]
+        inside = (ri >= 0) & (ri < H) & (ci >= 0) & (ci < W)
+        ri_c = jnp.clip(ri, 0, H - 1)
+        ci_c = jnp.clip(ci, 0, W - 1)
+
+        # Same pixel-integrated Gaussian the forward operator applies, at the
+        # atom's refined (sub-pixel) centre and width.
+        sig_sq2 = sig * jnp.sqrt(2.0) + 1e-6
+        erf_y = jax.scipy.special.erf(
+            (ri - r_c + 0.5) / sig_sq2
+        ) - jax.scipy.special.erf((ri - r_c - 0.5) / sig_sq2)
+        erf_x = jax.scipy.special.erf(
+            (ci - c_c + 0.5) / sig_sq2
+        ) - jax.scipy.special.erf((ci - c_c - 0.5) / sig_sq2)
+        r_n = amp * (jnp.pi / 2.0) * (sig**2) * erf_y * erf_x
+        r_n = jnp.where(inside & (amp > 0), r_n, 0.0)
+
+        # Model image assembled from those same truncated atoms, so that the
+        # U appearing in the window is consistent with the r_n subtracted from
+        # it -- including the tails of *other* atoms reaching into the window.
+        model = jnp.zeros((H, W), dtype=r_n.dtype).at[ri_c, ci_c].add(r_n)
+        u_full = jnp.maximum(bg + model, 1e-9)
+
+        u_win = u_full[ri_c, ci_c]
+        u_minus = jnp.maximum(u_win - r_n, 1e-9)
+        y_win = target[ri_c, ci_c]
+
+        return 2.0 * jnp.sum(y_win * jnp.log(u_win / u_minus) - r_n, axis=(1, 2))
+
+    def compute_peak_deviance(self, images_raw, bg_map, peaks_list):
+        """Per-peak leave-one-out deviance, one array per image.
+
+        See ``_peak_deviance_image`` for the statistic.  A companion number
+        worth having later is the *local residual* deviance per degree of
+        freedom over the same window, which answers the complementary question
+        -- "is this neighbourhood well modelled?", the width-mismatch and
+        missed-neighbour detector -- rather than "is this atom real?".  One
+        number is enough to report and to tune against for now.
+        """
+        B = images_raw.shape[0]
+        max_k = max([len(p) for p in peaks_list] + [1])
+
+        # Pad to a single shape so the batch compiles once; padded rows carry
+        # zero amplitude and drop out of the statistic.
+        peaks_padded = np.zeros((B, max_k, 4), dtype=np.float32)
+        for b in range(B):
+            n = len(peaks_list[b])
+            if n > 0:
+                peaks_padded[b, :n, :] = peaks_list[b]
+            peaks_padded[b, n:, 3] = 1.0
+
+        out = []
+        for b in range(B):
+            n = len(peaks_list[b])
+            if n == 0:
+                out.append(np.zeros(0, dtype=np.float32))
+                continue
+            dev = self._peak_deviance_image(
+                jnp.asarray(peaks_padded[b]),
+                jnp.asarray(images_raw[b]),
+                jnp.asarray(bg_map[b]),
+            )
+            out.append(np.asarray(dev)[:n].astype(np.float32))
+
+        if self.show_steps:
+            flat = np.concatenate(out) if any(len(o) for o in out) else np.zeros(0)
+            if flat.size:
+                weak = int(np.count_nonzero(flat < 9.49))
+                print(
+                    f"  > Peak deviance: median {np.median(flat):.3g}, "
+                    f"{weak}/{flat.size} below the chi^2_4 95% point (9.49)"
+                )
+
+        return out
 
     @partial(jit, static_argnames=["self"])
     def _predict_batch_scan(self, peaks, x_grid):
