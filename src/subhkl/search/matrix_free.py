@@ -130,10 +130,63 @@ class MatrixFreeSparseRBFPeakFinder:
 
         kernels_2d = vmap(build_one)(self.sigmas)
         sq_norms = jnp.sum(kernels_2d**2, axis=(1, 2))
+
+        # Separable factorization.  The pixel-integrated Gaussian is an exact
+        # outer product, k_2d = (pi/2) s^2 * e1 (x) e1 with e1 the 1D erf
+        # profile, and so is its square.  Two 1D depthwise passes therefore
+        # apply the *identical* operator at (2r+1)+(2r+1) taps instead of
+        # (2r+1)^2 -- a ~15x FLOP reduction at max_sigma = 5 -- differing
+        # from the dense path only by floating-point reassociation.
+        sig_sq2 = self.sigmas * jnp.sqrt(2.0) + 1e-6
+        g = k_grid[None, :]
+        e1 = jax.scipy.special.erf(
+            (g + 0.5) / sig_sq2[:, None]
+        ) - jax.scipy.special.erf((g - 0.5) / sig_sq2[:, None])  # [K, taps]
+        amp = (jnp.pi / 2.0) * self.sigmas**2
+        self._rows_w = (amp[:, None] * e1)[:, None, :, None]  # [K,1,taps,1]
+        self._cols_w = e1[:, None, None, :]  # [K,1,1,taps]
+        self._rows_sq = ((amp**2)[:, None] * e1**2)[:, None, :, None]
+        self._cols_sq = (e1**2)[:, None, None, :]
+        self.use_separable = True
+
         return kernels_2d[:, None, :, :], sq_norms
 
     @staticmethod
-    def _forward_op(c, weights):
+    def _sep_depthwise(x, rows, cols):
+        """Two 1D depthwise passes; rows [K,1,t,1], cols [K,1,1,t]."""
+        K = rows.shape[0]
+        y = lax.conv_general_dilated(
+            x,
+            rows,
+            window_strides=(1, 1),
+            padding="SAME",
+            dimension_numbers=("NCHW", "OIHW", "NCHW"),
+            feature_group_count=K,
+        )
+        return lax.conv_general_dilated(
+            y,
+            cols,
+            window_strides=(1, 1),
+            padding="SAME",
+            dimension_numbers=("NCHW", "OIHW", "NCHW"),
+            feature_group_count=K,
+        )
+
+    def _sep_factors(self, weights):
+        """Trace-time dispatch: identify which bank `weights` is."""
+        if not getattr(self, "use_separable", False):
+            return None
+        if weights is self.K_weights:
+            return self._rows_w, self._cols_w
+        if weights is self.K_sq:
+            return self._rows_sq, self._cols_sq
+        return None
+
+    def _forward_op(self, c, weights):
+        factors = self._sep_factors(weights)
+        if factors is not None:
+            filtered = self._sep_depthwise(c, *factors)
+            return jnp.sum(filtered, axis=1, keepdims=True)
         weights_fwd = weights.transpose(1, 0, 2, 3)
         return lax.conv_general_dilated(
             c,
@@ -143,8 +196,12 @@ class MatrixFreeSparseRBFPeakFinder:
             dimension_numbers=("NCHW", "OIHW", "NCHW"),
         )
 
-    @staticmethod
-    def _adjoint_op(u, weights):
+    def _adjoint_op(self, u, weights):
+        factors = self._sep_factors(weights)
+        if factors is not None:
+            K = weights.shape[0]
+            tiled = jnp.broadcast_to(u, u.shape[:1] + (K,) + u.shape[2:])
+            return self._sep_depthwise(tiled, *factors)
         return lax.conv_general_dilated(
             u,
             weights,
