@@ -139,8 +139,14 @@ def process_single_image(
     det = Detector(det_config)
 
     # 1. Find Peaks
+    finder_widths = None
     if algo == "sparse_rbf":
-        i, j = pre_coords
+        # (rows, cols) or (rows, cols, widths): the optional third slot is
+        # the finder's per-peak Gaussian sigma, carried through to the
+        # harvest output for --max-sigma tuning diagnostics.
+        i, j = pre_coords[0], pre_coords[1]
+        if len(pre_coords) > 2:
+            finder_widths = np.asarray(pre_coords[2])
     elif algo == "peak_local_max":
         i, j = _run_harvest_local_max(image, **harvest_kwargs)
     elif algo == "thresholding":
@@ -181,6 +187,8 @@ def process_single_image(
     centers = centers[valid_indices]
     i = i[valid_indices]
     j = j[valid_indices]
+    if finder_widths is not None:
+        finder_widths = finder_widths[valid_indices]
 
     # 3. Integration Setup (Sigma Override)
     # Rebuild integrator from params to avoid sharing state
@@ -209,6 +217,8 @@ def process_single_image(
 
     # Keep integrated centers centers for finder
     i, j = i[keep], j[keep]
+    if finder_widths is not None:
+        finder_widths = finder_widths[keep]
 
     # 6. Gather Results
     if sum(keep) > 0:
@@ -259,7 +269,14 @@ def process_single_image(
             "lamda_min": [wl_min] * num,
             "lamda_max": [wl_max] * num,
             "intensity": intensities.tolist(),
-            "sigma": sigmas.tolist(),
+            # Redefined at the finding stage: no intensity is measured here,
+            # so peaks/sigma carries the finder's per-peak Gaussian width
+            # (for --max-sigma tuning diagnostics) instead of the
+            # integrator's intensity sigma.  The integration-stage output
+            # (the lattice path) keeps intensity sigma unchanged.
+            "sigma": (
+                finder_widths.tolist() if finder_widths is not None else sigmas.tolist()
+            ),
             "radii": radii,
             "xyz": lab_coords.tolist(),
             "banks": [physical_bank] * num,

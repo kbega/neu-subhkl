@@ -171,11 +171,14 @@ def prepare_harvest_tasks(
         pre_coords = None
         if finder_algorithm == "sparse_rbf":
             coords = precomputed_peaks[img_key]
-            # coords shape is [intensity, r, c, sigma]
+            # coords shape is [intensity, r, c, sigma].  The third slot of
+            # pre_coords carries the finder's per-peak Gaussian width so the
+            # harvest output can record it (peaks/sigma) for --max-sigma
+            # tuning diagnostics.
             if len(coords) > 0:
-                pre_coords = (coords[:, 1], coords[:, 2])
+                pre_coords = (coords[:, 1], coords[:, 2], coords[:, 3])
             else:
-                pre_coords = (np.array([]), np.array([]))
+                pre_coords = (np.array([]), np.array([]), np.array([]))
 
         finder_info = (finder_algorithm, harvest_peaks_kwargs, pre_coords)
         mask_info = (
