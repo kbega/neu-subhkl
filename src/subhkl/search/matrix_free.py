@@ -1105,15 +1105,20 @@ class MatrixFreeSparseRBFPeakFinder:
         # show_steps, exactly as the greedy code did.
         self.fit_metrics = self.compute_metrics(images_batch, bg_map, results, 1.0)
 
-        # Per-peak counterpart of that global number: one significance value
-        # per reported atom, aligned with `results`.
-        self.peak_deviance = self.compute_peak_deviance(images_batch, bg_map, results)
+        # Per-peak counterpart of that global number: two values per reported
+        # atom, aligned with `results`.  They answer different questions and
+        # neither substitutes for the other; see `compute_peak_metrics`.
+        self.peak_deviance, self.peak_residual_deviance = self.compute_peak_metrics(
+            images_batch, bg_map, results
+        )
 
         return results
 
     @partial(jit, static_argnames=["self"])
-    def _peak_deviance_image(self, peaks, target, bg):
-        """Leave-one-out deviance for every atom of one image.
+    def _peak_metrics_image(self, peaks, target, bg):
+        """Leave-one-out and local residual deviance for every atom of one image.
+
+        **Leave-one-out deviance.**
 
         For each atom n this returns
 
@@ -1136,6 +1141,47 @@ class MatrixFreeSparseRBFPeakFinder:
         is therefore not a 3-sigma approximation to the image-wide sum, it *is*
         the image-wide sum for this model, at a cost of (2 max_k_rad + 1)^2
         pixels per peak instead of H*W.
+
+        **Local residual deviance.**
+
+        dD says whether an atom is carrying real signal; it says almost
+        nothing about whether it is carrying it *correctly*.  An atom fitted
+        with too large a sigma still explains a great deal of density, so
+        removing it still costs a great deal: on a sigma = 2 peak, dD reads
+        26154 at the true width and still 15364 at sigma = 6, a factor of 1.7
+        where the width is wrong by a factor of 3.  Every one of those passes
+        any significance cut.
+
+        The residual deviance answers the complementary question -- is this
+        neighbourhood explained? -- by summing the goodness-of-fit deviance of
+        the *fitted* model over the atom's own footprint,
+
+            D_res,n / dof = sum_{|x - x_n| <= 3 sigma_n} 2 [ y log(y/U) - (y - U) ]
+                            / (n_window - 4),
+
+        with U the full model again, so a neighbour's tails and any unmodelled
+        background count against the atom sitting in them.  This is calibrated
+        the same way the global Deviance/DoF is: near 1 for a model that fits,
+        above 1 for structure left behind.  On the same sigma = 2 peak it reads
+        1.06 at the true width against 19.1 at sigma = 1.5 and 9.5 at
+        sigma = 3, and on a genuinely broad sigma = 5 peak it reads 0.93 at
+        sigma = 5 and 62.8 at sigma = 3 -- so it tracks whether the width is
+        *right*, not whether it is large.
+
+        Two caveats, both measured on Poisson nulls with an exact model.  The
+        statistic carries a mild positive bias at low count rates -- E[D/dof]
+        is 1.04 at 10 counts/pixel, 1.19 at 1 count/pixel, with a spread of
+        about 0.15 -- so 1.2 is the null there, not 1.0.  Below roughly 0.5
+        counts/pixel it breaks down in the other direction (0.49 at 0.1
+        counts/pixel): almost every pixel is empty, the deviance has nothing
+        to test, and a low value stops meaning a good fit.  Read it as a fit
+        diagnostic only where the background is counted rather than dark.
+
+        The 3-sigma footprint is a choice, not an identity -- unlike the dD
+        window there is nothing exact to preserve here, and the alternative of
+        using the full kernel box dilutes the signal badly (4.0 rather than
+        116.8 on the sigma = 1 case above) because it averages the mismatch
+        against a large annulus of pure background.
         """
         R = self.max_k_rad
         d = jnp.arange(-R, R + 1)
@@ -1175,17 +1221,31 @@ class MatrixFreeSparseRBFPeakFinder:
         u_minus = jnp.maximum(u_win - r_n, 1e-9)
         y_win = target[ri_c, ci_c]
 
-        return 2.0 * jnp.sum(y_win * jnp.log(u_win / u_minus) - r_n, axis=(1, 2))
+        loo = 2.0 * jnp.sum(y_win * jnp.log(u_win / u_minus) - r_n, axis=(1, 2))
 
-    def compute_peak_deviance(self, images_raw, bg_map, peaks_list):
-        """Per-peak leave-one-out deviance, one array per image.
+        # Residual deviance over the atom's own 3-sigma footprint, clipped to
+        # the kernel box that is actually gathered above.
+        radius = jnp.minimum(3.0 * sig, float(R))
+        foot = inside & (amp > 0) & ((ri - r_c) ** 2 + (ci - c_c) ** 2 <= radius**2)
+        y_safe = jnp.maximum(y_win, 1.0)  # the y log y term vanishes at y = 0
+        dev_pix = 2.0 * (
+            jnp.where(y_win > 0, y_win * jnp.log(y_safe / u_win), 0.0) - (y_win - u_win)
+        )
+        n_foot = jnp.sum(foot, axis=(1, 2))
+        dof = jnp.maximum(n_foot - 4, 1)
+        resid = jnp.sum(jnp.where(foot, dev_pix, 0.0), axis=(1, 2)) / dof
 
-        See ``_peak_deviance_image`` for the statistic.  A companion number
-        worth having later is the *local residual* deviance per degree of
-        freedom over the same window, which answers the complementary question
-        -- "is this neighbourhood well modelled?", the width-mismatch and
-        missed-neighbour detector -- rather than "is this atom real?".  One
-        number is enough to report and to tune against for now.
+        return loo, resid
+
+    def compute_peak_metrics(self, images_raw, bg_map, peaks_list):
+        """Per-peak quality metrics: (leave-one-out, residual), one array each
+        per image.
+
+        The two are complementary and a peak needs both to be trusted: a high
+        dD with a residual near 1 is a real peak, well fitted; a high dD with a
+        large residual is a real peak fitted with the wrong shape (a mis-sized
+        sigma, or a neighbour it has swallowed); a dD near or below zero is an
+        atom the data do not support at all.  See ``_peak_metrics_image``.
         """
         B = images_raw.shape[0]
         max_k = max([len(p) for p in peaks_list] + [1])
@@ -1199,29 +1259,40 @@ class MatrixFreeSparseRBFPeakFinder:
                 peaks_padded[b, :n, :] = peaks_list[b]
             peaks_padded[b, n:, 3] = 1.0
 
-        out = []
+        out, out_res = [], []
         for b in range(B):
             n = len(peaks_list[b])
             if n == 0:
                 out.append(np.zeros(0, dtype=np.float32))
+                out_res.append(np.zeros(0, dtype=np.float32))
                 continue
-            dev = self._peak_deviance_image(
+            dev, resid = self._peak_metrics_image(
                 jnp.asarray(peaks_padded[b]),
                 jnp.asarray(images_raw[b]),
                 jnp.asarray(bg_map[b]),
             )
             out.append(np.asarray(dev)[:n].astype(np.float32))
+            out_res.append(np.asarray(resid)[:n].astype(np.float32))
 
         if self.show_steps:
             flat = np.concatenate(out) if any(len(o) for o in out) else np.zeros(0)
+            flat_res = (
+                np.concatenate(out_res) if any(len(o) for o in out_res) else np.zeros(0)
+            )
             if flat.size:
                 weak = int(np.count_nonzero(flat < 9.49))
+                misfit = int(np.count_nonzero(flat_res > 2.0))
                 print(
                     f"  > Peak deviance: median {np.median(flat):.3g}, "
                     f"{weak}/{flat.size} below the chi^2_4 95% point (9.49)"
                 )
+                print(
+                    f"  > Peak residual deviance/DoF: median "
+                    f"{np.median(flat_res):.3g}, {misfit}/{flat_res.size} above 2 "
+                    f"(shape mismatch; target ~ 1)"
+                )
 
-        return out
+        return out, out_res
 
     @partial(jit, static_argnames=["self"])
     def _predict_batch_scan(self, peaks, x_grid):

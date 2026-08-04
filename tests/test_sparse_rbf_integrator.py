@@ -1517,14 +1517,15 @@ def test_peak_deviance_is_exact_and_flags_a_spurious_atom():
 
     dev = finder.peak_deviance[0]
     assert dev.shape == (len(peaks),)
+    assert finder.peak_residual_deviance[0].shape == (len(peaks),)
 
     # A spurious atom: weak, wide, and sitting between the two real peaks.
     ghost = np.array([[3.8, 49.05, 51.05, 5.07]], dtype=np.float32)
     augmented = np.vstack([peaks, ghost])
     bg_map = np.asarray(finder._last_bg_map)
-    dev_aug = finder.compute_peak_deviance(image[np.newaxis, ...], bg_map, [augmented])[
+    dev_aug = finder.compute_peak_metrics(image[np.newaxis, ...], bg_map, [augmented])[
         0
-    ]
+    ][0]
 
     # Brute force over the whole image, using the same truncated atoms.
     rad = finder.max_k_rad
@@ -1562,3 +1563,78 @@ def test_peak_deviance_is_exact_and_flags_a_spurious_atom():
     assert max(dev_aug[:-1]) > 100.0 * chi2_4_95, (
         f"real peaks not separated from the threshold: max dD = {max(dev_aug[:-1]):.3f}"
     )
+
+
+def test_residual_deviance_flags_a_mis_sized_width():
+    """The residual deviance sees a wrong sigma; the leave-one-out one does not.
+
+    An atom fitted with too large a width still explains a great deal of
+    density, so leaving it out still costs a great deal: dD stays enormous and
+    passes any significance cut.  The local residual deviance per degree of
+    freedom over the atom's own footprint is calibrated near 1 for a model that
+    fits and rises sharply when the shape is wrong, in either direction.
+
+    The amplitudes here are Poisson maximum-likelihood fits at each trial
+    width, so the comparison is between best-possible fits of the wrong shape
+    and the right one -- not a handicap given to the mis-sized atoms.
+    """
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    H = W = 80
+    bg_level = 10.0
+    r0 = c0 = 40.0
+    sig_true, amp_true = 2.0, 300.0
+
+    rng = np.random.default_rng(7)
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    truth = np.full((H, W), bg_level, dtype=np.float64)
+    truth += generate_erf_peak(yy, xx, r0, c0, sig_true, amp_true)
+    image = rng.poisson(truth).astype(np.float32)
+
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=0.5, loss="poisson", min_sigma=1.0, max_sigma=8.0
+    )
+    bg_map = np.full((1, H, W), bg_level, dtype=np.float32)
+
+    def mle_amplitude(shape):
+        """Poisson MLE amplitude for a fixed shape, by Newton on the score."""
+        a = max(1e-6, float((image - bg_level).sum() / max(shape.sum(), 1e-9)))
+        for _ in range(60):
+            u = np.maximum(bg_level + a * shape, 1e-9)
+            grad = float(np.sum(shape * (1.0 - image / u)))
+            curv = float(np.sum(shape**2 * image / u**2))
+            step = grad / max(curv, 1e-12)
+            a = max(1e-9, a - step)
+            if abs(step) < 1e-12:
+                break
+        return a
+
+    scored = {}
+    for sig_fit in (1.0, 2.0, 4.0, 6.0):
+        shape = generate_erf_peak(yy, xx, r0, c0, sig_fit, 1.0)
+        peak = np.array([[mle_amplitude(shape), r0, c0, sig_fit]], dtype=np.float32)
+        loo, resid = finder.compute_peak_metrics(image[np.newaxis, ...], bg_map, [peak])
+        scored[sig_fit] = (float(loo[0][0]), float(resid[0][0]))
+
+    # The leave-one-out deviance cannot tell these apart: every width, right or
+    # wrong by a factor of three, is overwhelmingly "significant".
+    for sig_fit, (loo, _) in scored.items():
+        assert loo > 1e4, f"sigma {sig_fit}: dD unexpectedly small ({loo:.1f})"
+    spread = max(v[0] for v in scored.values()) / min(v[0] for v in scored.values())
+    assert spread < 3.0, (
+        f"dD separates widths better than expected (spread {spread:.1f}x); "
+        "this test's premise needs revisiting"
+    )
+
+    # The residual deviance does tell them apart, and is calibrated near 1 at
+    # the true width.  The null carries a mild positive bias at these count
+    # rates, so 2.0 is a comfortable pass mark rather than 1.0 exactly.
+    assert scored[sig_true][1] < 2.0, (
+        f"correct width scores badly: {scored[sig_true][1]:.3f}"
+    )
+    for sig_fit in (1.0, 4.0, 6.0):
+        assert scored[sig_fit][1] > 5.0, (
+            f"mis-sized width sigma={sig_fit} not flagged: {scored[sig_fit][1]:.3f}"
+        )

@@ -141,16 +141,20 @@ def process_single_image(
     # 1. Find Peaks
     finder_widths = None
     finder_deviance = None
+    finder_residual = None
     if algo == "sparse_rbf":
-        # (rows, cols[, widths[, deviance]]): the optional third slot is the
-        # finder's per-peak Gaussian sigma, carried through to the harvest
-        # output for --max-sigma tuning diagnostics, and the fourth is the
-        # per-peak leave-one-out deviance.
+        # (rows, cols[, widths[, deviance[, residual]]]): the optional third
+        # slot is the finder's per-peak Gaussian sigma, carried through to the
+        # harvest output for --max-sigma tuning diagnostics, the fourth is the
+        # per-peak leave-one-out deviance and the fifth its local residual
+        # deviance per degree of freedom.
         i, j = pre_coords[0], pre_coords[1]
         if len(pre_coords) > 2:
             finder_widths = np.asarray(pre_coords[2])
         if len(pre_coords) > 3:
             finder_deviance = np.asarray(pre_coords[3])
+        if len(pre_coords) > 4:
+            finder_residual = np.asarray(pre_coords[4])
     elif algo == "peak_local_max":
         i, j = _run_harvest_local_max(image, **harvest_kwargs)
     elif algo == "thresholding":
@@ -195,6 +199,8 @@ def process_single_image(
         finder_widths = finder_widths[valid_indices]
     if finder_deviance is not None:
         finder_deviance = finder_deviance[valid_indices]
+    if finder_residual is not None:
+        finder_residual = finder_residual[valid_indices]
 
     # 3. Integration Setup (Sigma Override)
     # Rebuild integrator from params to avoid sharing state
@@ -227,6 +233,8 @@ def process_single_image(
         finder_widths = finder_widths[keep]
     if finder_deviance is not None:
         finder_deviance = finder_deviance[keep]
+    if finder_residual is not None:
+        finder_residual = finder_residual[keep]
 
     # 6. Gather Results
     if sum(keep) > 0:
@@ -291,6 +299,15 @@ def process_single_image(
             # degrees of freedom (95% point 9.49).
             "deviance": (
                 finder_deviance.tolist() if finder_deviance is not None else [0.0] * num
+            ),
+            # Local residual deviance per degree of freedom over the atom's own
+            # 3-sigma footprint: near 1 where the model explains the
+            # neighbourhood, well above 1 where it does not -- a mis-sized
+            # sigma, a swallowed neighbour, unmodelled background.  The
+            # deviance above cannot see any of that: it stays large for a
+            # badly shaped atom that still carries real signal.
+            "residual_deviance": (
+                finder_residual.tolist() if finder_residual is not None else [0.0] * num
             ),
             "radii": radii,
             "xyz": lab_coords.tolist(),
