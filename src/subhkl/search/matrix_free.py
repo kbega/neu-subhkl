@@ -555,8 +555,18 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return c_l1[0]
 
-    @partial(jit, static_argnames=["self", "border", "capacity"])
-    def _extract_peaks(self, c_tensor, border=0, capacity=256):
+    @partial(jit, static_argnames=["self", "border"])
+    def _rank_support(self, c_tensor, border=0):
+        """Rank the significance-gated support of one image, capacity-free.
+
+        Everything here is independent of how many peaks there are -- the
+        smoothing, the local-maximum test, and the full argsort all have
+        shapes fixed by the image alone -- so this compiles exactly once per
+        image shape no matter how large the support turns out to be.  Returns
+        the descending coefficient order over the flattened image and the
+        exact support count; the capacity-dependent work (measuring and
+        refining candidates) happens downstream in fixed-size chunks.
+        """
         c_tot = jnp.sum(c_tensor, axis=0)  # [H, W]
 
         # Smooth the discrete L1 coefficients to recover true continuous center
@@ -602,22 +612,27 @@ class MatrixFreeSparseRBFPeakFinder:
 
         c_flat = jnp.where(is_max.flatten(), c_smooth.flatten(), -1.0)
 
-        # `capacity` is a round size, not a criterion.  jit needs a static
-        # shape here, so some bound on the slice is unavoidable -- but a bound
-        # that binds would silently truncate by coefficient magnitude, which is
-        # not the selection rule of this finder.  The caller therefore re-runs
-        # extraction with doubled capacity whenever every slot comes back
-        # valid, so no admission decision is ever made by this slice; the only
-        # criterion is the significance gate above.
-        top_indices = jnp.argsort(c_flat)[::-1][:capacity]
-        valid_mask = c_flat[top_indices] > 0.0
+        # Full descending order plus the exact support count.  Every support
+        # maximum is strictly positive and every non-maximum slot is -1, so
+        # the first `count` entries of `order` are exactly the support --
+        # membership in it is the alpha test, and no cap or epsilon takes part
+        # in the decision.
+        order = jnp.argsort(c_flat)[::-1]
+        return order, jnp.sum(is_max)
+
+    @partial(jit, static_argnames=["self"])
+    def _measure_candidates(self, c_tensor, idx):
+        """Read (amplitude, row, column, sigma) for one fixed-size chunk of
+        ranked candidate indices.  Shapes depend only on the image and the
+        chunk length, never on the support size, so this compiles once."""
+        H, W = c_tensor.shape[1], c_tensor.shape[2]
 
         def process_peak(idx):
-            r = idx // c_smooth.shape[1]
-            c = idx % c_smooth.shape[1]
+            r = idx // W
+            c = idx % W
 
-            r_safe = jnp.clip(r, 1, c_smooth.shape[0] - 2)
-            c_safe = jnp.clip(c, 1, c_smooth.shape[1] - 2)
+            r_safe = jnp.clip(r, 1, H - 2)
+            c_safe = jnp.clip(c, 1, W - 2)
 
             # Extract 3x3 patch to integrate splintered coefficients
             c_patch = lax.dynamic_slice(
@@ -668,34 +683,119 @@ class MatrixFreeSparseRBFPeakFinder:
 
             return jnp.array([amp_eff, r_cont, c_cont, sigma_eff])
 
-        extracted = vmap(process_peak)(top_indices)
-        return extracted, valid_mask
+        return vmap(process_peak)(idx)
 
-    def _extract_peaks_all(self, c_tensor, border=0):
-        """Extract the *entire* significance-gated support of one image.
+    @partial(jit, static_argnames=["self"])
+    def _render_atoms(self, y_img, peaks, active):
+        """Render one chunk of atoms into an [H, W] image, boxes clipped at
+        the borders exactly as ``_refine_peaks`` renders them."""
+        H, W = y_img.shape
+        P = 2 * self.max_k_rad + 1
+        off = jnp.arange(P, dtype=jnp.float32)
+
+        finite = jnp.all(jnp.isfinite(peaks), axis=1) & active
+        amp = jnp.where(finite, peaks[:, 0], 0.0)
+        r = jnp.where(finite, peaks[:, 1], float(self.max_k_rad))
+        c = jnp.where(finite, peaks[:, 2], float(self.max_k_rad))
+        sig = jnp.where(finite, peaks[:, 3], float(self.min_sigma))
+
+        s2 = sig * jnp.sqrt(2.0) + 1e-6
+        r0 = jnp.clip(jnp.round(r).astype(jnp.int32) - self.max_k_rad, 0, H - P)
+        c0 = jnp.clip(jnp.round(c).astype(jnp.int32) - self.max_k_rad, 0, W - P)
+        rr = r0[:, None].astype(jnp.float32) + off[None, :]
+        cc = c0[:, None].astype(jnp.float32) + off[None, :]
+
+        def erf_span(grid, centre):
+            d = grid - centre[:, None]
+            return jax.scipy.special.erf(
+                (d + 0.5) / s2[:, None]
+            ) - jax.scipy.special.erf((d - 0.5) / s2[:, None])
+
+        ey = erf_span(rr, r)
+        ex = erf_span(cc, c)
+        amp_s = amp * (jnp.pi / 2.0) * (sig**2)
+        patch = amp_s[:, None, None] * ey[:, :, None] * ex[:, None, :]
+
+        idx_r = jnp.broadcast_to(
+            (r0[:, None] + jnp.arange(P))[:, :, None], (peaks.shape[0], P, P)
+        )
+        idx_c = jnp.broadcast_to(
+            (c0[:, None] + jnp.arange(P))[:, None, :], (peaks.shape[0], P, P)
+        )
+        return jnp.zeros((H, W)).at[idx_r, idx_c].add(patch)
+
+    # Fixed chunk length for the capacity-dependent stages.  This is a tile
+    # size, not a limit: the number of chunks grows with the support while
+    # every jitted shape stays constant, so nothing recompiles however many
+    # peaks an image carries, and per-chunk memory is bounded (the refinement
+    # working set is O(chunk * patch^2) rather than O(support * patch^2)).
+    EXTRACT_CHUNK = 256
+
+    def _extract_peaks_all(self, c_tensor, y_img, bg_img, border=0):
+        """Extract and refine the *entire* significance-gated support.
 
         The admission criterion is support membership alone: the prox step
         soft-thresholds at ``alpha`` standard deviations of coefficient noise,
         so a coefficient is nonzero exactly when it cleared the significance
-        level, and ``_extract_peaks`` admits every positive local maximum of
-        that support.  No count cap and no epsilon takes part in the decision.
+        level, and every positive local maximum of that support is admitted.
+        No count cap and no epsilon takes part in the decision.
 
-        jit still needs a static output shape, so extraction runs in rounds:
-        if every slot of the current capacity comes back valid, the round is
-        rerun at double the capacity until the valid count is strictly below
-        it, which proves the support was exhausted.  The starting capacity is
-        arbitrary -- it determines which power-of-two compile buckets get
-        touched, never which peaks are returned.  Termination is guaranteed
-        because the number of local maxima is bounded by the pixel count.
+        jit needs static shapes, so the work is transposed rather than sized:
+        the capacity-independent stages (smoothing, maximum test, full sort)
+        run once with image-fixed shapes in ``_rank_support``, and the
+        capacity-dependent stages (candidate measurement, refinement) sweep
+        the ranked support in fixed-length chunks.  Each jitted function
+        therefore compiles exactly once per image shape; a larger support
+        means more chunk iterations, never a new compilation.  The earlier
+        capacity-doubling ladder recompiled the sort and the 200-step
+        refinement at every rung -- the largest graphs in the finder, twice
+        over.
+
+        Refinement stays a minimisation of the one joint Poisson NLL: the
+        atoms outside the chunk being refined are frozen and rendered into
+        that chunk's background, which is exact block-coordinate descent on
+        the joint objective (one sweep, strongest block first).  When the
+        whole support fits a single chunk -- the common case -- this is
+        bit-identical to refining everything jointly.
+
+        Returns the valid peaks only, [n, 4], already mask-applied.
         """
-        capacity = 256
-        while True:
-            peaks_padded, valid_mask = self._extract_peaks(
-                c_tensor, border=border, capacity=capacity
-            )
-            if int(np.asarray(valid_mask).sum()) < capacity:
-                return peaks_padded, valid_mask
-            capacity *= 2
+        order, count = self._rank_support(c_tensor, border=border)
+        n = int(count)
+        if n == 0:
+            return np.zeros((0, 4), dtype=np.float32)
+
+        chunk = self.EXTRACT_CHUNK
+        n_chunks = -(-n // chunk)
+        # The order vector has H*W entries and a 3x3-window maximum occupies
+        # at least a 2x2 cell, so n_chunks*chunk <= n + chunk - 1 << H*W and
+        # this slice never truncates.
+        order_np = np.asarray(order[: n_chunks * chunk])
+
+        peaks_chunks = []
+        masks = []
+        for k in range(n_chunks):
+            idx = jnp.asarray(order_np[k * chunk : (k + 1) * chunk])
+            peaks_chunks.append(self._measure_candidates(c_tensor, idx))
+            masks.append(np.arange(k * chunk, (k + 1) * chunk) < n)
+
+        if self.refine_positions:
+            renders = [
+                self._render_atoms(y_img, p, jnp.asarray(m))
+                for p, m in zip(peaks_chunks, masks)
+            ]
+            total = renders[0]
+            for rimg in renders[1:]:
+                total = total + rimg
+            refined = []
+            for p, m, rimg in zip(peaks_chunks, masks, renders):
+                bg_eff = bg_img + (total - rimg)
+                refined.append(self._refine_peaks(y_img, bg_eff, p, jnp.asarray(m)))
+            peaks_chunks = refined
+
+        peaks_all = np.concatenate([np.asarray(p) for p in peaks_chunks])
+        mask_all = np.concatenate(masks)
+        return peaks_all[mask_all].astype(np.float32)
 
     @partial(jit, static_argnames=["self", "n_steps"])
     def _refine_peaks(self, y_img, bg_img, peaks, active, n_steps=200):
@@ -969,21 +1069,15 @@ class MatrixFreeSparseRBFPeakFinder:
             c_tensors = solve_batch(images_padded[start:stop], bg_padded[start:stop])
 
             for i in range(start, stop):
-                peaks_padded, valid_mask = self._extract_peaks_all(
-                    c_tensors[i - start], border=pad_y + MARGIN
+                # Extraction and sliding refinement in one chunked sweep; the
+                # coordinates still match the padded image the model is
+                # rendered on, and only the valid rows come back.
+                valid_peaks = self._extract_peaks_all(
+                    c_tensors[i - start],
+                    images_padded[i],
+                    bg_padded[i],
+                    border=pad_y + MARGIN,
                 )
-
-                # Slide the selected support off the grid before un-padding, while
-                # the coordinates still match the image the model is rendered on.
-                if self.refine_positions:
-                    peaks_padded = self._refine_peaks(
-                        images_padded[i], bg_padded[i], peaks_padded, valid_mask
-                    )
-
-                peaks_np = np.array(peaks_padded)
-                mask_np = np.array(valid_mask)
-
-                valid_peaks = peaks_np[mask_np]
 
                 valid_peaks[:, 1] -= pad_y
                 valid_peaks[:, 2] -= pad_x

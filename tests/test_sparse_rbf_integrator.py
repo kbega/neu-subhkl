@@ -1640,19 +1640,20 @@ def test_residual_deviance_flags_a_mis_sized_width():
         )
 
 
-def test_extraction_returns_full_support_beyond_any_round_size():
+def test_extraction_returns_full_support_beyond_any_chunk_size():
     """No constant caps how many peaks extraction can admit.
 
     The admission criterion is support membership (the coefficient cleared the
-    alpha soft-threshold, so it is strictly positive); the static-shape slice
-    inside ``_extract_peaks`` is a round size that the caller doubles until the
-    valid count falls below it.  This plants far more support maxima than one
-    round holds (900 > 512 = 2 rounds of doubling from 256) and requires every
-    one of them back -- under the old hardcoded MAX_PEAKS = 100 this returns
-    100 peaks, silently ranked by magnitude.
+    alpha soft-threshold, so it is strictly positive).  The capacity-dependent
+    stages sweep the ranked support in fixed EXTRACT_CHUNK-length tiles, so a
+    support larger than any number of tiles still comes back complete and no
+    jitted shape ever depends on the support size.  This plants 900 support
+    maxima -- four tiles of 256 -- and requires every one of them back; under
+    the old hardcoded MAX_PEAKS = 100 this returns 100 peaks, silently ranked
+    by magnitude.
 
-    Sparse frames are the flip side: 5 maxima must yield exactly 5, with the
-    remaining slots invalid, not padded in by an epsilon gate.
+    Sparse frames are the flip side: 5 maxima must yield exactly 5, with no
+    filler admitted by an epsilon gate.
     """
     import numpy as np
 
@@ -1661,8 +1662,13 @@ def test_extraction_returns_full_support_beyond_any_round_size():
     finder = MatrixFreeSparseRBFPeakFinder(
         alpha=None, gamma=0.5, loss="poisson", min_sigma=1.0, max_sigma=3.0
     )
+    # Refinement is exercised by the solver-level tests; here it would only
+    # slide the synthetic delta atoms around and obscure the counting claim.
+    finder.refine_positions = False
     K = len(np.asarray(finder.sigmas))
     H = W = 130
+    y_img = np.zeros((H, W), dtype=np.float32)
+    bg_img = np.full((H, W), 1.0, dtype=np.float32)
 
     # 900 isolated one-pixel atoms on a 4-px grid: each is a strict local
     # maximum of the smoothed map, all coefficients strictly positive as the
@@ -1676,18 +1682,20 @@ def test_extraction_returns_full_support_beyond_any_round_size():
             c[0, r, cc] = 1.0 + rng.random()
     n_true = len(rows) * len(cols)
     assert n_true == 900
+    assert n_true > 3 * finder.EXTRACT_CHUNK
 
-    peaks, valid = finder._extract_peaks_all(np.asarray(c), border=0)
-    n_found = int(np.asarray(valid).sum())
-    assert n_found == n_true, (
-        f"extraction capped the support: {n_found} of {n_true} maxima returned"
+    peaks = finder._extract_peaks_all(np.asarray(c), y_img, bg_img, border=0)
+    assert peaks.shape == (n_true, 4), (
+        f"extraction capped the support: {peaks.shape[0]} of {n_true} returned"
     )
-    # The output array has grown past every smaller round size.
-    assert peaks.shape[0] >= 1024
+    # Every planted position is recovered (order is by coefficient, so sort).
+    got = set(zip(np.round(peaks[:, 1]).astype(int), np.round(peaks[:, 2]).astype(int)))
+    want = {(int(r), int(cc)) for r in rows for cc in cols}
+    assert got == want
 
     # Sparse frame: the same machinery reports exactly the support, no filler.
     c_sparse = np.zeros((K, H, W), dtype=np.float32)
     for r, cc in [(10, 10), (10, 60), (60, 10), (60, 60), (100, 100)]:
         c_sparse[0, r, cc] = 2.0
-    _, valid_sparse = finder._extract_peaks_all(np.asarray(c_sparse), border=0)
-    assert int(np.asarray(valid_sparse).sum()) == 5
+    sparse = finder._extract_peaks_all(np.asarray(c_sparse), y_img, bg_img, border=0)
+    assert sparse.shape == (5, 4)
