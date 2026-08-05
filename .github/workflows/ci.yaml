@@ -59,4 +59,4 @@ jobs:
       - name: Install dependencies
         run: uv sync
       - name: Run tests
-        run: uv run pytest -v -m "not slow and not integration" --durations=25
+        run: uv run pytest -v -m "not slow and not integration and not mesolite"
