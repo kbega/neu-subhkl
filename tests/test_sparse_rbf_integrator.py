@@ -1638,3 +1638,56 @@ def test_residual_deviance_flags_a_mis_sized_width():
         assert scored[sig_fit][1] > 5.0, (
             f"mis-sized width sigma={sig_fit} not flagged: {scored[sig_fit][1]:.3f}"
         )
+
+
+def test_extraction_returns_full_support_beyond_any_round_size():
+    """No constant caps how many peaks extraction can admit.
+
+    The admission criterion is support membership (the coefficient cleared the
+    alpha soft-threshold, so it is strictly positive); the static-shape slice
+    inside ``_extract_peaks`` is a round size that the caller doubles until the
+    valid count falls below it.  This plants far more support maxima than one
+    round holds (900 > 512 = 2 rounds of doubling from 256) and requires every
+    one of them back -- under the old hardcoded MAX_PEAKS = 100 this returns
+    100 peaks, silently ranked by magnitude.
+
+    Sparse frames are the flip side: 5 maxima must yield exactly 5, with the
+    remaining slots invalid, not padded in by an epsilon gate.
+    """
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=0.5, loss="poisson", min_sigma=1.0, max_sigma=3.0
+    )
+    K = len(np.asarray(finder.sigmas))
+    H = W = 130
+
+    # 900 isolated one-pixel atoms on a 4-px grid: each is a strict local
+    # maximum of the smoothed map, all coefficients strictly positive as the
+    # prox step would leave them.
+    c = np.zeros((K, H, W), dtype=np.float32)
+    rows = np.arange(4, 124, 4)
+    cols = np.arange(4, 124, 4)
+    rng = np.random.default_rng(3)
+    for r in rows:
+        for cc in cols:
+            c[0, r, cc] = 1.0 + rng.random()
+    n_true = len(rows) * len(cols)
+    assert n_true == 900
+
+    peaks, valid = finder._extract_peaks_all(np.asarray(c), border=0)
+    n_found = int(np.asarray(valid).sum())
+    assert n_found == n_true, (
+        f"extraction capped the support: {n_found} of {n_true} maxima returned"
+    )
+    # The output array has grown past every smaller round size.
+    assert peaks.shape[0] >= 1024
+
+    # Sparse frame: the same machinery reports exactly the support, no filler.
+    c_sparse = np.zeros((K, H, W), dtype=np.float32)
+    for r, cc in [(10, 10), (10, 60), (60, 10), (60, 60), (100, 100)]:
+        c_sparse[0, r, cc] = 2.0
+    _, valid_sparse = finder._extract_peaks_all(np.asarray(c_sparse), border=0)
+    assert int(np.asarray(valid_sparse).sum()) == 5

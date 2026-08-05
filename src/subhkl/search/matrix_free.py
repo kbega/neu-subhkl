@@ -555,8 +555,8 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return c_l1[0]
 
-    @partial(jit, static_argnames=["self", "border"])
-    def _extract_peaks(self, c_tensor, border=0):
+    @partial(jit, static_argnames=["self", "border", "capacity"])
+    def _extract_peaks(self, c_tensor, border=0, capacity=256):
         c_tot = jnp.sum(c_tensor, axis=0)  # [H, W]
 
         # Smooth the discrete L1 coefficients to recover true continuous center
@@ -582,12 +582,18 @@ class MatrixFreeSparseRBFPeakFinder:
         c_max = lax.reduce_window(
             c_smooth, -jnp.inf, jax.lax.max, window, (1, 1), "SAME"
         )
-        is_max = (c_smooth == c_max) & (c_smooth > 1e-5)
+        # Support membership is exact, not approximate: the prox step returns
+        # c = max(0, q - tau * lam), so every coefficient below the alpha
+        # threshold is *identically* zero and everything above it is strictly
+        # positive.  Smoothing (a nonnegative kernel) preserves that sign, so
+        # `> 0` admits exactly the maxima whose support cleared alpha.  An
+        # epsilon here would be a second, hidden significance level.
+        is_max = (c_smooth == c_max) & (c_smooth > 0.0)
 
         # Discard maxima in the replicated border before ranking, not after.
         # The edge padding is a constant strip that the finest basis fits
         # readily, so it carries many strong spurious maxima; leaving them in
-        # until after the top-MAX_PEAKS cut lets them consume the whole budget
+        # until after the top-capacity cut lets them consume the whole budget
         # and silently drop the real peaks from the interior.
         if border > 0:
             interior = jnp.zeros_like(is_max)
@@ -596,9 +602,15 @@ class MatrixFreeSparseRBFPeakFinder:
 
         c_flat = jnp.where(is_max.flatten(), c_smooth.flatten(), -1.0)
 
-        MAX_PEAKS = 100
-        top_indices = jnp.argsort(c_flat)[::-1][:MAX_PEAKS]
-        valid_mask = c_flat[top_indices] > 1e-5
+        # `capacity` is a round size, not a criterion.  jit needs a static
+        # shape here, so some bound on the slice is unavoidable -- but a bound
+        # that binds would silently truncate by coefficient magnitude, which is
+        # not the selection rule of this finder.  The caller therefore re-runs
+        # extraction with doubled capacity whenever every slot comes back
+        # valid, so no admission decision is ever made by this slice; the only
+        # criterion is the significance gate above.
+        top_indices = jnp.argsort(c_flat)[::-1][:capacity]
+        valid_mask = c_flat[top_indices] > 0.0
 
         def process_peak(idx):
             r = idx // c_smooth.shape[1]
@@ -658,6 +670,32 @@ class MatrixFreeSparseRBFPeakFinder:
 
         extracted = vmap(process_peak)(top_indices)
         return extracted, valid_mask
+
+    def _extract_peaks_all(self, c_tensor, border=0):
+        """Extract the *entire* significance-gated support of one image.
+
+        The admission criterion is support membership alone: the prox step
+        soft-thresholds at ``alpha`` standard deviations of coefficient noise,
+        so a coefficient is nonzero exactly when it cleared the significance
+        level, and ``_extract_peaks`` admits every positive local maximum of
+        that support.  No count cap and no epsilon takes part in the decision.
+
+        jit still needs a static output shape, so extraction runs in rounds:
+        if every slot of the current capacity comes back valid, the round is
+        rerun at double the capacity until the valid count is strictly below
+        it, which proves the support was exhausted.  The starting capacity is
+        arbitrary -- it determines which power-of-two compile buckets get
+        touched, never which peaks are returned.  Termination is guaranteed
+        because the number of local maxima is bounded by the pixel count.
+        """
+        capacity = 256
+        while True:
+            peaks_padded, valid_mask = self._extract_peaks(
+                c_tensor, border=border, capacity=capacity
+            )
+            if int(np.asarray(valid_mask).sum()) < capacity:
+                return peaks_padded, valid_mask
+            capacity *= 2
 
     @partial(jit, static_argnames=["self", "n_steps"])
     def _refine_peaks(self, y_img, bg_img, peaks, active, n_steps=200):
@@ -931,7 +969,7 @@ class MatrixFreeSparseRBFPeakFinder:
             c_tensors = solve_batch(images_padded[start:stop], bg_padded[start:stop])
 
             for i in range(start, stop):
-                peaks_padded, valid_mask = self._extract_peaks(
+                peaks_padded, valid_mask = self._extract_peaks_all(
                     c_tensors[i - start], border=pad_y + MARGIN
                 )
 
