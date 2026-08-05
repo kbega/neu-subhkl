@@ -449,3 +449,26 @@ def test_an_integrator_run_can_be_replayed_afterwards(tmp_path):
     )
 
     assert (tmp_path / "img0-pred.png").stat().st_size > 0
+
+
+def test_drawing_nothing_at_all_is_an_error(tmp_path):
+    """A command whose only job is drawing must not exit quietly having failed.
+
+    A frame that is not the shape of the bank it claims to come from cannot be
+    drawn on that bank's mesh; one such run is reported and skipped, but if
+    that is every run there is no result to hand back.
+    """
+    images = tmp_path / "images.h5"
+    _write_single_frame(images, _gaussian_frame((50.0, 50.0), shape=(100, 100)))
+    peaks = _write_finder_peaks(tmp_path / "found.h5", n_images=1)
+
+    with pytest.raises(RuntimeError, match="could be drawn"):
+        replay.replay_plots(
+            images_filename=str(images),
+            peaks_filename=str(peaks),
+            suffix="-found",
+            output_dir=str(tmp_path),
+            dpi=50,
+            max_workers=1,
+            show_progress=False,
+        )
