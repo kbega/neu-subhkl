@@ -114,6 +114,17 @@ def finder(
     sparse_rbf_gamma: float = 0.5,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
+    sparse_rbf_num_sigmas: Annotated[
+        int,
+        typer.Option(
+            help="Number of widths in the basis bank, spaced linearly from "
+            "--sparse-rbf-min-sigma to --sparse-rbf-max-sigma. Controls the "
+            "bank's resolution independently of its ceiling: raising max-sigma "
+            "alone widens the spacing, which approximates a peak whose true "
+            "width falls between two available scales with several atoms "
+            "instead of one."
+        ),
+    ] = 5,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_loss: Annotated[
         str,
@@ -173,6 +184,7 @@ def finder(
         sparse_rbf_gamma=sparse_rbf_gamma,
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
+        sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
         sparse_rbf_legacy=sparse_rbf_legacy,
