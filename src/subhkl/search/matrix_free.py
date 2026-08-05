@@ -86,6 +86,7 @@ class MatrixFreeSparseRBFPeakFinder:
         refine_positions: bool = True,
         reject_boundary_sigma: bool = False,
         boundary_sigma_frac: float = 0.98,
+        false_alarms_per_image: float = 1.0,
         **kwargs,
     ):
         if max_sigma < min_sigma:
@@ -126,6 +127,11 @@ class MatrixFreeSparseRBFPeakFinder:
         self.refine_positions = refine_positions
         self.reject_boundary_sigma = reject_boundary_sigma
         self.boundary_sigma_frac = boundary_sigma_frac
+        if false_alarms_per_image <= 0:
+            raise ValueError(
+                f"false_alarms_per_image must be positive, got {false_alarms_per_image}"
+            )
+        self.false_alarms_per_image = float(false_alarms_per_image)
 
         # 1. Pre-build the Filter Bank
         self.sigmas = jnp.linspace(min_sigma, max_sigma, num_sigmas)
@@ -134,36 +140,88 @@ class MatrixFreeSparseRBFPeakFinder:
         # Use strictly unnormalized physical bases to preserve flux relationships
         self.K_weights, self.kernel_sq_norms = self._build_kernel_bank()
         self.K_sq = self.K_weights**2
+        self.K_cu = self.K_weights**3
 
     def effective_alpha(self, height, width):
-        """Per-scale significance threshold, in units of coefficient noise.
+        """Per-scale significance threshold, in units of the dual's noise.
 
-        Solving globally tests every (pixel, scale) coefficient at once, so a
-        bare significance level does not control the false-alarm rate.  The
-        maximum of a smooth Gaussian field over ``N_k`` resolution elements sits
-        near ``sqrt(2 log N_k)``, and that is the level at which the expected
-        number of false detections over the whole image is O(1).
+        The number returned here multiplies ``sd[p(omega)] = sqrt(H_diag)``
+        (the standard deviation of the studentized dual variable under the
+        background-only null) to form the L1 weight, so it is a z-score:
+        an atom is admitted where the matched-filter correlation of the
+        Poisson residual exceeds this many standard deviations of what noise
+        alone produces.
 
-        With ``alpha=None`` the threshold is derived from that floor: the
-        smallest level whose weighted profile clears it at every scale.  The
-        ``(sigma/sigma_ref)**gamma`` shape is kept, because that shape is what
-        sets the merge/split balance -- using the floor alone flattens it into
-        the over-merging regime and loses weak peaks in the tails of strong
-        ones.  Only the *level* is taken from the data.
+        Admission is a binary classification run simultaneously over every
+        resolution element of (position, scale) space: ``N_k = area /
+        (2 pi sigma_k^2)`` elements at scale k, each with one-sided
+        false-positive probability ``Q(z) = P(N(0,1) > z)``.  The threshold
+        is fixed by the *calibration equation*
 
-        Passing a number instead keeps it as a lower bound on significance,
-        still floored, so an explicit request can be stricter but not weaker
-        than false-alarm control allows.
+            E[FP](z) = sum_k N_k * Q(z * w_k) = m0,
+
+        solved for ``z`` by bisection, where ``w_k = (sigma_k/ref_sigma) **
+        gamma`` is the scale prior and ``m0 = false_alarms_per_image`` is the
+        expected number of false atoms per image.  This replaces an earlier
+        anchoring rule, ``max(floor_k / w_k) * w_k`` with per-scale floors
+        ``sqrt(2 log N_k)``, which had two measured defects: it admitted the
+        finest scale at its bare floor for every gamma > 0 while holding
+        broad scales 2-3x above theirs (systematically favouring the split
+        solutions gamma < 1 exists to suppress), and its realised E[FP]
+        drifted with gamma (0.40 at gamma=0 down to 0.095 at gamma=1 on a
+        256^2 frame), so gamma sweeps silently changed the detection budget.
+        Under the calibration equation E[FP] = m0 identically for every
+        gamma: the prior reshapes the threshold across scales but no longer
+        moves the overall rate, and any rescaling of the weights -- including
+        the choice of ``ref_sigma`` -- is absorbed exactly into z, so the
+        unexposed reference constant provably cannot change the result.
+
+        Multiplicity is sum-pooled over the bank as given.  By linearity of
+        expectation this is exact for the per-slot count and a valid
+        Bonferroni bound on distinct false atoms regardless of the strong
+        correlation between adjacent scales (0.99 for neighbouring bank
+        entries; one noise bump lighting several correlated scales still
+        yields one admitted atom, so the realised count sits at or below
+        m0).  The cost of that conservatism is logarithmically damped and
+        includes a mild dependence on the bank sampling: densifying
+        num_sigmas 5 -> 33 at fixed range raises z by ~0.4, because
+        near-duplicate scales are counted as new tests.
+
+        Passing an explicit ``alpha`` keeps its meaning as a z-score and is
+        floored at the calibrated level: the final threshold is
+        ``max(alpha, z*) * w_k``, so a user can demand more evidence than
+        false-alarm control requires but not less.
         """
-        weights = (self.sigmas / self.ref_sigma) ** self.gamma
-        n_tests = jnp.maximum(
+        w = (self.sigmas / self.ref_sigma) ** self.gamma
+        n_k = jnp.maximum(
             (height * width) / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6)),
             2.0,
         )
-        floor = jnp.sqrt(2.0 * jnp.log(n_tests))
+        m0 = self.false_alarms_per_image
+
+        def expected_fp(z):
+            q = 0.5 * jax.scipy.special.erfc(z * w / jnp.sqrt(2.0))
+            return jnp.sum(n_k * q)
+
+        # E[FP](z) is strictly decreasing, so bisection converges
+        # unconditionally.  The bracket top is generous: even at w_min = 0.1
+        # and N ~ 1e8, z* < 60 / w_min never binds.  60 halvings resolve z to
+        # ~1e-16 of the bracket.
+        lo = jnp.asarray(0.0, dtype=jnp.float32)
+        hi = jnp.asarray(60.0, dtype=jnp.float32) / jnp.minimum(jnp.min(w), 1.0)
+
+        def bisect(_, bounds):
+            lo, hi = bounds
+            mid = 0.5 * (lo + hi)
+            too_low = expected_fp(mid) > m0
+            return jnp.where(too_low, mid, lo), jnp.where(too_low, hi, mid)
+
+        lo, hi = lax.fori_loop(0, 60, bisect, (lo, hi))
+        z_star = 0.5 * (lo + hi)
+
         if self.alpha is None:
-            return jnp.max(floor / weights) * weights
-        return jnp.maximum(self.alpha * weights, floor)
+            return z_star * w
+        return jnp.maximum(self.alpha, z_star) * w
 
     def _build_kernel_bank(self):
         k_grid = jnp.arange(-self.max_k_rad, self.max_k_rad + 1)
@@ -199,6 +257,11 @@ class MatrixFreeSparseRBFPeakFinder:
         self._cols_w = e1[:, None, None, :]  # [K,1,1,taps]
         self._rows_sq = ((amp**2)[:, None] * e1**2)[:, None, :, None]
         self._cols_sq = (e1**2)[:, None, None, :]
+        # Cubed bank, for the third cumulant of the dual variable (the
+        # Cornish-Fisher skewness correction in the solve).  The cube of an
+        # outer product is the outer product of cubes, so it stays separable.
+        self._rows_cu = ((amp**3)[:, None] * e1**3)[:, None, :, None]
+        self._cols_cu = (e1**3)[:, None, None, :]
         self.use_separable = True
 
         return kernels_2d[:, None, :, :], sq_norms
@@ -232,6 +295,8 @@ class MatrixFreeSparseRBFPeakFinder:
             return self._rows_w, self._cols_w
         if weights is self.K_sq:
             return self._rows_sq, self._cols_sq
+        if weights is self.K_cu:
+            return self._rows_cu, self._cols_cu
         return None
 
     def _forward_op(self, c, weights):
@@ -294,7 +359,17 @@ class MatrixFreeSparseRBFPeakFinder:
         else:
             var_c = 1.0 / H_diag_safe
 
-        alpha_vec = self.effective_alpha(H, W)
+        # The multiplicity in the calibration is the number of tests actually
+        # performed.  The solver sees the padded image, but extraction
+        # discards maxima within pad + MARGIN of every edge (find_peaks_batch:
+        # pad = max_k_rad, MARGIN = max(3, max_k_rad)), so the padded border
+        # holds no admissible candidates and must not be counted -- at
+        # max_sigma = 25 on a 256^2 frame it would otherwise inflate the test
+        # count 2.5x and the threshold by ~0.2 sigma.
+        border = self.max_k_rad + max(3, self.max_k_rad)
+        H_int = max(H - 2 * border, 8)
+        W_int = max(W - 2 * border, 8)
+        alpha_vec = self.effective_alpha(H_int, W_int)
 
         # 2. L1 penalty weight, in units of the objective rather than of the
         # prox step.  Soft-thresholding at lam/H_diag recovers the intended
@@ -303,7 +378,31 @@ class MatrixFreeSparseRBFPeakFinder:
         # step size instead makes the objective itself move whenever the step
         # does, which leaves the line search minimising a different problem on
         # every iteration.
-        lam = alpha_vec[None, :, None, None] * H_diag_safe * jnp.sqrt(var_c)
+        a_gauss = jnp.broadcast_to(alpha_vec[None, :, None, None], H_diag_safe.shape)
+        if self.loss == "poisson":
+            # Cornish-Fisher skewness correction.  The calibration converts a
+            # false-alarm budget to a *Gaussian* quantile, but the dual is a
+            # weighted sum of Poisson residuals whose third cumulant per pixel
+            # is E[(y - U)^3]/U^3 = 1/U^2, so its standardized skewness is
+            #     gamma1(omega) = (Phi^3 adj 1/U^2) / H_diag^{3/2},
+            # exactly computable with one more separable convolution (the
+            # cube of an outer product is an outer product).  Where the atom
+            # footprint collects many photons gamma1 -> 0 and this is inert;
+            # in the photon-starved regime it is decisive: at 0.5 counts/px
+            # the finest scale sums ~3 photons, the upper tail is far fatter
+            # than Gaussian, and the uncorrected calibrated threshold admits
+            # 14 false atoms per frame against a budget of 1 (measured).  The
+            # second-order Cornish-Fisher quantile transform
+            #     z_corr = z + gamma1 (z^2 - 1) / 6
+            # restores the budget; validity requires gamma1 * z / 2 < 1, and
+            # the clip keeps the correction inside that regime rather than
+            # extrapolating the expansion where it has no meaning.
+            kappa3 = self._adjoint_op(W_ref * W_ref, self.K_cu)
+            gamma1 = jnp.clip(kappa3 / H_diag_safe**1.5, 0.0, 2.0)
+            a_corr = a_gauss + gamma1 * (a_gauss**2 - 1.0) / 6.0
+        else:
+            a_corr = a_gauss
+        lam = a_corr * H_diag_safe * jnp.sqrt(var_c)
 
         # 3. Step size.  A prox-gradient step is only guaranteed to descend for
         # tau <= 1/lambda_max(A^T W A).  The diagonal of that operator is not a

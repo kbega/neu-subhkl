@@ -1153,23 +1153,40 @@ def test_boundary_sigma_rejection_fires_on_unmodelled_background():
     )
 
 
-def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
-    """`alpha=None` should set the threshold level from the data, not a constant.
+def test_alpha_none_solves_the_false_alarm_calibration_equation():
+    """`alpha=None` must satisfy E[FP] = m0 exactly, for every gamma.
 
-    Solving globally tests every (pixel, scale) coefficient at once, so the
-    level that keeps the expected number of false detections at O(1) over the
-    image is ``sqrt(2 log N_k)`` with ``N_k`` the resolution-element count at
-    that scale.  That level depends on how big the image is, which a hard-coded
-    constant cannot express: the same constant is too strict for a small crop
-    and too permissive for a full detector frame.
+    Admission is a binary classification over every (position, scale)
+    resolution element, so the threshold is fixed by the calibration equation
 
-    What must be preserved is the ``sigma**gamma`` *shape* of the threshold,
-    since that is what sets the merge/split balance.  Using the floor alone
-    flattens it and over-merges, losing weak peaks in the tails of strong ones.
+        E[FP](z) = sum_k N_k * Q(z * w_k) = m0,
+
+    with N_k = area / (2 pi sigma_k^2), w_k the sigma**gamma prior and
+    m0 = false_alarms_per_image.  Three properties are pinned: the realised
+    E[FP] equals m0 independent of gamma (the earlier anchored scheme drifted
+    0.40 -> 0.095 across gamma 0 -> 1, so gamma sweeps silently changed the
+    detection budget); the sigma**gamma *shape* survives; and rescaling the
+    weights -- e.g. any choice of ref_sigma -- is absorbed into z exactly.
     """
     import numpy as np
+    from scipy.stats import norm
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    def realised_efp(finder, side):
+        a = np.array(finder.effective_alpha(side, side))
+        sigmas = np.array(finder.sigmas)
+        n_k = np.maximum((side * side) / (2 * np.pi * sigmas**2), 2.0)
+        return float((n_k * norm.sf(a)).sum())
+
+    for gamma in (0.0, 0.5, 1.0, -0.5):
+        finder = MatrixFreeSparseRBFPeakFinder(
+            alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        )
+        efp = realised_efp(finder, 256)
+        assert np.isclose(efp, 1.0, rtol=1e-3), (
+            f"gamma={gamma}: E[FP] = {efp:.4f}, not the calibrated 1.0"
+        )
 
     gamma = 0.5
     finder = MatrixFreeSparseRBFPeakFinder(
@@ -1178,38 +1195,53 @@ def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
     sigmas = np.array(finder.sigmas)
     weights = (sigmas / finder.ref_sigma) ** gamma
 
-    def floor_for(side):
-        n = np.maximum((side * side) / (2 * np.pi * sigmas**2), 2.0)
-        return np.sqrt(2 * np.log(n))
-
     a_small = np.array(finder.effective_alpha(64, 64))
     a_large = np.array(finder.effective_alpha(4096, 4096))
 
-    # It must never sit below the false-alarm floor at any scale.
-    assert np.all(a_small >= floor_for(64) - 1e-4)
-    assert np.all(a_large >= floor_for(4096) - 1e-4)
-
-    # It must be the *smallest* such level, i.e. touching the floor somewhere,
-    # otherwise it is needlessly throwing away real peaks.
-    assert np.isclose(np.min(a_small - floor_for(64)), 0.0, atol=1e-4)
-
     # The sigma**gamma shape must survive: alpha_eff / w is one constant.
-    assert np.allclose(a_small / weights, (a_small / weights)[0])
+    assert np.allclose(a_small / weights, (a_small / weights)[0], rtol=1e-5)
 
     # A bigger image tests more coefficients, so it must demand more evidence.
     assert np.all(a_large > a_small)
 
+    # ref_sigma provably cancels: the calibration absorbs any weight rescaling.
+    other_ref = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, ref_sigma=3.0
+    )
+    assert np.allclose(
+        np.array(other_ref.effective_alpha(256, 256)),
+        np.array(finder.effective_alpha(256, 256)),
+        rtol=1e-5,
+    )
+
+    # m0 is the honest knob: demanding fewer false alarms raises the bar.
+    stricter = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=gamma,
+        min_sigma=1.0,
+        max_sigma=5.0,
+        false_alarms_per_image=0.1,
+    )
+    assert np.all(np.array(stricter.effective_alpha(256, 256)) > a_small)
+    assert np.isclose(realised_efp(stricter, 256), 0.1, rtol=1e-3)
+
     # An explicit alpha is a lower bound on significance, not a way under the
-    # floor: too small a request is raised, a strict one is honoured.
+    # calibration: too small a request is raised, a strict one is honoured.
     lax_finder = MatrixFreeSparseRBFPeakFinder(
         alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0
     )
-    assert np.allclose(np.array(lax_finder.effective_alpha(130, 130)), floor_for(130))
+    assert np.allclose(
+        np.array(lax_finder.effective_alpha(130, 130)),
+        np.array(finder.effective_alpha(130, 130)),
+        rtol=1e-5,
+    )
 
     strict = MatrixFreeSparseRBFPeakFinder(
         alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0
     )
-    assert np.all(np.array(strict.effective_alpha(130, 130)) > floor_for(130))
+    assert np.allclose(
+        np.array(strict.effective_alpha(130, 130)), 20.0 * weights, rtol=1e-5
+    )
 
     # And it must still work: a clear peak on a flat background is found.
     H = W = 60
@@ -1291,10 +1323,21 @@ def test_global_solve_reaches_first_order_optimality():
     w_ref = 1.0 / jnp.maximum(bg4, 1e-3)
     h_diag = jnp.maximum(finder._adjoint_op(w_ref, finder.K_sq), 1e-6)
     lam = (
-        finder.effective_alpha(*ip.shape)[None, :, None, None]
+        # Same interior test area the solver uses: the padded border holds
+        # no admissible candidates, so it is excluded from the multiplicity.
+        finder.effective_alpha(
+            max(ip.shape[0] - 2 * (finder.max_k_rad + max(3, finder.max_k_rad)), 8),
+            max(ip.shape[1] - 2 * (finder.max_k_rad + max(3, finder.max_k_rad)), 8),
+        )[None, :, None, None]
         * h_diag
         * jnp.sqrt(1.0 / h_diag)
     )
+    # Mirror the solver's Cornish-Fisher skewness correction so the KKT
+    # measure tests the objective the solver actually minimised.
+    a_gauss = lam / jnp.sqrt(h_diag)
+    kappa3 = finder._adjoint_op(w_ref * w_ref, finder.K_cu)
+    gamma1 = jnp.clip(kappa3 / h_diag**1.5, 0.0, 2.0)
+    lam = (a_gauss + gamma1 * (a_gauss**2 - 1.0) / 6.0) * jnp.sqrt(h_diag)
 
     def power_step(_, v):
         av = finder._adjoint_op(
@@ -1367,10 +1410,21 @@ def test_sparse_regime_certificate_and_shadow_deactivation():
     w_ref = 1.0 / jnp.maximum(bg4, 1e-3)
     h_diag = jnp.maximum(finder._adjoint_op(w_ref, finder.K_sq), 1e-6)
     lam = (
-        finder.effective_alpha(*ip.shape)[None, :, None, None]
+        # Same interior test area the solver uses: the padded border holds
+        # no admissible candidates, so it is excluded from the multiplicity.
+        finder.effective_alpha(
+            max(ip.shape[0] - 2 * (finder.max_k_rad + max(3, finder.max_k_rad)), 8),
+            max(ip.shape[1] - 2 * (finder.max_k_rad + max(3, finder.max_k_rad)), 8),
+        )[None, :, None, None]
         * h_diag
         * jnp.sqrt(1.0 / h_diag)
     )
+    # Mirror the solver's Cornish-Fisher skewness correction so the KKT
+    # measure tests the objective the solver actually minimised.
+    a_gauss = lam / jnp.sqrt(h_diag)
+    kappa3 = finder._adjoint_op(w_ref * w_ref, finder.K_cu)
+    gamma1 = jnp.clip(kappa3 / h_diag**1.5, 0.0, 2.0)
+    lam = (a_gauss + gamma1 * (a_gauss**2 - 1.0) / 6.0) * jnp.sqrt(h_diag)
 
     def power_step(_, v):
         av = finder._adjoint_op(
