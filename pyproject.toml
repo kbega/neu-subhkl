@@ -75,7 +75,11 @@ extension-pkg-whitelist = ["PyQt5"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
+    "mesolite: needs the mesolite dataset, downloaded from Zenodo on first use (select with '-m mesolite')",
 ]
+# Downloading the mesolite dataset takes hours, so the tests that need it are
+# left out of a plain `pytest` run. Select them explicitly with `-m mesolite`.
+addopts = "-m 'not mesolite'"
 
 [tool.ruff]
 include = ["pyproject.toml", "src/**/*.py", "scripts/**/*.py", "tests/**/*.py"]
