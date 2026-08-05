@@ -25,6 +25,7 @@ import os
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import partial
 
 import h5py
 import numpy as np
@@ -270,28 +271,44 @@ def replay_plots(
         max_workers = os.cpu_count()
     max_workers = max(1, min(max_workers, len(tasks)))
 
+    written = []
+
     # Spawning a process costs a fresh import of the whole package, which is
     # not worth paying to draw a single plot.
     if max_workers == 1:
-        return sorted(_render(task) for task in tasks)
+        for task in tasks:
+            _attempt(partial(_render, task), task[0], written)
+    else:
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
+            futures = {executor.submit(_render, task): task[0] for task in tasks}
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Rendering unrolled plots",
+                disable=not show_progress,
+            ):
+                _attempt(future.result, futures[future], written)
 
-    written = []
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
-        futures = {executor.submit(_render, task): task[0] for task in tasks}
-        for future in tqdm(
-            as_completed(futures),
-            total=len(futures),
-            desc="Rendering unrolled plots",
-            disable=not show_progress,
-        ):
-            try:
-                written.append(future.result())
-                tqdm.write(f"Saved: {written[-1]}")
-            except Exception:
-                import traceback
-
-                print(f"Visualization failed for {futures[future]}:")
-                traceback.print_exc()
+    # One run failing to draw is worth reporting and carrying on from; every
+    # run failing means the command did its whole job and produced nothing,
+    # which should not look like success to whatever called it.
+    if not written:
+        raise RuntimeError(
+            f"None of the {len(tasks)} plot(s) could be drawn; see the errors above."
+        )
 
     return sorted(written)
+
+
+def _attempt(call, out_name, written):
+    """Run one render, keeping the path it wrote or reporting why it failed."""
+    try:
+        written.append(call())
+    except Exception:
+        import traceback
+
+        print(f"Visualization failed for {out_name}:")
+        traceback.print_exc()
+    else:
+        tqdm.write(f"Saved: {written[-1]}")
