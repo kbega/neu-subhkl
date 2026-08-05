@@ -1085,25 +1085,27 @@ class MatrixFreeSparseRBFPeakFinder:
             filter_size += 1
         bg_map = np.full_like(images_batch, 10.0)
         try:
-            from subhkl.search.sparse_rbf import MEDIAN_MAX_SAMPLES, compute_bg_batch
+            # The quantile-inversion rate map, not the median background: the
+            # median of Poisson(mu) is identically zero below mu = log 2, so
+            # on sparse frames the median map collapses to its clamp and every
+            # significance downstream is measured against a background
+            # hundreds of times too small.  See compute_rate_batch.  It also
+            # retires this branch's subsampled-median workaround
+            # (MEDIAN_MAX_SAMPLES): there is no window-sized sort left to
+            # subsample.  The legacy greedy finder keeps the median path
+            # unchanged.
+            from subhkl.search.sparse_rbf import compute_rate_batch
 
             # Chunked for the same reason the greedy finder chunks it: a full
             # detector scan is far too much to hold on the device at once.
             bg_chunk = min(self.chunk_size, max(1, B // 4))
             pieces = []
             for start in range(0, B, bg_chunk):
-                # Subsample the median window past MEDIAN_MAX_SAMPLES.  The
-                # exact filter is what makes a large max_sigma unusable: 86 s
-                # per frame of the 92 s total at max_sigma = 25, against 45 ms
-                # subsampled.  See the constant's definition for what it costs
-                # in accuracy.  The greedy finder does not pass this and so is
-                # left on the exact filter.
-                piece = compute_bg_batch(
+                piece = compute_rate_batch(
                     jnp.asarray(
                         images_batch[start : start + bg_chunk], dtype=jnp.float32
                     ),
                     filter_size,
-                    MEDIAN_MAX_SAMPLES,
                 )
                 piece.block_until_ready()
                 pieces.append(np.asarray(piece, dtype=np.float32))
