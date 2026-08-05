@@ -8,10 +8,13 @@ scale coordinate, and because extra atoms always absorb a little more noise the
 fit breaks the tie towards splitting -- a single peak is reported as a cluster.
 See docs/matrix_free_theory.md, Theorem 1.
 
-``gamma=0.5`` is used uniformly so that no test depends on its own tuning.  It
-sits inside the usable range on both sides: ``gamma=1`` fragments, while
-``gamma=0`` over-merges and swallows genuine neighbours.  A case needing a
-different value should say why at its own call site.
+``gamma=0.5`` is used uniformly so that no test depends on its own tuning: it
+is the shipped default, not a bound.  Only the upper end is a wall --
+``gamma=1`` fragments, for the reason above.  Below the default the penalty
+simply prefers broader atoms more strongly, continuously and through zero into
+negative values, so ``gamma<=0`` is a legitimate setting for diffuse features
+rather than a failure mode; see the finder's class docstring for the measured
+sweep.  A case needing a different value should say why at its own call site.
 
 Integrator call sites keep their original gamma deliberately.  The degeneracy
 above requires unknown positions *and* unknown scale at once; integration is
