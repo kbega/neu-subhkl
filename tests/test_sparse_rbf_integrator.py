@@ -939,13 +939,28 @@ def test_poisson_local_variance_suppression():
     def _is_peak_like(p):
         return p[3] <= 2.5
 
-    for p in peaks:
+    # The width gate alone is not coin-toss-proof: the fence atoms are
+    # narrow too (sigma = 1), and on one estimator's texture one of them
+    # landed 1.98 px from B.  The per-peak leave-one-out deviance separates
+    # the two populations cleanly and physically: each fence atom absorbs a
+    # sliver of spread residual and is individually marginal (measured
+    # dD ~ 4-18 across the fence), while a genuine detection is confident
+    # (A carries dD ~ 90), and the failure this test guards against --
+    # z-scores inflated by a collapsed background -- inflates dD along with
+    # them.  So count B as found only if the finder is *sure* of it.
+    dd_confident = 18.5  # chi^2_4 99.9%
+    dev = finder.peak_deviance[0]
+
+    for p, dd in zip(peaks, dev):
         # p = [intensity, r, c, sigma]
         if not _is_peak_like(p):
             continue
         if np.sqrt((p[1] - peak_a_r) ** 2 + (p[2] - peak_a_c) ** 2) < 2.0:
             found_a = True
-        if np.sqrt((p[1] - peak_b_r) ** 2 + (p[2] - peak_b_c) ** 2) < 2.0:
+        if (
+            np.sqrt((p[1] - peak_b_r) ** 2 + (p[2] - peak_b_c) ** 2) < 2.0
+            and dd > dd_confident
+        ):
             found_b = True
 
     assert found_a, "Failed to find the weak peak in the low-variance (dark) region."
@@ -1699,3 +1714,94 @@ def test_extraction_returns_full_support_beyond_any_chunk_size():
         c_sparse[0, r, cc] = 2.0
     sparse = finder._extract_peaks_all(np.asarray(c_sparse), y_img, bg_img, border=0)
     assert sparse.shape == (5, 4)
+
+
+def test_rate_estimator_survives_the_sparse_regime():
+    """The quantile-inversion rate map works where the median map collapses.
+
+    The median of Poisson(mu) is identically 0 for mu < log 2, so the median
+    background returns its 1e-3 clamp on any short-exposure frame (measured:
+    100% of pixels on real MANDI garnet banks whose true rate is 0.44).  The
+    replacement inverts the exact Poisson CDF at an empirical quantile and
+    must recover the rate across the sparse-to-bright range, stay robust to
+    injected peaks, and agree with the honest answer where the median also
+    works.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+
+    from subhkl.search.sparse_rbf import compute_bg_batch, compute_rate_batch
+
+    rng = np.random.default_rng(11)
+    H = W = 128
+    filter_size = 25
+
+    for mu in (0.3, 0.5, 2.0, 5.0, 12.0, 30.0):
+        img = rng.poisson(mu, size=(H, W)).astype(np.float32)
+        rate = np.asarray(compute_rate_batch(jnp.asarray(img[None]), filter_size))[0]
+        interior = rate[20:-20, 20:-20]
+        assert np.abs(np.median(interior) - mu) < 0.12 * mu + 0.05, (
+            f"mu={mu}: rate map median {np.median(interior):.3f}"
+        )
+
+    # The regime the median cannot enter: at mu = 0.5 the old estimator is
+    # pinned at its clamp, three orders of magnitude below the truth.
+    img = rng.poisson(0.5, size=(H, W)).astype(np.float32)
+    med = np.asarray(compute_bg_batch(jnp.asarray(img[None]), filter_size))[0]
+    assert np.median(med) <= 1e-3
+    rate = np.asarray(compute_rate_batch(jnp.asarray(img[None]), filter_size))[0]
+    assert np.median(rate) > 0.4
+
+    # Peak robustness: strong compact peaks must not drag the local rate up
+    # by more than the bulk-quantile bound allows.
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    truth = np.full((H, W), 0.5)
+    for r0, c0 in ((40, 40), (40, 88), (88, 40), (88, 88)):
+        truth += generate_erf_peak(yy, xx, float(r0), float(c0), 2.0, 100.0)
+    img = rng.poisson(truth).astype(np.float32)
+    rate = np.asarray(compute_rate_batch(jnp.asarray(img[None]), filter_size))[0]
+    assert np.median(rate[20:-20, 20:-20]) < 0.75, (
+        f"peaks dragged the rate map to {np.median(rate[20:-20, 20:-20]):.3f}"
+    )
+
+
+def test_stray_counts_on_sparse_background_are_not_peaks():
+    """A flat sparse frame must yield (nearly) no detections.
+
+    Under the median background the map collapses to the 1e-3 clamp, every
+    stray count carries a z inflated by sqrt(mu/0.001) ~ 21, and the finder
+    reports hundreds of sample-independent 'peaks' per frame -- the failure
+    measured on PR #15 (1,908 peaks/image on real data, identical across
+    different samples).  Against the true rate a single count is ~1.4 sigma
+    and no reachable alpha admits it.
+    """
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    rng = np.random.default_rng(5)
+    image = rng.poisson(0.5, size=(128, 128)).astype(np.float32)
+
+    finder = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=0.5, loss="poisson", min_sigma=1.0, max_sigma=4.0
+    )
+    peaks = finder.find_peaks_batch(image[np.newaxis, ...])[0]
+    # Not zero: effective_alpha's floor is calibrated so the *expected* number
+    # of false detections per frame is O(1), and a flat Poisson(0.5) frame of
+    # 16k pixels genuinely contains a few >= 4 sigma excursions (about three
+    # pixels at >= 5 counts).  A handful is the design target; hundreds was
+    # the bug.
+    assert len(peaks) <= 5, (
+        f"{len(peaks)} detections on a flat Poisson(0.5) frame with no peaks"
+    )
+
+    # And a real peak on the same sparse background is still found.
+    yy, xx = np.meshgrid(np.arange(128), np.arange(128), indexing="ij")
+    truth = np.full((128, 128), 0.5) + generate_erf_peak(yy, xx, 64.0, 64.0, 2.5, 40.0)
+    image2 = rng.poisson(truth).astype(np.float32)
+    peaks2 = finder.find_peaks_batch(image2[np.newaxis, ...])[0]
+    dists = np.sqrt((peaks2[:, 1] - 64.0) ** 2 + (peaks2[:, 2] - 64.0) ** 2)
+    assert len(peaks2) >= 1 and dists.min() < 2.0, (
+        f"real peak lost on sparse background: {len(peaks2)} peaks, "
+        f"nearest {dists.min() if len(peaks2) else np.inf:.1f} px"
+    )

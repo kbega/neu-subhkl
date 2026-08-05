@@ -136,6 +136,114 @@ def compute_bg_batch(imgs, filter_size, max_samples=None):
     return lax.map(process_one, imgs)  # [photons/Pixel]
 
 
+@partial(jit, static_argnames=["window_size"])
+def _box_mean_2d(img, window_size):
+    """Uniform box average, two separable 1D passes.  [same units as img]"""
+    w = window_size | 1  # odd, so the window is centred
+    k_1d = jnp.full((w,), 1.0 / w, dtype=img.dtype)
+    pad = w // 2
+    padded = jnp.pad(img, pad, mode="reflect")
+    temp = jax.scipy.signal.correlate2d(padded, k_1d[:, None], mode="valid")
+    return jax.scipy.signal.correlate2d(temp, k_1d[None, :], mode="valid")
+
+
+# Highest count level the quantile inversion resolves directly; brighter
+# background falls back to the windowed mean (see compute_rate_batch).  Not a
+# tuning constant: it only decides which of two estimators answers, and the
+# handover happens where both are accurate.
+RATE_K_MAX = 16
+
+
+@partial(jit, static_argnames=["filter_size"])
+def compute_rate_batch(imgs, filter_size):
+    """Local Poisson rate by exact quantile inversion -- the sparse-regime
+    replacement for the median background.
+
+    The median background is identically zero wherever the rate is below
+    log 2 ~ 0.69 counts/pixel -- the median of Poisson(mu < log 2) is 0 --
+    so on short-exposure frames the whole map collapses to its numerical
+    clamp (measured: 100% of pixels at 1e-3 on real MANDI garnet banks whose
+    true rate is 0.44).  Every z-score downstream is then measured against a
+    background hundreds of times too small, a stray single count clears the
+    chi^2 significance level on its own, and no reachable alpha controls the
+    peak count.
+
+    This estimator inverts the exact Poisson CDF at an empirical quantile
+    instead of reading the median off as if it were the rate:
+
+        F_k = box_mean(y <= k)            (window-fraction at or below k)
+        k*  = smallest k with F_k >= 1/2  (per pixel)
+        mu  solves  gammaincc(k* + 1, mu) = F_{k*}
+
+    using P(Y <= k) = Q(k+1, mu), the regularized upper incomplete gamma.
+    At k* = 0 this is the zero-fraction estimator mu = -log F_0 (measured on
+    peak-free MANDI tiles: 0.421 +- 0.056 against a masked-mean truth of
+    0.438 +- 0.087 -- tighter than the mean itself); at higher k* it reduces
+    to the Poisson-correct reading of the median.  Robustness to peaks is
+    the same bulk-quantile argument as the median's: peaks only add counts,
+    so they can only lower F_k, by at most the peak-area fraction of the
+    window, and the induced rate bias is bounded and positive.  Where even
+    F_{RATE_K_MAX} < 1/2 (background brighter than ~16 counts/pixel) the
+    windowed mean takes over -- there the Gaussian regime holds and peak
+    contamination is a small relative perturbation.
+
+    Cost replaces the median's O(window^2) materialised sort -- the 125x125
+    window at max_sigma = 25 sorts 15,625 values per pixel and took ~109 s
+    of XLA compilation alone -- with (RATE_K_MAX + 2) separable box filters
+    and a fixed 30-step bisection of a scalar special function: no sort, no
+    window-sized tensor, compile time in seconds.
+
+    Args:
+        imgs: [photons/Pixel]
+        filter_size: [Pixel^0.5]
+    Returns:
+        [photons/Pixel]
+    """
+
+    def process_one(img):
+        F = jnp.stack(
+            [
+                _box_mean_2d((img <= k).astype(img.dtype), filter_size)
+                for k in range(RATE_K_MAX + 1)
+            ]
+        )  # [K+1, H, W]
+
+        hit = F >= 0.5
+        any_hit = jnp.any(hit, axis=0)
+        k_star = jnp.argmax(hit, axis=0)  # first k with F_k >= 1/2
+        F_sel = jnp.take_along_axis(F, k_star[None], axis=0)[0]
+        # Clamp into the open unit interval: F = 1 exactly (a fully empty
+        # window) must invert to mu = 0, not to a log of zero.
+        F_sel = jnp.clip(F_sel, 1e-7, 1.0 - 1e-7)
+        a = (k_star + 1).astype(img.dtype)
+
+        # P(Y <= k; mu) = gammaincc(k+1, mu) is strictly decreasing in mu, so
+        # bisection on mu in [0, 4 * RATE_K_MAX] converges unconditionally;
+        # 30 halvings resolve the rate to 6e-8 of the bracket.
+        lo = jnp.zeros_like(F_sel)
+        hi = jnp.full_like(F_sel, 4.0 * RATE_K_MAX)
+
+        def bisect(_, bounds):
+            lo, hi = bounds
+            mid = 0.5 * (lo + hi)
+            too_low = jax.scipy.special.gammaincc(a, mid) > F_sel
+            return jnp.where(too_low, mid, lo), jnp.where(too_low, hi, mid)
+
+        lo, hi = lax.fori_loop(0, 30, bisect, (lo, hi))
+        mu = 0.5 * (lo + hi)
+
+        bright = _box_mean_2d(img, filter_size)
+        rate = jnp.where(any_hit, mu, bright)
+
+        blur = jax_gaussian_blur_2d(rate)  # [photons/Pixel]
+        # Numerical guard only.  Unlike the median path this never binds on
+        # counted data: any region with any exposure has mu >> 1e-3, and
+        # regions with none are masked upstream.
+        return jnp.maximum(blur, 1e-3)  # [photons/Pixel]
+
+    return lax.map(process_one, imgs)  # [photons/Pixel]
+
+
 class SparseRBFPeakFinder(SparseBasisPursuit):
     """
     Hierarchical Sparse RBF Peak Finder with Symmetric V-Cycle Basis Pursuit.
