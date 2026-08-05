@@ -1,0 +1,61 @@
+name: trigger benchmarks
+
+on:
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "subhkl ref to benchmark (default: this branch)"
+        default: ""
+      profile:
+        description: "Benchmark profile"
+        type: choice
+        options: [default, smoke, thorough]
+        default: default
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-benchmarks'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require triage rights on whoever asked
+        if: github.event_name == 'pull_request_target'
+        env:
+          # The built-in token is already scoped to this repository, and keeps
+          # Metadata: read even under `permissions: {}`, which is all this
+          # endpoint asks for.  BENCHMARK_DISPATCH_TOKEN is scoped to the
+          # benchmark repository instead, so it cannot read anything here and
+          # this check fails closed with a 403 on every pull request.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # `|| level=none` belongs outside the substitution: on an error `gh
+          # api` writes the response body to stdout, so folding the fallback
+          # inside appends to that body rather than replacing it, and the
+          # resulting string matches no case arm.
+          level=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.actor }}/permission" \
+                    --jq '.permission' 2>/dev/null) || level=none
+          echo "${{ github.actor }} has '${level}' on ${{ github.repository }}"
+          case "$level" in
+            admin|maintain|write|triage) ;;
+            *) echo "::error::${{ github.actor }} lacks triage rights; refusing to benchmark this pull request."
+               exit 1 ;;
+          esac
+
+      - name: Dispatch to the benchmark repository
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.BENCHMARK_DISPATCH_TOKEN }}
+          repository: jglaser/subhkl-benchmarks
+          event-type: subhkl-changed
+          client-payload: >-
+            {
+              "ref": "${{ github.event.pull_request.head.sha || inputs.ref || github.sha }}",
+              "pr": "${{ github.event.pull_request.number }}",
+              "repo": "${{ github.repository }}",
+              "profile": "${{ inputs.profile || 'default' }}"
+            }
