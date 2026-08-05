@@ -998,14 +998,20 @@ class MatrixFreeSparseRBFPeakFinder:
         filter_size = max(15, int(self.max_sigma * 5))
         bg_map = np.full_like(images_batch, 10.0)
         try:
-            from subhkl.search.sparse_rbf import compute_bg_batch
+            # The quantile-inversion rate map, not the median background: the
+            # median of Poisson(mu) is identically zero below mu = log 2, so
+            # on sparse frames the median map collapses to its clamp and every
+            # significance downstream is measured against a background
+            # hundreds of times too small.  See compute_rate_batch.  The
+            # legacy greedy finder keeps the median path unchanged.
+            from subhkl.search.sparse_rbf import compute_rate_batch
 
             # Chunked for the same reason the greedy finder chunks it: a full
             # detector scan is far too much to hold on the device at once.
             bg_chunk = min(self.chunk_size, max(1, B // 4))
             pieces = []
             for start in range(0, B, bg_chunk):
-                piece = compute_bg_batch(
+                piece = compute_rate_batch(
                     jnp.asarray(
                         images_batch[start : start + bg_chunk], dtype=jnp.float32
                     ),
