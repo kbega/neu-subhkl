@@ -136,6 +136,10 @@ def prepare_harvest_tasks(
                 loss=harvest_peaks_kwargs.get("loss", "poisson"),
                 min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
                 max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
+                # Bank resolution, independent of the ceiling: without it
+                # max_sigma sets both, so a wider range can only be bought by
+                # coarsening the spacing.
+                num_sigmas=harvest_peaks_kwargs.get("num_sigmas", 5),
                 show_steps=harvest_peaks_kwargs.get("show_steps", False),
             )
         batch_coords = alg.find_peaks_batch(img_stack)

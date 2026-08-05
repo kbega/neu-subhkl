@@ -62,6 +62,32 @@ class MatrixFreeSparseRBFPeakFinder:
         boundary_sigma_frac: float = 0.98,
         **kwargs,
     ):
+        if max_sigma < min_sigma:
+            raise ValueError(
+                f"max_sigma ({max_sigma}) is below min_sigma ({min_sigma}); "
+                "the basis bank would be empty."
+            )
+        if num_sigmas < 1:
+            raise ValueError(f"num_sigmas must be at least 1, got {num_sigmas}")
+
+        # A zero-width range is a single scale, whatever num_sigmas asks for.
+        # linspace(s, s, k) returns k identical widths, and the solve then
+        # carries k copies of one channel: k times the cost, and gamma --
+        # which only ever compares scales against each other -- becomes
+        # completely inert, silently.  Outputs at gamma 0.3, 0.5 and 0.75 came
+        # back bit-identical, which is how this was noticed.  Collapse it here
+        # rather than failing, because a single-width bank is a legitimate
+        # request (the finder is then a matched filter at one scale) and only
+        # the duplication is wrong.
+        if max_sigma == min_sigma and num_sigmas > 1:
+            if show_steps:
+                print(
+                    f"  > min_sigma == max_sigma == {min_sigma:g}: collapsing the "
+                    f"bank from {num_sigmas} identical widths to 1 "
+                    "(gamma has no effect on a single-scale bank)."
+                )
+            num_sigmas = 1
+
         self.alpha = alpha
         self.gamma = gamma
         self.min_sigma = min_sigma
