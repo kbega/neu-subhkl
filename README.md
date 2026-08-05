@@ -115,6 +115,28 @@ rs.concat(mtzs).hkl_to_asu().write_mtz("mesolite_202405/meso.mtz")
 which creates a single `.mtz` file `mesolite_202405/meso.mtz` that contains
 all reflections.
 
+## Plotting after the fact
+
+`finder` and `rbf-integrator` draw their unrolled-detector plots while they
+run, which costs both rendering time and a lot of disk at the 600 dpi they use.
+Two commands rebuild those plots later from the HDF5 files, so a run can be
+told to draw nothing and still be looked at afterwards:
+
+```bash
+# run the search without drawing anything
+python -m subhkl.io.parser finder images.h5 MANDI --output-filename found.h5
+
+# ... and draw it later, from the two HDF5 files
+python -m subhkl.io.parser finder-visualize images.h5 found.h5
+python -m subhkl.io.parser integrator-visualize images.h5 integrated.h5
+```
+
+`images.h5` is the reduced (or merged) image stack the step ran on; the peaks
+file supplies the peak centres and the width fitted to each one. Neither
+command re-runs the search, so this is quick, and `--dpi` trades resolution for
+size. Keep the two HDF5 files -- from a benchmark artifact, for instance -- and
+any run can be spot-checked without the raw data.
+
 ## Physics and Conventions
 
 This project uses the **Laue Equation** to relate Miller indices $(h, k, l)$ to the scattering vector $Q$:
