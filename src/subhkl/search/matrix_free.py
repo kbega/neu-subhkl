@@ -34,16 +34,42 @@ class MatrixFreeSparseRBFPeakFinder:
 
     ``gamma < 1`` breaks the symmetry and makes a single broad atom strictly
     cheaper than any spread of the same flux, which is what a deconvolution
-    ought to prefer.  ``gamma = 0`` is the other end: plain unweighted L1 on
-    L2-normalised atoms, which over-merges and swallows genuine neighbours.  The
-    usable range is interior, and the test-suite runs at ``gamma = 0.5``, which
-    recovers a weak peak hidden in a strong peak's tail (``gamma = 1`` misses
-    it) and cuts the reported peak count from 36 to 7 on the overlap cases.
+    ought to prefer.  Lowering ``gamma`` strengthens that preference
+    continuously -- the penalty per unit flux goes as sigma**(gamma - 1), so
+    the smaller ``gamma`` is, the more the fit prefers to explain structure
+    with one wide atom rather than several narrow ones.  ``gamma = 0`` (a
+    flat, scale-independent weight) is a point on that continuum, not a
+    boundary, and negative values continue it: they bias towards broad,
+    smooth solutions, which is what you want when the features of interest
+    are diffuse rather than compact.
+
+    Measured on the overlap regression cases, at ``min_sigma = 2``,
+    ``max_sigma = 8``, over a flat background of 10 counts/pixel:
+
+        gamma       -1.0   -0.5    0.0    0.5    1.0
+        two blended peaks resolved
+                     yes    yes    yes    yes    yes (as 32 atoms)
+        weak peak in a strong tail found
+                     yes    yes    yes    yes    yes (as 20 atoms)
+        one broad + one compact feature: atoms reported
+                       2      2      2      4     21
+        median recovered sigma
+                    4.35   4.35   4.35   3.36   2.00
+
+    An earlier version of this docstring claimed ``gamma = 0`` over-merges
+    and swallows genuine neighbours, and that the usable range is therefore
+    the open interval.  That does not reproduce: at and below zero both
+    overlap cases resolve cleanly into exactly two atoms, and the recovered
+    widths simply track the broad-atom preference.  What the sweep does show
+    is the fragmentation at ``gamma = 1`` the paragraphs above predict.
 
     The default is 0.5.  It should still be calibrated like ``alpha`` or a
     regularisation strength, against the merge/split error pair, and that
     calibration is only meaningful away from 1.0 -- the single point where the
-    penalty carries no information about model order at all.
+    penalty carries no information about model order at all.  Which side of
+    the default suits a given experiment depends on what is being measured:
+    lower (including negative) for diffuse or broad features, higher -- but
+    short of 1 -- to keep close compact neighbours apart.
     """
 
     def __init__(
