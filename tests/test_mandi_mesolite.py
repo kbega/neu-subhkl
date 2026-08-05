@@ -80,9 +80,9 @@ INDEXER_DEFAULTS = {
 
 
 @pytest.fixture(name="mesolite_input_file")
-def fixture__mesolite_input_file(test_data_dir):
+def fixture__mesolite_input_file(mesolite_data):
     """Provide path to mesolite test data file."""
-    filepath = Path(test_data_dir) / "MANDI" / "mesolite" / MESOLITE_FILE
+    filepath = Path(mesolite_data) / MESOLITE_FILE
 
     if not filepath.exists():
         pytest.skip(f"Mesolite test file not found: {filepath}")
@@ -199,5 +199,6 @@ class TestMandiMesoliteSingleRun:
         print(f"  Output files in: {temp_output_dir}")
 
 
-# Mark the test class for pytest markers
-pytestmark = pytest.mark.integration
+# Mark the test class for pytest markers. `mesolite` keeps these tests, and the
+# hours-long dataset download they need, out of a default test run.
+pytestmark = [pytest.mark.integration, pytest.mark.mesolite]

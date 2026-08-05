@@ -145,6 +145,20 @@ where $\hat{k}_f$ and $\hat{k}_i$ are unit vectors along the scattered and incid
 pytest -v
 ```
 
+Tests that need the mesolite dataset are marked `mesolite` and are left out of
+that run, because the dataset is downloaded from Zenodo on first use and that
+takes hours. Ask for them explicitly:
+
+```bash
+pytest -v -m mesolite
+
+# or download only the first few files, which is enough for most of them
+MESOLITE_MAX_FILES=1 pytest -v -m mesolite
+```
+
+The other markers are `slow` and `integration`; CI runs unit tests with
+`-m "not slow and not integration and not mesolite"`.
+
 ### Running Linting
 
 ```bash
