@@ -10,6 +10,7 @@ def plot_unrolled_detector(
     finder_peaks=None,
     out_name="unrolled_detector_peaks.png",
     instrument=None,
+    dpi=600,
 ):
     fig, ax = plt.subplots(figsize=(16, 6))
 
@@ -438,5 +439,5 @@ def plot_unrolled_detector(
             markerscale=0.5,
         )
 
-    plt.savefig(out_name, dpi=600, bbox_inches="tight", pad_inches=0.05)
+    plt.savefig(out_name, dpi=dpi, bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)
