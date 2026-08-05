@@ -1805,3 +1805,65 @@ def test_stray_counts_on_sparse_background_are_not_peaks():
         f"real peak lost on sparse background: {len(peaks2)} peaks, "
         f"nearest {dists.min() if len(peaks2) else np.inf:.1f} px"
     )
+
+
+def test_num_sigmas_decouples_bank_resolution_from_the_ceiling():
+    """Bank resolution is settable without moving the ceiling.
+
+    With `num_sigmas` fixed, `max_sigma` sets the ceiling *and* the spacing
+    ((max - min) / (n - 1)), so a wider range can only be bought by coarsening
+    the bank -- and a coarse bank approximates a peak whose true width falls
+    between two available scales with several atoms instead of one.  Exposing
+    `num_sigmas` makes those independent, which is what lets the duplicate
+    mechanism be tested rather than inferred.
+    """
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    coarse = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0)
+    assert len(np.asarray(coarse.sigmas)) == 5
+    assert np.isclose(np.diff(np.asarray(coarse.sigmas)).mean(), 1.0)
+
+    # Same ceiling, finer bank: spacing falls, ceiling does not move.
+    fine = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0, num_sigmas=17)
+    fine_s = np.asarray(fine.sigmas)
+    assert len(fine_s) == 17
+    assert np.isclose(fine_s[-1], 5.0) and np.isclose(fine_s[0], 1.0)
+    assert np.isclose(np.diff(fine_s).mean(), 0.25)
+
+    # It reaches the finder through the harvest kwargs the CLI populates.
+    import inspect
+
+    from subhkl.integration import orchestrator
+
+    src = inspect.getsource(orchestrator.prepare_harvest_tasks)
+    assert 'harvest_peaks_kwargs.get("num_sigmas"' in src
+
+
+def test_degenerate_single_width_bank_collapses_instead_of_duplicating():
+    """min_sigma == max_sigma must not silently solve N copies of one channel.
+
+    `linspace(s, s, n)` yields n identical widths: n times the solve cost, and
+    gamma -- which only ever weighs scales against each other -- becomes inert,
+    so runs at different gamma come back bit-identical.  A single-width bank is
+    a legitimate request; the duplication is not.
+    """
+    import numpy as np
+    import pytest
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    degenerate = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=1.5)
+    assert degenerate.num_sigmas == 1
+    assert np.asarray(degenerate.sigmas).tolist() == [1.5]
+    assert degenerate.K_weights.shape[0] == 1
+
+    # An explicitly single-scale bank is unchanged, and an inverted range is an
+    # error rather than an empty bank.
+    single = MatrixFreeSparseRBFPeakFinder(min_sigma=2.0, max_sigma=2.0, num_sigmas=1)
+    assert single.num_sigmas == 1
+    with pytest.raises(ValueError, match="below min_sigma"):
+        MatrixFreeSparseRBFPeakFinder(min_sigma=4.0, max_sigma=2.0)
+    with pytest.raises(ValueError, match="at least 1"):
+        MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0, num_sigmas=0)
