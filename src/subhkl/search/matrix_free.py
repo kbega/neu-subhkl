@@ -1307,6 +1307,40 @@ class MatrixFreeSparseRBFPeakFinder:
             images_batch, bg_map, results
         )
 
+        # Bank-edge report, both ends.  An atom pinned at the ceiling is a
+        # width the bank could not represent (max_sigma too small -- and the
+        # solver then tiles the reflection with several atoms, which the
+        # per-peak metrics score as a *better* fit); one pinned at the floor
+        # is the mirror statement about min_sigma.  These are the
+        # configuration-selection statistics: the operating point is the
+        # smallest ceiling at which saturation reaches zero, with no
+        # hand-chosen threshold involved.  Always computed and stored;
+        # printed under show_steps.
+        all_sigma = np.concatenate(
+            [np.asarray(p)[:, 3] for p in results if len(p)] or [np.zeros(0)]
+        )
+        n_atoms = all_sigma.size
+        self.bank_saturation = {
+            "ceiling": float(
+                np.mean(all_sigma >= self.boundary_sigma_frac * self.max_sigma)
+            )
+            if n_atoms
+            else 0.0,
+            "floor": float(
+                np.mean(all_sigma <= self.min_sigma / self.boundary_sigma_frac)
+            )
+            if n_atoms
+            else 0.0,
+        }
+        if self.show_steps and n_atoms:
+            print(
+                f"  > Bank saturation: {100 * self.bank_saturation['ceiling']:.1f}% "
+                f"of atoms at the ceiling (max_sigma={self.max_sigma:g}), "
+                f"{100 * self.bank_saturation['floor']:.1f}% at the floor "
+                f"(min_sigma={self.min_sigma:g}).  Nonzero ceiling saturation "
+                "means widths were imposed, not measured: raise max_sigma."
+            )
+
         return results
 
     @partial(jit, static_argnames=["self"])
@@ -1441,6 +1475,23 @@ class MatrixFreeSparseRBFPeakFinder:
         large residual is a real peak fitted with the wrong shape (a mis-sized
         sigma, or a neighbour it has swallowed); a dD near or below zero is an
         atom the data do not support at all.  See ``_peak_metrics_image``.
+
+        .. warning::
+            Both metrics are *within-configuration* statistics.  They rank
+            peaks and track regressions at a fixed bank; they must not be
+            used to compare configurations that change how reflections are
+            tiled (``max_sigma``, ``num_sigmas``, ``gamma``).  N narrow atoms
+            tiling one broad reflection each fit their own sub-footprint
+            extremely well, so splitting *improves* both statistics by
+            construction: measured on real CG4D data, a ceiling-starved bank
+            that tiled three reflections with 23 atoms scored 0% residual
+            misfit while the correct three-atom solution scored 24% -- the
+            natural "lower is better" reading is exactly inverted across
+            bank changes.  For choosing a configuration use the ceiling
+            saturation fraction reported by ``find_peaks_batch`` (smallest
+            ceiling at which it reaches zero) and the global BIC from
+            ``compute_metrics``, whose per-atom parameter penalty is the
+            anti-tiling term the local metrics lack.
         """
         B = images_raw.shape[0]
         max_k = max([len(p) for p in peaks_list] + [1])
