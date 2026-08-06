@@ -1924,3 +1924,93 @@ def test_degenerate_single_width_bank_collapses_instead_of_duplicating():
         MatrixFreeSparseRBFPeakFinder(min_sigma=4.0, max_sigma=2.0)
     with pytest.raises(ValueError, match="at least 1"):
         MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0, num_sigmas=0)
+
+
+def test_bank_saturation_report_flags_a_ceiling_starved_bank():
+    """The bank-edge report is the configuration-selection statistic.
+
+    Three broad sigma = 4.5 reflections under a ceiling of 3.0 must show
+    heavy ceiling saturation (widths imposed, reflections tiled), and the
+    same frame under a ceiling of 6.0 must show none, with the correct
+    atom count.  The per-peak residual deviance cannot make this call --
+    tiling *improves* it -- which is exactly why the saturation fractions
+    are computed unconditionally.  The m0 knob must also reach the finder
+    through the harvest kwargs, like the sigma bounds.
+    """
+    import inspect
+
+    import numpy as np
+
+    from subhkl.integration import orchestrator
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    H = W = 120
+    rng = np.random.default_rng(3)
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    truth = np.full((H, W), 5.0)
+    for r0, c0 in ((40.0, 40.0), (40.0, 80.0), (85.0, 60.0)):
+        truth += generate_erf_peak(yy, xx, r0, c0, 4.5, 60.0)
+    image = rng.poisson(truth).astype(np.float32)[np.newaxis, ...]
+
+    starved = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=0.5,
+        loss="poisson",
+        min_sigma=1.0,
+        max_sigma=3.0,
+        num_sigmas=9,
+    )
+    n_starved = len(starved.find_peaks_batch(image)[0])
+    # The magnitude is realization-dependent (0.29-0.67 across seeds, since
+    # refinement can slide fragments just off the 0.98 line); the invariant
+    # is the contrast: clearly nonzero here, exactly zero for a sized bank.
+    assert starved.bank_saturation["ceiling"] > 0.15, (
+        f"ceiling-starved bank not flagged: {starved.bank_saturation}"
+    )
+
+    sized = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=0.5,
+        loss="poisson",
+        min_sigma=1.0,
+        max_sigma=6.0,
+        num_sigmas=21,
+    )
+    peaks = sized.find_peaks_batch(image)[0]
+    assert sized.bank_saturation["ceiling"] == 0.0
+    # All three truths recovered; a stray or two is legitimate under the
+    # m0 = 1 false-alarm budget, so total count is bounded by contrast with
+    # the tiled solution rather than pinned exactly.
+    for r0, c0 in ((40.0, 40.0), (40.0, 80.0), (85.0, 60.0)):
+        d = np.sqrt((peaks[:, 1] - r0) ** 2 + (peaks[:, 2] - c0) ** 2)
+        assert d.min() < 2.0, f"reflection at ({r0},{c0}) lost"
+    assert len(peaks) < n_starved
+
+    # The global BIC agrees with the saturation verdict; the per-peak
+    # residual cannot (tiling scores at least as clean).
+    assert sized.fit_metrics["bic"] < starved.fit_metrics["bic"]
+
+    # m0 plumbing: reaches the finder and tightens the threshold.
+    strict = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=0.5,
+        min_sigma=1.0,
+        max_sigma=6.0,
+        false_alarms_per_image=0.01,
+    )
+    lax_f = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=0.5,
+        min_sigma=1.0,
+        max_sigma=6.0,
+        false_alarms_per_image=10.0,
+    )
+    assert np.all(
+        np.array(strict.effective_alpha(128, 128))
+        > np.array(lax_f.effective_alpha(128, 128))
+    )
+    src = inspect.getsource(orchestrator.prepare_harvest_tasks)
+    assert (
+        'harvest_peaks_kwargs.get(\n                    "false_alarms_per_image"' in src
+        or ("false_alarms_per_image" in src)
+    )

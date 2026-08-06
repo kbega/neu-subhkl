@@ -140,6 +140,11 @@ def prepare_harvest_tasks(
                 # max_sigma sets both, so a wider range can only be bought by
                 # coarsening the spacing.
                 num_sigmas=harvest_peaks_kwargs.get("num_sigmas", 5),
+                # The m0 of the false-alarm calibration: expected false peaks
+                # per image.  The one knob that sets the detection budget.
+                false_alarms_per_image=harvest_peaks_kwargs.get(
+                    "false_alarms_per_image", 1.0
+                ),
                 show_steps=harvest_peaks_kwargs.get("show_steps", False),
             )
         batch_coords = alg.find_peaks_batch(img_stack)

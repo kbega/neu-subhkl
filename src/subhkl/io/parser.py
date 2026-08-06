@@ -100,6 +100,17 @@ def finder(
     sparse_rbf_gamma: float = 0.5,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
+    sparse_rbf_false_alarms_per_image: Annotated[
+        float,
+        typer.Option(
+            help="Expected number of false peaks per image (the m0 of the "
+            "false-alarm calibration). This is the parameter that sets the "
+            "detection budget: the significance threshold is solved from "
+            "E[false peaks] = m0 over every (position, scale) tested, so "
+            "lowering it demands more evidence everywhere at once. gamma "
+            "reshapes the threshold across scales at constant budget."
+        ),
+    ] = 1.0,
     sparse_rbf_num_sigmas: Annotated[
         int,
         typer.Option(
@@ -170,6 +181,7 @@ def finder(
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
         sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
+        sparse_rbf_false_alarms_per_image=sparse_rbf_false_alarms_per_image,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
         sparse_rbf_legacy=sparse_rbf_legacy,
