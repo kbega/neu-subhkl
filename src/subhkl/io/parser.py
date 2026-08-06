@@ -111,7 +111,7 @@ def finder(
             "to demand more evidence than that."
         ),
     ] = None,
-    sparse_rbf_gamma: float = 0.5,
+    sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
     sparse_rbf_false_alarms_per_image: Annotated[

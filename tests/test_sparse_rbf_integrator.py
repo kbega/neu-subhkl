@@ -8,8 +8,10 @@ scale coordinate, and because extra atoms always absorb a little more noise the
 fit breaks the tie towards splitting -- a single peak is reported as a cluster.
 See docs/matrix_free_theory.md, Theorem 1.
 
-``gamma=0.5`` is used uniformly so that no test depends on its own tuning: it
-is the shipped default, not a bound.  Only the upper end is a wall --
+``gamma=0.5`` is used uniformly so that no test depends on its own tuning.
+It is a fixed historical operating point, not the shipped default -- that is
+now ``gamma=0``, the flux-matched value; see the finder's class docstring for
+the derivation.  Only the upper end is a wall --
 ``gamma=1`` fragments, for the reason above.  Below the default the penalty
 simply prefers broader atoms more strongly, continuously and through zero into
 negative values, so ``gamma<=0`` is a legitimate setting for diffuse features
