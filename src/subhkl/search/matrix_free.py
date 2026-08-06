@@ -63,19 +63,38 @@ class MatrixFreeSparseRBFPeakFinder:
     widths simply track the broad-atom preference.  What the sweep does show
     is the fragmentation at ``gamma = 1`` the paragraphs above predict.
 
-    The default is 0.5.  It should still be calibrated like ``alpha`` or a
-    regularisation strength, against the merge/split error pair, and that
-    calibration is only meaningful away from 1.0 -- the single point where the
-    penalty carries no information about model order at all.  Which side of
-    the default suits a given experiment depends on what is being measured:
-    lower (including negative) for diffuse or broad features, higher -- but
-    short of 1 -- to keep close compact neighbours apart.
+    The default is 0, and unlike its predecessor (0.5, inherited from the
+    test-suite operating point) it is derived rather than tuned.  Under the
+    calibrated threshold the minimum detectable *flux* at scale sigma works
+    out to
+
+        F_min(sigma)  ~  z * sigma**(gamma + 1) * sqrt(U),
+
+    (coefficient threshold z * sigma**gamma * sd_c with sd_c ~ sqrt(U)/sigma,
+    times the atom's flux-per-coefficient 2 pi sigma**2), while pure photon
+    statistics -- the matched-filter sensitivity for a flux F at scale sigma
+    on background U -- gives F_min ~ z * sigma * sqrt(U).  The two agree
+    exactly at ``gamma = 0`` and only there: any positive gamma demands more
+    flux than counting statistics requires at broad scales (missing real
+    broad reflections), any negative gamma does the same at fine scales.  So
+    gamma = 0 is the detection-neutral, likelihood-ratio operating point --
+    and it still breaks the splitting degeneracy, because the penalty per
+    unit flux ~ sigma**(gamma-1) = 1/sigma remains strictly decreasing;
+    only gamma = 1 is degenerate.  The ten-dataset benchmark survey found
+    gamma = 0 optimal across instruments, which is this argument measured.
+
+    gamma is therefore a physics switch, not a tuning knob: 0 for point-like
+    reflections, negative to impose a smoothness prior when the features of
+    interest are genuinely diffuse, and never near 1.  Note the false-alarm
+    calibration holds E[FP] = m0 at every gamma, so moving gamma reshapes
+    *which scales* the budget is spent on without changing the budget --
+    the two axes are orthogonal by construction.
     """
 
     def __init__(
         self,
         alpha: float | None = None,
-        gamma: float = 0.5,
+        gamma: float = 0.0,
         min_sigma: float = 1.0,
         max_sigma: float = 5.0,
         num_sigmas: int = 5,
