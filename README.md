@@ -137,6 +137,13 @@ command re-runs the search, so this is quick, and `--dpi` trades resolution for
 size. Keep the two HDF5 files -- from a benchmark artifact, for instance -- and
 any run can be spot-checked without the raw data.
 
+Each peak is outlined at the size it was actually fitted with, not at a fixed
+marker size: a circle of radius `n_sigma * sigma` for the sparse-RBF finder's
+isotropic widths, and the corresponding ellipse for the RBF integrator's full
+covariance. `--n-sigma` sets which contour that is (2 by default, holding about
+86% of a 2D Gaussian's flux). The finders that fit no width are drawn as plain
+markers, because there is no size to draw.
+
 ## Physics and Conventions
 
 This project uses the **Laue Equation** to relate Miller indices $(h, k, l)$ to the scattering vector $Q$:

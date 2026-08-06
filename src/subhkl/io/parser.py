@@ -6,6 +6,8 @@ import typer
 import h5py
 import os
 
+from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
+
 from subhkl.commands import (
     run_index,
     run_rbf_integrator,
@@ -755,6 +757,11 @@ _INSTRUMENT_HELP = (
     "files do not record it, so pass it if the peaks file predates the change."
 )
 _OUTPUT_DIR_HELP = "Where to write the plots (default: next to the peaks file)"
+_N_SIGMA_HELP = (
+    "How many standard deviations out to draw each peak's outline. A peak has "
+    "no edge, only a width, so the circle is a choice of contour; 2 sigma "
+    "holds about 86% of a 2D Gaussian's flux."
+)
 _DPI_HELP = (
     "Resolution of the saved plots. The inline plots are written at 600, which "
     "is too heavy to keep for every run of a benchmark sweep."
@@ -768,6 +775,7 @@ def finder_visualize(
     instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
     output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
+    n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
     max_workers: Optional[int] = None,
     show_progress: bool = True,
 ):
@@ -786,6 +794,7 @@ def finder_visualize(
         instrument=instrument,
         output_dir=output_dir,
         dpi=dpi,
+        n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
     )
@@ -800,6 +809,7 @@ def integrator_visualize(
     instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
     output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
+    n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
     max_workers: Optional[int] = None,
     show_progress: bool = True,
 ):
@@ -816,6 +826,7 @@ def integrator_visualize(
         instrument=instrument,
         output_dir=output_dir,
         dpi=dpi,
+        n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
     )

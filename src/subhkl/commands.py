@@ -8,7 +8,7 @@ from subhkl.instrument.goniometer import (
 from subhkl.integration import Peaks
 from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
-from subhkl.viz import replay
+from subhkl.viz import detector_assembly, replay
 
 from typing import List
 
@@ -1729,6 +1729,7 @@ def run_finder_visualize(
     instrument: str | None = None,
     output_dir: str | None = None,
     dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
     max_workers: int | None = None,
     show_progress: bool = True,
 ):
@@ -1745,6 +1746,7 @@ def run_finder_visualize(
         instrument=instrument,
         output_dir=output_dir,
         dpi=dpi,
+        n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
     )
@@ -1758,6 +1760,7 @@ def run_integrator_visualize(
     instrument: str | None = None,
     output_dir: str | None = None,
     dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
     max_workers: int | None = None,
     show_progress: bool = True,
 ):
@@ -1773,6 +1776,7 @@ def run_integrator_visualize(
         instrument=instrument,
         output_dir=output_dir,
         dpi=dpi,
+        n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
     )
