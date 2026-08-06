@@ -77,9 +77,10 @@ afterwards, from the image stack and the peaks file:
 python -m subhkl.io.parser finder-visualize MANDI_11612.reduce.h5 finder_output_11612.h5 --dpi 150
 ```
 
-Each peak is drawn at the width the finder fitted it, so the plot shows not
-just where the peaks are but how big the search thought they were. The
-integrator's plots come back the same way, at the shape it fitted:
+Each peak is drawn at the width the finder fitted it — a circle of radius
+`--n-sigma` times that width — so the plot shows not just where the peaks are
+but how big the search thought they were, which a fixed marker size cannot.
+The integrator's plots come back the same way, at the shape it fitted:
 
 ```commandline
 python -m subhkl.io.parser integrator-visualize MANDI_11612.reduce.h5 rbf_integrator_11612.h5
