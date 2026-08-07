@@ -1,3 +1,4 @@
+import warnings
 from functools import partial
 
 import jax
@@ -6,6 +7,132 @@ import jax.scipy.signal
 import jax.scipy.sparse.linalg
 import numpy as np
 from jax import jit, lax, vmap
+
+# --- Carpet-fragmentation control --------------------------------------------
+#
+# A truth width sigma* strictly between two bank widths can be rendered two
+# ways: as a point mixture of the two bracketing atoms (concentrated, but
+# inexact -- the shape error is 4th order in the gap), or as a spatial carpet
+# of the narrower atom (exact for any sigma* >= sigma_k, by the Gaussian
+# semigroup G_sigma* = G_sigma_k * G_sqrt(sigma*^2-sigma_k^2), but taxed by
+# the sigma**gamma penalty, 1st order in the gap).  The solver takes whichever
+# is cheaper in the objective, and when the bank is too sparse in sigma that
+# is the carpet: one physical peak comes back as a cluster of narrow atoms.
+# No gamma < 1 can prevent it, because the tax is levied per unit mass while
+# the fidelity gap grows with the 4th power of the gap -- the penalty only
+# wins below a critical bank density.  The helpers below price both options
+# so the bank can be sized to that density (num_sigmas=None) or an explicit
+# bank flagged when it is predicted to fragment.
+#
+# Fidelity is the exact Poisson-core-weighted projection residual of the
+# bracketing pair (no small-gap expansion: at the narrow end of a uniform
+# bank the relative gap is O(1) and a Taylor form is badly wrong).  The tax
+# is the flux-matched carpet surcharge priced at the calibrated per-height
+# threshold lam_k ~ z sqrt(pi sigma_k^2 / bg) (sigma_k/ref)^gamma.  In the
+# bright-peak limit both sides are linear in peak height, so the criterion is
+# amplitude-free; brightness only enters through the assumed peak/background
+# contrast in the weight.  Two constants tie the model to a measured
+# fragmentation case (bank [1,25]x5, truth sigma*=15 at height 120 over
+# background 7.6): the collected tax is only ~32% of the nominal flux-matched
+# assessment, because the carpet's many small coefficients soft-threshold
+# pointwise and shed their skirt into the background estimate, which a rigid
+# 2-atom mixture cannot; and the realised fidelity gap was 3.8x the idealised
+# projection residual (886 vs 233 nats), dominated by the background bias
+# under wide peaks that the carpet absorbs and the pair cannot.
+
+_FRAG_RHO = 0.32  # collected fraction of the nominal carpet tax (measured)
+_FRAG_FID_CAL = 3.8  # realised / idealised fidelity gap (measured)
+_FRAG_CONTRAST = 16.0  # peak/background contrast of the calibration case
+_FRAG_BG = 10.0  # nominal background rate [photons/Pixel]
+_FRAG_Z = 4.0  # nominal calibrated threshold z-score (log-weak in size)
+_NUM_SIGMAS_SOFT_CAP = 16  # solve cost is linear in the channel count
+
+
+def _frag_pair_ratio(sa, sb, gamma, ref_sigma):
+    """Worst fidelity/tax ratio over off-grid widths in the gap (sa, sb).
+
+    A value above 1 predicts that some bright peak of width inside the gap
+    is cheaper to represent as a carpet of sigma-sa atoms than as a point
+    mixture of the two bracketing atoms, i.e. that the fit will fragment it.
+    """
+    va, vb = sa * sa, sb * sb
+    r = np.linspace(0.0, 6.0 * sb, 1500)
+    dA = 2.0 * np.pi * r
+    fa = np.exp(-r * r / (2.0 * va))
+    fb = np.exp(-r * r / (2.0 * vb))
+    lam_a = _FRAG_Z * np.sqrt(np.pi * va / _FRAG_BG) * (sa / ref_sigma) ** gamma
+    lam_b = _FRAG_Z * np.sqrt(np.pi * vb / _FRAG_BG) * (sb / ref_sigma) ** gamma
+    worst = 0.0
+    for t in (0.2, 0.35, 0.5, 0.65, 0.8):
+        vs = (1.0 - t) * va + t * vb
+        fs = np.exp(-r * r / (2.0 * vs))
+        wt = dA / (fs + 1.0 / _FRAG_CONTRAST)
+        G = np.array(
+            [
+                [np.trapezoid(fa * fa * wt, r), np.trapezoid(fa * fb * wt, r)],
+                [np.trapezoid(fa * fb * wt, r), np.trapezoid(fb * fb * wt, r)],
+            ]
+        )
+        h = np.array(
+            [np.trapezoid(fa * fs * wt, r), np.trapezoid(fb * fs * wt, r)]
+        )
+        w = np.maximum(np.linalg.solve(G, h), 0.0)
+        fid = 0.5 * (np.trapezoid(fs * fs * wt, r) - 2.0 * w @ h + w @ G @ w)
+        tax = max(lam_a * vs / va - (w[0] * lam_a + w[1] * lam_b), 0.0)
+        worst = max(worst, _FRAG_FID_CAL * fid / max(_FRAG_RHO * tax, 1e-12))
+    return worst
+
+
+def _frag_worst_ratio(sigmas, gamma, ref_sigma):
+    """Worst pair ratio over a bank; returns (ratio, sigma near the worst gap)."""
+    worst, where = 0.0, float(sigmas[0])
+    for sa, sb in zip(sigmas[:-1], sigmas[1:]):
+        ratio = _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma)
+        if ratio > worst:
+            worst, where = ratio, float(np.sqrt(0.5 * (sa * sa + sb * sb)))
+    return worst, where
+
+
+def _required_uniform_num_sigmas(min_sigma, max_sigma, gamma, ref_sigma, nmax=64):
+    """Smallest uniform-grid num_sigmas with no fragmenting gap, or None."""
+    for n in range(2, nmax + 1):
+        sigmas = np.linspace(min_sigma, max_sigma, n)
+        if all(
+            _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma) <= 1.0
+            for sa, sb in zip(sigmas[:-1], sigmas[1:])
+        ):
+            return n
+    return None
+
+
+def _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma):
+    """Smallest bank with no fragmenting gap: greedy widest-safe-step placement.
+
+    The safe gap is roughly a constant *ratio* (~1.3-1.6x, tightening as
+    sigma**(1-gamma) toward the wide end), so the minimal grid is close to
+    geometric.  A uniform grid pays that ratio at the narrowest pair and
+    needs several times more channels for the same guarantee -- e.g. 38
+    uniform vs ~12 adaptive over [1, 25] at gamma = 0.
+    """
+    grid = [float(min_sigma)]
+    while grid[-1] < max_sigma * (1.0 - 1e-9) and len(grid) < 64:
+        sa = grid[-1]
+        if _frag_pair_ratio(sa, max_sigma, gamma, ref_sigma) <= 1.0:
+            grid.append(float(max_sigma))
+            break
+        lo, hi = sa, float(max_sigma)
+        for _ in range(20):
+            mid = 0.5 * (lo + hi)
+            if _frag_pair_ratio(sa, mid, gamma, ref_sigma) <= 1.0:
+                lo = mid
+            else:
+                hi = mid
+        # A vanishing safe step means the criterion cannot be met locally
+        # (pathological parameters); take a small fixed ratio rather than spin.
+        grid.append(max(lo, sa * 1.05))
+    if grid[-1] < max_sigma:
+        grid.append(float(max_sigma))
+    return grid
 
 
 class MatrixFreeSparseRBFPeakFinder:
@@ -89,6 +216,22 @@ class MatrixFreeSparseRBFPeakFinder:
     calibration holds E[FP] = m0 at every gamma, so moving gamma reshapes
     *which scales* the budget is spent on without changing the budget --
     the two axes are orthogonal by construction.
+
+    One caveat bounds all of the above: gamma's broad-atom preference is only
+    enforceable when the competing broad atom exists in the bank.  For a truth
+    width strictly between two bank widths the atomic option is missing; the
+    fit then chooses between an inexact point mixture of the bracketing atoms
+    (shape error 4th order in the gap) and an exact semigroup carpet of the
+    narrower one (penalty surcharge 1st order in the gap), and once the bank
+    is too sparse in sigma the carpet wins at any gamma < 1 -- one bright peak
+    is reported as a cluster of narrow atoms (measured: an 886-nat fidelity
+    gap against a 245-nat collected tax on a [1, 25] x 5 bank).  The default
+    ``num_sigmas=None`` therefore sizes the bank automatically to the
+    smallest, roughly geometric grid whose every gap keeps the tax ahead of
+    the shape error, and an explicit ``num_sigmas`` below that density
+    triggers a fragmentation warning at construction.  See the
+    carpet-fragmentation helpers at module scope for the criterion and its
+    calibration.
     """
 
     def __init__(
@@ -97,7 +240,7 @@ class MatrixFreeSparseRBFPeakFinder:
         gamma: float = 0.0,
         min_sigma: float = 1.0,
         max_sigma: float = 5.0,
-        num_sigmas: int = 5,
+        num_sigmas: int | None = None,
         loss: str = "poisson",
         show_steps: bool = False,
         ref_sigma: float = 1.0,
@@ -113,7 +256,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 f"max_sigma ({max_sigma}) is below min_sigma ({min_sigma}); "
                 "the basis bank would be empty."
             )
-        if num_sigmas < 1:
+        if num_sigmas is not None and num_sigmas < 1:
             raise ValueError(f"num_sigmas must be at least 1, got {num_sigmas}")
 
         # A zero-width range is a single scale, whatever num_sigmas asks for.
@@ -125,14 +268,64 @@ class MatrixFreeSparseRBFPeakFinder:
         # rather than failing, because a single-width bank is a legitimate
         # request (the finder is then a matched filter at one scale) and only
         # the duplication is wrong.
-        if max_sigma == min_sigma and num_sigmas > 1:
-            if show_steps:
+        if max_sigma == min_sigma:
+            if num_sigmas is not None and num_sigmas > 1 and show_steps:
                 print(
                     f"  > min_sigma == max_sigma == {min_sigma:g}: collapsing the "
                     f"bank from {num_sigmas} identical widths to 1 "
                     "(gamma has no effect on a single-scale bank)."
                 )
             num_sigmas = 1
+
+        # Bank sizing against carpet fragmentation (see the helpers at module
+        # scope).  num_sigmas=None sizes the bank to the smallest grid whose
+        # every sigma gap keeps the penalty tax ahead of the mixture's shape
+        # error; an explicit num_sigmas keeps the historical uniform grid and
+        # is checked against the same criterion.
+        sigma_grid = None
+        if num_sigmas is None:
+            sigma_grid = _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma)
+            num_sigmas = len(sigma_grid)
+            print(
+                f"  > num_sigmas auto-tuned to {num_sigmas} for sigma in "
+                f"[{min_sigma:g}, {max_sigma:g}] at gamma = {gamma:g} "
+                "(fragmentation control; pass num_sigmas to override): "
+                + ", ".join(f"{s:.3g}" for s in sigma_grid)
+            )
+            if num_sigmas > _NUM_SIGMAS_SOFT_CAP:
+                warnings.warn(
+                    f"auto-tuned num_sigmas={num_sigmas} exceeds "
+                    f"{_NUM_SIGMAS_SOFT_CAP}; solve cost and memory scale "
+                    "linearly with the channel count.  The narrow end of the "
+                    "range dominates the requirement, so raising min_sigma is "
+                    "the strongest lever; alternatively narrow the sigma range "
+                    "or pass an explicit (smaller) num_sigmas and accept that "
+                    "off-grid peak widths may be reported fragmented.",
+                    stacklevel=2,
+                )
+        elif num_sigmas >= 2 and max_sigma > min_sigma:
+            ratio, near = _frag_worst_ratio(
+                np.linspace(min_sigma, max_sigma, num_sigmas), gamma, ref_sigma
+            )
+            if ratio > 1.0:
+                n_req = _required_uniform_num_sigmas(
+                    min_sigma, max_sigma, gamma, ref_sigma
+                )
+                n_auto = len(
+                    _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma)
+                )
+                warnings.warn(
+                    f"num_sigmas={num_sigmas} is below the fragmentation "
+                    f"threshold for sigma in [{min_sigma:g}, {max_sigma:g}] at "
+                    f"gamma = {gamma:g}: bright peaks of off-grid width (worst "
+                    f"near sigma ~ {near:.1f}, fidelity/tax ratio {ratio:.1f}) "
+                    "are predicted to be reported as clusters of narrower "
+                    "atoms rather than one atom.  A uniform grid needs "
+                    f"num_sigmas >= {n_req if n_req else '> 64'}; "
+                    f"num_sigmas=None auto-tunes an adaptive {n_auto}-channel "
+                    "bank instead.",
+                    stacklevel=2,
+                )
 
         self.alpha = alpha
         self.gamma = gamma
@@ -153,7 +346,10 @@ class MatrixFreeSparseRBFPeakFinder:
         self.false_alarms_per_image = float(false_alarms_per_image)
 
         # 1. Pre-build the Filter Bank
-        self.sigmas = jnp.linspace(min_sigma, max_sigma, num_sigmas)
+        if sigma_grid is not None:
+            self.sigmas = jnp.asarray(sigma_grid, dtype=jnp.float32)
+        else:
+            self.sigmas = jnp.linspace(min_sigma, max_sigma, num_sigmas)
         self.max_k_rad = int(3.0 * max_sigma)
 
         # Use strictly unnormalized physical bases to preserve flux relationships

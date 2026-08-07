@@ -136,10 +136,10 @@ def prepare_harvest_tasks(
                 loss=harvest_peaks_kwargs.get("loss", "poisson"),
                 min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
                 max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
-                # Bank resolution, independent of the ceiling: without it
-                # max_sigma sets both, so a wider range can only be bought by
-                # coarsening the spacing.
-                num_sigmas=harvest_peaks_kwargs.get("num_sigmas", 5),
+                # Bank resolution, independent of the ceiling.  None lets the
+                # finder auto-size the bank against carpet fragmentation; an
+                # explicit count keeps the historical uniform grid.
+                num_sigmas=harvest_peaks_kwargs.get("num_sigmas"),
                 # The m0 of the false-alarm calibration: expected false peaks
                 # per image.  The one knob that sets the detection budget.
                 false_alarms_per_image=harvest_peaks_kwargs.get(

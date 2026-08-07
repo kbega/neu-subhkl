@@ -112,16 +112,18 @@ def finder(
         ),
     ] = 1.0,
     sparse_rbf_num_sigmas: Annotated[
-        int,
+        int | None,
         typer.Option(
             help="Number of widths in the basis bank, spaced linearly from "
             "--sparse-rbf-min-sigma to --sparse-rbf-max-sigma. Controls the "
             "bank's resolution independently of its ceiling: raising max-sigma "
             "alone widens the spacing, which approximates a peak whose true "
             "width falls between two available scales with several atoms "
-            "instead of one."
+            "instead of one. The default (unset) auto-sizes an adaptive bank "
+            "just dense enough to prevent exactly that fragmentation, and an "
+            "explicit value below that density warns at startup."
         ),
-    ] = 5,
+    ] = None,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_loss: Annotated[
         str,

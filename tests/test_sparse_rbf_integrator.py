@@ -318,6 +318,17 @@ def test_gaussian_loss_path_finds_peaks():
     assertion on flux was testing a quantity with no consumer, and it was the
     only thing keeping the debiasing phase alive.  What still needs covering is
     that ``loss="gaussian"`` runs and localises, which is what this asserts.
+
+    Localisation is asserted on the flux-weighted centroid of the detections
+    near each truth position, not on the single nearest detection.  The truth
+    widths here (2.0, 3.0) sat exactly on the historical uniform [1..5] bank,
+    which made a nearest-atom assertion look tight; under the auto-sized bank
+    truth widths are generically off-grid, and the gaussian path may then
+    report a bright peak as a sub-pixel pair straddling the true centre (the
+    thin-grid split on the *position* grid).  The pair's centroid stays within
+    a small fraction of a pixel while the nearest single atom jitters around
+    1 px with GPU nondeterminism, so the centroid is the stable statement of
+    the contract this test exists to keep.
     """
     import numpy as np
 
@@ -345,8 +356,15 @@ def test_gaussian_loss_path_finds_peaks():
         assert len(peaks) >= 2, f"{loss} loss found {len(peaks)} peaks, expected 2"
         for r, c, _sig, _amp in truth:
             d = np.sqrt((peaks[:, 1] - r) ** 2 + (peaks[:, 2] - c) ** 2)
-            assert d.min() < 1.0, (
+            assert d.min() < 2.0, (
                 f"{loss} loss missed the peak at ({r}, {c}); nearest was {d.min():.2f} px"
+            )
+            near = peaks[d < 3.0]
+            cy = np.average(near[:, 1], weights=near[:, 0])
+            cx = np.average(near[:, 2], weights=near[:, 0])
+            err = np.sqrt((cy - r) ** 2 + (cx - c) ** 2)
+            assert err < 1.0, (
+                f"{loss} loss centroid off by {err:.2f} px at ({r}, {c})"
             )
 
 
