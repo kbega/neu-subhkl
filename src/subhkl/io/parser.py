@@ -111,6 +111,19 @@ def finder(
             "reshapes the threshold across scales at constant budget."
         ),
     ] = 1.0,
+    sparse_rbf_max_fragmentation_rate: Annotated[
+        float | None,
+        typer.Option(
+            help="Calibrate the sigma bank against this many tolerable "
+            "unsupported atoms per image -- the bank-sizing analogue of "
+            "--sparse-rbf-false-alarms-per-image.  An unsupported atom is one "
+            "whose leave-one-out deviance falls below the chi^2_4 95% point: "
+            "the signature of one peak reported as a cluster of fragments.  "
+            "Runs one full solve of the first frame per calibration rung "
+            "before the main pass, so it costs a few extra solves up front.  "
+            "Unset keeps the factory calibration."
+        ),
+    ] = None,
     sparse_rbf_num_sigmas: Annotated[
         int | None,
         typer.Option(
@@ -183,6 +196,7 @@ def finder(
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
         sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
+        sparse_rbf_max_fragmentation_rate=sparse_rbf_max_fragmentation_rate,
         sparse_rbf_false_alarms_per_image=sparse_rbf_false_alarms_per_image,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
