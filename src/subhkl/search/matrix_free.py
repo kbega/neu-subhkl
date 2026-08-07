@@ -59,8 +59,10 @@ from jax import jit, lax, vmap
 # real frame and the measured background in find_peaks_batch, which warns if
 # the built bank falls short on the actual data).
 
-_FRAG_FID_RESIDUAL = 9.9  # realised / idealised carpet advantage, the one
-# empirical constant left: the measured factor (bank [1,25]x5, truth
+_FRAG_FID_RESIDUAL = 9.9  # realised / idealised carpet advantage; factory
+# default of the fid_residual constructor argument, and the one empirical
+# constant left.  calibrate_fragmentation_residual fits it per instrument
+# against a requested unsupported-atom rate, the way m0 fixes the threshold: the measured factor (bank [1,25]x5, truth
 # sigma*=15 at height 120 over background 7.6: 886/245 nats measured against
 # the model's idealised ratio) by which reality favours the carpet beyond
 # the projection model.  It absorbs the carpet's pointwise-shrinkage evasion
@@ -141,7 +143,7 @@ def _moment_peak_amplitude(images, bg_map, bg_hi, quantile=90.0):
     return float(np.percentile(np.asarray(amps), quantile))
 
 
-def _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp):
+def _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp, fid_res=None):
     """Worst fidelity/tax ratio over off-grid widths in the gap (sa, sb).
 
     A value above 1 predicts that a peak of amplitude ``amp`` and some width
@@ -179,25 +181,31 @@ def _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp):
         w = np.maximum(np.linalg.solve(G, h), 0.0)
         fid = 0.5 * (np.trapezoid(fs * fs * wt, r) - 2.0 * w @ h + w @ G @ w)
         tax = max(lam_a * vs / va - (w[0] * lam_a + w[1] * lam_b), 0.0)
-        worst = max(worst, _FRAG_FID_RESIDUAL * fid / max(tax, 1e-12))
+        if fid_res is None:
+            fid_res = _FRAG_FID_RESIDUAL
+        worst = max(worst, fid_res * fid / max(tax, 1e-12))
     return worst
 
 
-def _frag_bank_ratio(sigmas, gamma, ref_sigma, m0, bg, amp, height, width):
+def _frag_bank_ratio(
+    sigmas, gamma, ref_sigma, m0, bg, amp, height, width, fid_res=None
+):
     """Worst pair ratio over a built bank, with z calibrated for that bank.
 
     Returns (ratio, sigma near the worst gap)."""
     z = _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width)
     worst, where = 0.0, float(sigmas[0])
     for sa, sb in zip(sigmas[:-1], sigmas[1:]):
-        ratio = _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma, z, bg, amp)
+        ratio = _frag_pair_ratio(
+            float(sa), float(sb), gamma, ref_sigma, z, bg, amp, fid_res
+        )
         if ratio > worst:
             worst, where = ratio, float(np.sqrt(0.5 * (sa * sa + sb * sb)))
     return worst, where
 
 
 def _required_uniform_num_sigmas(
-    min_sigma, max_sigma, gamma, ref_sigma, m0, bg, amp, nmax=64
+    min_sigma, max_sigma, gamma, ref_sigma, m0, bg, amp, fid_res=None, nmax=64
 ):
     """Smallest uniform-grid num_sigmas with no fragmenting gap, or None."""
     side = _FRAG_NOMINAL_SIDE
@@ -222,6 +230,7 @@ def _auto_sigma_grid(
     amp,
     height=_FRAG_NOMINAL_SIDE,
     width=_FRAG_NOMINAL_SIDE,
+    fid_res=None,
 ):
     """Smallest bank with no fragmenting gap: greedy widest-safe-step placement.
 
@@ -241,13 +250,19 @@ def _auto_sigma_grid(
         grid = [float(min_sigma)]
         while grid[-1] < max_sigma * (1.0 - 1e-9) and len(grid) < 64:
             sa = grid[-1]
-            if _frag_pair_ratio(sa, max_sigma, gamma, ref_sigma, z, bg, amp) <= 1.0:
+            if (
+                _frag_pair_ratio(sa, max_sigma, gamma, ref_sigma, z, bg, amp, fid_res)
+                <= 1.0
+            ):
                 grid.append(float(max_sigma))
                 break
             lo, hi = sa, float(max_sigma)
             for _ in range(20):
                 mid = 0.5 * (lo + hi)
-                if _frag_pair_ratio(sa, mid, gamma, ref_sigma, z, bg, amp) <= 1.0:
+                if (
+                    _frag_pair_ratio(sa, mid, gamma, ref_sigma, z, bg, amp, fid_res)
+                    <= 1.0
+                ):
                     lo = mid
                 else:
                     hi = mid
@@ -277,10 +292,10 @@ def _auto_sigma_grid(
                 for _ in range(15):
                     mid = np.sqrt(lo * hi)
                     left = _frag_pair_ratio(
-                        relaxed[i - 1], mid, gamma, ref_sigma, z, bg, amp
+                        relaxed[i - 1], mid, gamma, ref_sigma, z, bg, amp, fid_res
                     )
                     right = _frag_pair_ratio(
-                        mid, relaxed[i + 1], gamma, ref_sigma, z, bg, amp
+                        mid, relaxed[i + 1], gamma, ref_sigma, z, bg, amp, fid_res
                     )
                     if left > right:
                         hi = mid
@@ -288,7 +303,7 @@ def _auto_sigma_grid(
                         lo = mid
                 relaxed[i] = float(np.sqrt(lo * hi))
         ok = all(
-            _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp) <= 1.0
+            _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp, fid_res) <= 1.0
             for sa, sb in zip(relaxed[:-1], relaxed[1:])
         )
         if ok:
@@ -412,6 +427,7 @@ class MatrixFreeSparseRBFPeakFinder:
         false_alarms_per_image: float = 1.0,
         expected_background: float = _FRAG_BG,
         expected_peak_amplitude: float | None = None,
+        fid_residual: float | None = None,
         **kwargs,
     ):
         if max_sigma < min_sigma:
@@ -452,6 +468,13 @@ class MatrixFreeSparseRBFPeakFinder:
         amp_for_build = (
             _FRAG_PEAK_AMP if amp_is_auto else float(expected_peak_amplitude)
         )
+        # The criterion's one empirical constant, as an instance parameter:
+        # the factory default is _FRAG_FID_RESIDUAL, and
+        # calibrate_fragmentation_residual fits it per instrument against a
+        # requested fragmentation rate, the way m0 fixes the threshold.
+        fid_residual = (
+            _FRAG_FID_RESIDUAL if fid_residual is None else float(fid_residual)
+        )
 
         sigma_grid = None
         if num_sigmas is None:
@@ -463,6 +486,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 false_alarms_per_image,
                 expected_background,
                 amp_for_build,
+                fid_res=fid_residual,
             )
             num_sigmas = len(sigma_grid)
             print(
@@ -492,6 +516,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 amp_for_build,
                 _FRAG_NOMINAL_SIDE,
                 _FRAG_NOMINAL_SIDE,
+                fid_res=fid_residual,
             )
             if ratio > 1.0:
                 n_req = _required_uniform_num_sigmas(
@@ -502,6 +527,7 @@ class MatrixFreeSparseRBFPeakFinder:
                     false_alarms_per_image,
                     expected_background,
                     amp_for_build,
+                    fid_res=fid_residual,
                 )
                 n_auto = len(
                     _auto_sigma_grid(
@@ -512,6 +538,7 @@ class MatrixFreeSparseRBFPeakFinder:
                         false_alarms_per_image,
                         expected_background,
                         amp_for_build,
+                        fid_res=fid_residual,
                     )
                 )
                 warnings.warn(
@@ -538,6 +565,7 @@ class MatrixFreeSparseRBFPeakFinder:
         self.expected_background = float(expected_background)
         self.expected_peak_amplitude = amp_for_build
         self._amp_is_auto = amp_is_auto
+        self.fid_residual = fid_residual
         self.chunk_size = chunk_size
         self.refine_positions = refine_positions
         self.reject_boundary_sigma = reject_boundary_sigma
@@ -1871,9 +1899,10 @@ class MatrixFreeSparseRBFPeakFinder:
                     self.ref_sigma,
                     self.false_alarms_per_image,
                     bg_hi,
-                    self.amp_for_build,
+                    amp_for_resize,
                     H,
                     W,
+                    fid_res=self.fid_residual,
                 )
                 cur = np.asarray(self.sigmas, dtype=float)
                 # Rebuild only for a change that matters: a different channel
@@ -1900,6 +1929,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 amp_hi,
                 H,
                 W,
+                fid_res=self.fid_residual,
             )
             if ratio > 1.0:
                 warnings.warn(
@@ -2201,6 +2231,61 @@ class MatrixFreeSparseRBFPeakFinder:
         resid = jnp.sum(jnp.where(foot, dev_pix, 0.0), axis=(1, 2)) / dof
 
         return loo, resid
+
+    @classmethod
+    def calibrate_fragmentation_residual(
+        cls,
+        images_batch,
+        max_fragmentation_rate=1.0,
+        residual_ladder=(2.5, 5.0, 10.0, 20.0, 40.0),
+        **finder_kwargs,
+    ):
+        """Fit the criterion's empirical constant to a requested rate.
+
+        The bank-sizing analogue of the false-alarm calibration: ``m0``
+        turns "how many spurious peaks per image are tolerable" into a
+        threshold, and this turns "how many unsupported atoms per image are
+        tolerable" into ``fid_residual``.  The observable is the
+        leave-one-out deviance already computed by compute_peak_metrics: an
+        atom whose removal barely changes the fit (dD below the chi^2_4 95%
+        point) is one the data do not independently support, which is
+        exactly what a carpet fragment is -- its neighbours absorb it.  The
+        same statistic also counts the redundant atoms an *over*-dense bank
+        re-introduces, so the measured rate is a U-shaped curve in bank size
+        and the calibration picks the cheapest bank meeting the target
+        rather than the largest.
+
+        (The fit-quality caveat on compute_peak_metrics -- that splitting
+        *improves* within-configuration statistics -- applies to the
+        residual deviance, not to this count: leave-one-out support of a
+        redundant atom collapses instead of improving.)
+
+        Runs one full solve of ``images_batch`` per ladder rung, so this is
+        an offline, per-instrument calibration, not a per-run step.  Returns
+        ``(fid_residual, rows)`` with ``rows`` of ``(residual, num_sigmas,
+        unsupported_atoms_per_image)`` for the report; pass the returned
+        value back as ``fid_residual=`` (it is not stored globally).
+        """
+        images_batch = np.asarray(images_batch, dtype=np.float32)
+        rows = []
+        for res in residual_ladder:
+            finder = cls(num_sigmas=None, fid_residual=float(res), **finder_kwargs)
+            peaks = finder.find_peaks_batch(images_batch)
+            dev, _ = finder.compute_peak_metrics(
+                images_batch, finder._last_bg_map, peaks
+            )
+            n_unsup = sum(int(np.count_nonzero(d < 9.49)) for d in dev)
+            rows.append((float(res), finder.num_sigmas, n_unsup / len(images_batch)))
+        met = [r for r in rows if r[2] <= max_fragmentation_rate]
+        # Cheapest bank that meets the rate; smaller residual breaks ties.
+        # If no rung meets it, take the best rate observed -- the report rows
+        # show the caller how far off the target was.
+        chosen = (
+            min(met, key=lambda r: (r[1], r[0]))
+            if met
+            else min(rows, key=lambda r: r[2])
+        )
+        return chosen[0], rows
 
     def compute_peak_metrics(self, images_raw, bg_map, peaks_list):
         """Per-peak quality metrics: (leave-one-out, residual), one array each

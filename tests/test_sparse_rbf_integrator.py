@@ -2102,3 +2102,19 @@ def test_expected_peak_amplitude_defaults_to_measuring_it():
     )
     assert not explicit._amp_is_auto
     assert explicit.expected_peak_amplitude == 42.0
+
+
+def test_fid_residual_is_a_calibratable_input():
+    """The criterion's empirical constant is an instance parameter: a larger
+    residual claims a larger real-world carpet advantage and must buy a
+    denser bank.  calibrate_fragmentation_residual fits it to a requested
+    unsupported-atom rate; here only the monotone plumbing is asserted,
+    because each calibration rung is a full solve."""
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    kwargs = dict(min_sigma=1.0, max_sigma=25.0)
+    lean = MatrixFreeSparseRBFPeakFinder(fid_residual=2.5, **kwargs)
+    factory = MatrixFreeSparseRBFPeakFinder(**kwargs)
+    dense = MatrixFreeSparseRBFPeakFinder(fid_residual=40.0, **kwargs)
+    assert lean.num_sigmas <= factory.num_sigmas <= dense.num_sigmas
+    assert lean.num_sigmas < dense.num_sigmas
