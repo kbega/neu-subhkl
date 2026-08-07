@@ -363,9 +363,7 @@ def test_gaussian_loss_path_finds_peaks():
             cy = np.average(near[:, 1], weights=near[:, 0])
             cx = np.average(near[:, 2], weights=near[:, 0])
             err = np.sqrt((cy - r) ** 2 + (cx - c) ** 2)
-            assert err < 1.0, (
-                f"{loss} loss centroid off by {err:.2f} px at ({r}, {c})"
-            )
+            assert err < 1.0, f"{loss} loss centroid off by {err:.2f} px at ({r}, {c})"
 
 
 def test_poisson_overlapping_string():

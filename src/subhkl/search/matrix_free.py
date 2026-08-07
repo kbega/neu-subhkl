@@ -73,9 +73,7 @@ def _frag_pair_ratio(sa, sb, gamma, ref_sigma):
                 [np.trapezoid(fa * fb * wt, r), np.trapezoid(fb * fb * wt, r)],
             ]
         )
-        h = np.array(
-            [np.trapezoid(fa * fs * wt, r), np.trapezoid(fb * fs * wt, r)]
-        )
+        h = np.array([np.trapezoid(fa * fs * wt, r), np.trapezoid(fb * fs * wt, r)])
         w = np.maximum(np.linalg.solve(G, h), 0.0)
         fid = 0.5 * (np.trapezoid(fs * fs * wt, r) - 2.0 * w @ h + w @ G @ w)
         tax = max(lam_a * vs / va - (w[0] * lam_a + w[1] * lam_b), 0.0)
@@ -311,9 +309,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 n_req = _required_uniform_num_sigmas(
                     min_sigma, max_sigma, gamma, ref_sigma
                 )
-                n_auto = len(
-                    _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma)
-                )
+                n_auto = len(_auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma))
                 warnings.warn(
                     f"num_sigmas={num_sigmas} is below the fragmentation "
                     f"threshold for sigma in [{min_sigma:g}, {max_sigma:g}] at "
@@ -624,9 +620,7 @@ class MatrixFreeSparseRBFPeakFinder:
         # calibration is not affected.  Flip the default once extraction
         # merges same-reflection clusters (or the bank is dense enough in
         # sigma that single atoms are representable).
-        return getattr(self, "use_sm_precond", False) and self._use_fft(
-            self.K_weights
-        )
+        return getattr(self, "use_sm_precond", False) and self._use_fft(self.K_weights)
 
     def _forward_op(self, c, weights):
         if self._use_fft(weights):
@@ -1086,9 +1080,7 @@ class MatrixFreeSparseRBFPeakFinder:
                     def Mop(v, Fm=Fm, Ei_a=Ei_a, den_a=den_a, Wt_bar=Wt_bar):
                         vh = jnp.fft.rfft2((v * Fm)[0])
                         s = jnp.sum(Kh * vh * Ei_a, axis=0)
-                        out = vh * Ei_a - jnp.conj(Kh) * Ei_a * (
-                            Wt_bar * s / den_a
-                        )
+                        out = vh * Ei_a - jnp.conj(Kh) * Ei_a * (Wt_bar * s / den_a)
                         w = jnp.fft.irfft2(out, s=(H, W))[None]
                         return w * Fm + (1.0 - Fm) * v
 
