@@ -68,7 +68,9 @@ _FRAG_FID_RESIDUAL = 9.9  # realised / idealised carpet advantage, the one
 # under wide peaks, neither of which the idealised model prices.
 _FRAG_PEAK_AMP = 160.0  # default expected_peak_amplitude [photons]
 _FRAG_BG = 10.0  # default expected_background [photons/Pixel]
-_FRAG_NOMINAL_SIDE = 512  # frame side assumed at construction [Pixel]
+_FRAG_NOMINAL_SIDE = 512  # frame side assumed before any data exists [Pixel];
+# auto-sized banks re-derive the grid from the real frame and the measured
+# background on every find_peaks_batch call and rebuild when it differs
 _NUM_SIGMAS_SOFT_CAP = 16  # solve cost is linear in the channel count
 
 
@@ -163,7 +165,17 @@ def _required_uniform_num_sigmas(
     return None
 
 
-def _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma, m0, bg, amp):
+def _auto_sigma_grid(
+    min_sigma,
+    max_sigma,
+    gamma,
+    ref_sigma,
+    m0,
+    bg,
+    amp,
+    height=_FRAG_NOMINAL_SIDE,
+    width=_FRAG_NOMINAL_SIDE,
+):
     """Smallest bank with no fragmenting gap: greedy widest-safe-step placement.
 
     The safe gap is roughly a constant *ratio* (~1.3-1.6x, tightening as
@@ -177,7 +189,6 @@ def _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma, m0, bg, amp):
     z for that grid, repeat until the grid reproduces itself.  z varies only
     logarithmically with the channel count, so this settles in 2-3 passes.
     """
-    side = _FRAG_NOMINAL_SIDE
     z, prev = 4.0, None
     for _ in range(4):
         grid = [float(min_sigma)]
@@ -201,7 +212,7 @@ def _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma, m0, bg, amp):
         if prev is not None and len(grid) == len(prev) and np.allclose(grid, prev):
             break
         prev = grid
-        z = _frag_calibrated_z(grid, gamma, ref_sigma, m0, side, side)
+        z = _frag_calibrated_z(grid, gamma, ref_sigma, m0, height, width)
 
     # Greedy-from-below leaves its remnant at the wide end -- when the last
     # bisection lands just short of max_sigma the forced endpoint creates a
@@ -482,16 +493,39 @@ class MatrixFreeSparseRBFPeakFinder:
         self.false_alarms_per_image = float(false_alarms_per_image)
 
         # 1. Pre-build the Filter Bank
-        if sigma_grid is not None:
-            self.sigmas = jnp.asarray(sigma_grid, dtype=jnp.float32)
-        else:
-            self.sigmas = jnp.linspace(min_sigma, max_sigma, num_sigmas)
+        self._auto_bank = sigma_grid is not None
         self.max_k_rad = int(3.0 * max_sigma)
+        if sigma_grid is not None:
+            self._set_bank(sigma_grid)
+        else:
+            self._set_bank(np.linspace(min_sigma, max_sigma, num_sigmas))
 
-        # Use strictly unnormalized physical bases to preserve flux relationships
+    def _set_bank(self, sigma_grid):
+        """(Re)build every tensor derived from the sigma grid.
+
+        Auto-sized banks call this again from find_peaks_batch when the real
+        frame and measured background imply a different grid than the
+        construction-time assumptions did."""
+        self.num_sigmas = len(sigma_grid)
+        self.sigmas = jnp.asarray(np.asarray(sigma_grid), dtype=jnp.float32)
+        # Use strictly unnormalized physical bases to preserve flux
+        # relationships.  _build_kernel_bank also refreshes the separable
+        # row/column factors; the identity-dispatch caches key on the new
+        # arrays, so nothing stale survives the rebuild.
         self.K_weights, self.kernel_sq_norms = self._build_kernel_bank()
         self.K_sq = self.K_weights**2
         self.K_cu = self.K_weights**3
+        self._pc_cache = {}
+        # The jitted methods take `self` as a static argument, so their
+        # compiled traces bake in the bank tensors read at trace time.  A
+        # rebuilt bank with unchanged input shapes would otherwise hit those
+        # stale traces silently -- _extract_peaks_all would read widths off
+        # the old grid.  Resizing is rare, so drop every cached trace and
+        # let the next call retrace against the new bank.
+        for name in dir(type(self)):
+            fn = getattr(type(self), name, None)
+            if hasattr(fn, "clear_cache"):
+                fn.clear_cache()
 
     def effective_alpha(self, height, width):
         """Per-scale significance threshold, in units of the dual's noise.
@@ -1755,6 +1789,43 @@ class MatrixFreeSparseRBFPeakFinder:
         if self.num_sigmas >= 2:
             bg_hi = float(np.percentile(bg_map, 90.0))
             amp_hi = max(float(np.percentile(images_batch, 99.99)) - bg_hi, 1.0)
+
+            # An auto-sized bank re-derives its grid from what the data
+            # implies -- the real frame (which sets z through the calibration)
+            # and the measured background -- and rebuilds itself when that
+            # differs from the construction-time assumptions.  The measured
+            # peak amplitude deliberately stays out of the resize: a
+            # top-quantile count is one hot pixel away from silently
+            # inflating the bank, so it only feeds the warning below, where
+            # the user decides.
+            if self._auto_bank:
+                grid = _auto_sigma_grid(
+                    self.min_sigma,
+                    self.max_sigma,
+                    self.gamma,
+                    self.ref_sigma,
+                    self.false_alarms_per_image,
+                    bg_hi,
+                    self.expected_peak_amplitude,
+                    H,
+                    W,
+                )
+                cur = np.asarray(self.sigmas, dtype=float)
+                # Rebuild only for a change that matters: a different channel
+                # count, or grid points shifted beyond the ~5% level below
+                # which the criterion's steepness makes placement immaterial.
+                # (A rebuild clears the jitted-method caches, so cosmetic
+                # rebuilds would recompile the whole solve for nothing.)
+                if len(grid) != len(cur) or not np.allclose(grid, cur, rtol=0.05):
+                    self._set_bank(grid)
+                    if self.show_steps:
+                        print(
+                            f"  > sigma bank re-sized to {self.num_sigmas} "
+                            f"channels for this data (frame {H}x{W}, measured "
+                            f"background ~{bg_hi:.2f} photons/px): "
+                            + ", ".join(f"{v:.3g}" for v in grid)
+                        )
+
             ratio, near = _frag_bank_ratio(
                 np.asarray(self.sigmas),
                 self.gamma,

@@ -1206,9 +1206,15 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
             f"gamma={gamma}: E[FP] = {efp:.4f}, not the calibrated 1.0"
         )
 
+    # The comparisons below vary threshold knobs (ref_sigma, m0, alpha) and
+    # compare effective_alpha arrays elementwise, which is only meaningful at
+    # a fixed bank.  Auto-sizing legitimately couples some of those knobs
+    # into the channel count (a stricter m0 raises z, strengthens the
+    # anti-carpet tax, and can drop a channel), and marginal counts can flip
+    # across BLAS/scipy builds, so the bank is pinned here.
     gamma = 0.5
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
     sigmas = np.array(finder.sigmas)
     weights = (sigmas / finder.ref_sigma) ** gamma
@@ -1224,7 +1230,12 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
 
     # ref_sigma provably cancels: the calibration absorbs any weight rescaling.
     other_ref = MatrixFreeSparseRBFPeakFinder(
-        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, ref_sigma=3.0
+        alpha=None,
+        gamma=gamma,
+        min_sigma=1.0,
+        max_sigma=5.0,
+        ref_sigma=3.0,
+        num_sigmas=5,
     )
     assert np.allclose(
         np.array(other_ref.effective_alpha(256, 256)),
@@ -1239,6 +1250,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
         min_sigma=1.0,
         max_sigma=5.0,
         false_alarms_per_image=0.1,
+        num_sigmas=5,
     )
     assert np.all(np.array(stricter.effective_alpha(256, 256)) > a_small)
     assert np.isclose(realised_efp(stricter, 256), 0.1, rtol=1e-3)
@@ -1246,7 +1258,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     # An explicit alpha is a lower bound on significance, not a way under the
     # calibration: too small a request is raised, a strict one is honoured.
     lax_finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
     assert np.allclose(
         np.array(lax_finder.effective_alpha(130, 130)),
@@ -1255,7 +1267,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     )
 
     strict = MatrixFreeSparseRBFPeakFinder(
-        alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
     assert np.allclose(
         np.array(strict.effective_alpha(130, 130)), 20.0 * weights, rtol=1e-5
