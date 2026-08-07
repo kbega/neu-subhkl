@@ -48,7 +48,7 @@ _FRAG_Z = 4.0  # nominal calibrated threshold z-score (log-weak in size)
 _NUM_SIGMAS_SOFT_CAP = 16  # solve cost is linear in the channel count
 
 
-def _frag_pair_ratio(sa, sb, gamma, ref_sigma):
+def _frag_pair_ratio(sa, sb, gamma):
     """Worst fidelity/tax ratio over off-grid widths in the gap (sa, sb).
 
     A value above 1 predicts that some bright peak of width inside the gap
@@ -60,8 +60,17 @@ def _frag_pair_ratio(sa, sb, gamma, ref_sigma):
     dA = 2.0 * np.pi * r
     fa = np.exp(-r * r / (2.0 * va))
     fb = np.exp(-r * r / (2.0 * vb))
-    lam_a = _FRAG_Z * np.sqrt(np.pi * va / _FRAG_BG) * (sa / ref_sigma) ** gamma
-    lam_b = _FRAG_Z * np.sqrt(np.pi * vb / _FRAG_BG) * (sb / ref_sigma) ** gamma
+    # The production threshold is z * (sigma_k/ref_sigma)**gamma with z solved
+    # from E[FP] = m0, which absorbs any constant rescaling of the weights --
+    # ref_sigma provably cancels there (see effective_alpha).  A fixed nominal
+    # z therefore must be paired with weights normalised locally, not with the
+    # raw ref_sigma-scaled ones, or the bank size would depend on ref_sigma,
+    # which no observable quantity does.  Normalising at the pair's geometric
+    # mean prices the pair at ~z and keeps the criterion a function of
+    # (sa, sb, gamma) only.
+    s_ref = np.sqrt(sa * sb)
+    lam_a = _FRAG_Z * np.sqrt(np.pi * va / _FRAG_BG) * (sa / s_ref) ** gamma
+    lam_b = _FRAG_Z * np.sqrt(np.pi * vb / _FRAG_BG) * (sb / s_ref) ** gamma
     worst = 0.0
     for t in (0.2, 0.35, 0.5, 0.65, 0.8):
         vs = (1.0 - t) * va + t * vb
@@ -81,29 +90,29 @@ def _frag_pair_ratio(sa, sb, gamma, ref_sigma):
     return worst
 
 
-def _frag_worst_ratio(sigmas, gamma, ref_sigma):
+def _frag_worst_ratio(sigmas, gamma):
     """Worst pair ratio over a bank; returns (ratio, sigma near the worst gap)."""
     worst, where = 0.0, float(sigmas[0])
     for sa, sb in zip(sigmas[:-1], sigmas[1:]):
-        ratio = _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma)
+        ratio = _frag_pair_ratio(float(sa), float(sb), gamma)
         if ratio > worst:
             worst, where = ratio, float(np.sqrt(0.5 * (sa * sa + sb * sb)))
     return worst, where
 
 
-def _required_uniform_num_sigmas(min_sigma, max_sigma, gamma, ref_sigma, nmax=64):
+def _required_uniform_num_sigmas(min_sigma, max_sigma, gamma, nmax=64):
     """Smallest uniform-grid num_sigmas with no fragmenting gap, or None."""
     for n in range(2, nmax + 1):
         sigmas = np.linspace(min_sigma, max_sigma, n)
         if all(
-            _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma) <= 1.0
+            _frag_pair_ratio(float(sa), float(sb), gamma) <= 1.0
             for sa, sb in zip(sigmas[:-1], sigmas[1:])
         ):
             return n
     return None
 
 
-def _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma):
+def _auto_sigma_grid(min_sigma, max_sigma, gamma):
     """Smallest bank with no fragmenting gap: greedy widest-safe-step placement.
 
     The safe gap is roughly a constant *ratio* (~1.3-1.6x, tightening as
@@ -115,13 +124,13 @@ def _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma):
     grid = [float(min_sigma)]
     while grid[-1] < max_sigma * (1.0 - 1e-9) and len(grid) < 64:
         sa = grid[-1]
-        if _frag_pair_ratio(sa, max_sigma, gamma, ref_sigma) <= 1.0:
+        if _frag_pair_ratio(sa, max_sigma, gamma) <= 1.0:
             grid.append(float(max_sigma))
             break
         lo, hi = sa, float(max_sigma)
         for _ in range(20):
             mid = 0.5 * (lo + hi)
-            if _frag_pair_ratio(sa, mid, gamma, ref_sigma) <= 1.0:
+            if _frag_pair_ratio(sa, mid, gamma) <= 1.0:
                 lo = mid
             else:
                 hi = mid
@@ -282,7 +291,7 @@ class MatrixFreeSparseRBFPeakFinder:
         # is checked against the same criterion.
         sigma_grid = None
         if num_sigmas is None:
-            sigma_grid = _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma)
+            sigma_grid = _auto_sigma_grid(min_sigma, max_sigma, gamma)
             num_sigmas = len(sigma_grid)
             print(
                 f"  > num_sigmas auto-tuned to {num_sigmas} for sigma in "
@@ -303,13 +312,11 @@ class MatrixFreeSparseRBFPeakFinder:
                 )
         elif num_sigmas >= 2 and max_sigma > min_sigma:
             ratio, near = _frag_worst_ratio(
-                np.linspace(min_sigma, max_sigma, num_sigmas), gamma, ref_sigma
+                np.linspace(min_sigma, max_sigma, num_sigmas), gamma
             )
             if ratio > 1.0:
-                n_req = _required_uniform_num_sigmas(
-                    min_sigma, max_sigma, gamma, ref_sigma
-                )
-                n_auto = len(_auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma))
+                n_req = _required_uniform_num_sigmas(min_sigma, max_sigma, gamma)
+                n_auto = len(_auto_sigma_grid(min_sigma, max_sigma, gamma))
                 warnings.warn(
                     f"num_sigmas={num_sigmas} is below the fragmentation "
                     f"threshold for sigma in [{min_sigma:g}, {max_sigma:g}] at "
