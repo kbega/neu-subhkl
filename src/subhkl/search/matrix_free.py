@@ -384,6 +384,54 @@ class MatrixFreeSparseRBFPeakFinder:
             and weights.shape[-1] == 2 * self.max_k_rad + 1
         )
 
+    def _pc_kernels(self, weights, H, W):
+        """Fourier symbols of the kernel bank on the solver's (H, W) grid.
+
+        These feed the Sherman-Morrison preconditioner in the Newton CG
+        solves: with a scalar weight the Gram operator A^T W A is circulant,
+        and because the dictionary maps K coefficient planes into a single
+        image its per-frequency K x K block is exactly the rank-one outer
+        product of this vector with itself -- invertible in closed form once
+        a diagonal ridge completes it.  Cached as numpy for the tracer-leak
+        reason documented on _fft_kernels.  Keyed on the grid shape: the
+        preconditioner must live on exactly the solver's torus, since
+        transforming on a padded grid and cropping would break the symmetry
+        CG requires of M.
+        """
+        cache = self.__dict__.setdefault("_pc_cache", {})
+        key = (id(weights), H, W)
+        if key not in cache:
+            k2d = np.asarray(weights, dtype=np.float64)[:, 0, :, :]
+            r = self.max_k_rad
+            ker = np.zeros((k2d.shape[0], H, W), dtype=np.float64)
+            ker[:, : 2 * r + 1, : 2 * r + 1] = k2d
+            ker = np.roll(ker, (-r, -r), axis=(1, 2))
+            Kh = np.fft.rfft2(ker)
+            cache[key] = (
+                Kh.astype(np.complex64),
+                (np.abs(Kh) ** 2).astype(np.float32),
+            )
+        return cache[key]
+
+    def _use_sm_precond(self):
+        # Opt-in (finder.use_sm_precond = True), off by default: the solver-
+        # level win is unambiguous (see _solve_ssn_cg_global), but on wide
+        # peaks whose true sigma falls between bank scales the better-
+        # converged solution represents the flux as the cluster of
+        # neighbouring bank atoms that the discretized L1 optimum actually
+        # is, where the stalled default solve reports one dominant atom that
+        # sigma-refinement then fits -- cleaner output, worse optimality.
+        # Measured on a 512^2 frame with peaks at sigma = 3/8/15 against a
+        # 5-scale bank to max_sigma = 25: 6 -> 22 reported atoms, BIC worse
+        # by ~1.5k despite ~200 nats better NLL.  On pure-noise controls the
+        # two paths return identical peak lists, so the false-alarm
+        # calibration is not affected.  Flip the default once extraction
+        # merges same-reflection clusters (or the bank is dense enough in
+        # sigma that single atoms are representable).
+        return getattr(self, "use_sm_precond", False) and self._use_fft(
+            self.K_weights
+        )
+
     def _forward_op(self, c, weights):
         if self._use_fft(weights):
             H, W = c.shape[-2:]
@@ -527,6 +575,31 @@ class MatrixFreeSparseRBFPeakFinder:
 
         tau_alpha = tau_local * lam
 
+        # Sherman-Morrison circulant preconditioner for the Newton CG solves.
+        # Jacobi preconditioning collapses in the wide-kernel regime: the
+        # overlap ratio lambda_max/diag grows as the footprint area 4*pi*
+        # sigma^2 (theory notes, Prop. 2), and at max_sigma = 25 a Jacobi-
+        # preconditioned CG leaves the Newton system at a relative residual
+        # of 0.05-0.5 no matter the iteration budget (measured at maxiter up
+        # to 150), so every Newton step is rejected and the outer loop
+        # degenerates into prox-gradient steps of size 1/lambda_max -- it
+        # stalls at a KKT residual ~1e4 above STOP_TOL.  The circulant
+        # approximation A^T Wbar A + eps captures exactly the overlap
+        # structure Jacobi ignores: per frequency it is a rank-one K x K
+        # block (see _pc_kernels) plus a diagonal, inverted in closed form
+        # below at the cost of one round-trip FFT per application.  Measured
+        # at max_sigma = 25 on a 512^2 Poisson frame: Newton acceptance
+        # 13% -> 57%, final KKT residual 12.0 -> 0.6, active set 4.3k -> 1.1k
+        # atoms, per-iteration cost +35%.  The damped variants (adding a
+        # fraction of the rank-one diagonal to eps) were swept and always
+        # lost to the undamped form.  Off by default -- see _use_sm_precond
+        # for why better convergence is not yet better output.
+        use_sm = self._use_sm_precond()
+        if use_sm:
+            Kh_np, Kh2_np = self._pc_kernels(self.K_weights, H, W)
+            Kh = jnp.asarray(Kh_np)
+            Kh2 = jnp.asarray(Kh2_np)
+
         def get_loss_grad_hess(c_curr):
             u = self._forward_op(c_curr, self.K_weights) + bg
             if self.loss == "gaussian":
@@ -599,7 +672,6 @@ class MatrixFreeSparseRBFPeakFinder:
             RIDGE_REL = 1e-4
 
             H_diag_local = jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
-            eta = 1.0 / H_diag_local
 
             def apply_jacobian(v):
                 v_active = v * D_mat
@@ -608,14 +680,37 @@ class MatrixFreeSparseRBFPeakFinder:
                 ridge = RIDGE_REL * H_diag_local * v_active
                 return (At_W_Av + ridge) * D_mat + (1.0 - D_mat) * v
 
-            def jacobi(v):
-                return eta * v * D_mat + (1.0 - D_mat) * v
+            if use_sm:
+                # Closed-form inverse of E + Wbar u u^H per frequency
+                # (Sherman-Morrison), with u the kernel-bank symbol vector
+                # and E the per-channel mean of the true ridge.  The mask to
+                # the active set keeps M symmetric positive definite; the
+                # mismatch it introduces (the true Jacobian is masked, the
+                # circulant is not) is localized to active-set boundaries,
+                # which is what CG's remaining iterations are for.
+                Wbar = jnp.mean(W_diag)
+                eps_ch = RIDGE_REL * jnp.mean(H_diag_local, axis=(0, 2, 3))
+                Ei = 1.0 / eps_ch[:, None, None]
+                den = 1.0 + Wbar * jnp.sum(Kh2 * Ei, axis=0)
+
+                def precond(v):
+                    vh = jnp.fft.rfft2((v * D_mat)[0])
+                    s = jnp.sum(Kh * vh * Ei, axis=0)
+                    out = vh * Ei - jnp.conj(Kh) * Ei * (Wbar * s / den)
+                    w = jnp.fft.irfft2(out, s=(H, W))[None]
+                    return w * D_mat + (1.0 - D_mat) * v
+
+            else:
+                eta = 1.0 / H_diag_local
+
+                def precond(v):
+                    return eta * v * D_mat + (1.0 - D_mat) * v
 
             # Active rows solve A^T W A dq = -G; inactive rows reduce to the
             # explicit prox-gradient step dq = -tau_local * G.
             rhs = -Gq * D_mat - tau_local * Gq * (1.0 - D_mat)
             dq, _ = jax.scipy.sparse.linalg.cg(
-                apply_jacobian, rhs, M=jacobi, tol=1e-3, maxiter=20
+                apply_jacobian, rhs, M=precond, tol=1e-3, maxiter=20
             )
             dq = jnp.where(jnp.isfinite(dq), dq, 0.0)
 
@@ -777,11 +872,40 @@ class MatrixFreeSparseRBFPeakFinder:
                 def Aop(v, Fm=Fm, Wt=Wt):
                     return apn_Hop(v * Fm, Wt) * Fm + (1.0 - Fm) * v
 
-                def Mop(v, Fm=Fm, Hj=Hj):
-                    return (v / Hj) * Fm + (1.0 - Fm) * v
+                if use_sm:
+                    # The endgame's subproblem must be preconditioned like
+                    # the main loop's, and solved at least as well: handed
+                    # the tighter phase-1 iterate the Jacobi/maxiter-8
+                    # configuration returns garbage directions in the
+                    # wide-kernel regime, and its free-set rule then
+                    # RE-inflates the support 1.7k -> 15k atoms within two
+                    # steps (measured at max_sigma = 25).  With this
+                    # preconditioner and budget the decrement stays in the
+                    # full-step regime (nu ~ 0.09) and the support shrinks.
+                    Wt_bar = jnp.sum(Wt) / jnp.maximum(jnp.sum(P_mask), 1.0)
+                    eps_apn = 1e-4 * jnp.mean(Hj, axis=(0, 2, 3))
+                    Ei_a = 1.0 / eps_apn[:, None, None]
+                    den_a = 1.0 + Wt_bar * jnp.sum(Kh2 * Ei_a, axis=0)
+
+                    def Mop(v, Fm=Fm, Ei_a=Ei_a, den_a=den_a, Wt_bar=Wt_bar):
+                        vh = jnp.fft.rfft2((v * Fm)[0])
+                        s = jnp.sum(Kh * vh * Ei_a, axis=0)
+                        out = vh * Ei_a - jnp.conj(Kh) * Ei_a * (
+                            Wt_bar * s / den_a
+                        )
+                        w = jnp.fft.irfft2(out, s=(H, W))[None]
+                        return w * Fm + (1.0 - Fm) * v
+
+                    apn_cg_iters = 40
+                else:
+
+                    def Mop(v, Fm=Fm, Hj=Hj):
+                        return (v / Hj) * Fm + (1.0 - Fm) * v
+
+                    apn_cg_iters = 8
 
                 dx, _ = jax.scipy.sparse.linalg.cg(
-                    Aop, -qx * Fm, M=Mop, tol=1e-4, maxiter=8
+                    Aop, -qx * Fm, M=Mop, tol=1e-4, maxiter=apn_cg_iters
                 )
                 dx = jnp.where(jnp.isfinite(dx), dx, 0.0)
                 x_cand = jnp.maximum(0.0, x + dx)
