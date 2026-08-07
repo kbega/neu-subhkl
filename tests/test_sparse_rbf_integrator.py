@@ -2044,3 +2044,61 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
         'harvest_peaks_kwargs.get(\n                    "false_alarms_per_image"' in src
         or ("false_alarms_per_image" in src)
     )
+
+
+def test_moment_peak_amplitude_tracks_the_bright_end_of_the_population():
+    """``A = F / (2 pi sigma^2)`` from window moments, at a high quantile.
+
+    Not the median: the fidelity gap driving fragmentation grows with
+    brightness, so the bank is sized to protect the brightest peaks.  The
+    tolerance here is loose on purpose -- bank size responds to this input as
+    roughly its 0.28th power, so even a 50% error is under one channel.
+    """
+    import numpy as np
+    from scipy.special import erf
+
+    from subhkl.search.matrix_free import _moment_peak_amplitude
+
+    def pixel_integrated(shape, r0, c0, sigma, amp):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        s2 = sigma * np.sqrt(2.0)
+        er = erf((rr - r0 + 0.5) / s2) - erf((rr - r0 - 0.5) / s2)
+        ec = erf((cc - c0 + 0.5) / s2) - erf((cc - c0 - 0.5) / s2)
+        return amp * (np.pi / 2.0) * sigma**2 * er * ec
+
+    rng = np.random.default_rng(4)
+    bg = 0.6
+    frame = np.full((256, 256), bg)
+    for r, c, amp in (
+        (60, 60, 200.0),
+        (60, 180, 120.0),
+        (180, 60, 60.0),
+        (180, 180, 300.0),
+    ):
+        frame += pixel_integrated(frame.shape, r, c, 4.0, amp)
+    image = rng.poisson(frame).astype(float)
+    bg_map = np.full_like(image, bg)
+
+    # The bright end of 60/120/200/300, not the median and not the maximum.
+    measured = _moment_peak_amplitude(image[None], bg_map[None], bg, quantile=90.0)
+    assert 120.0 < measured < 400.0
+    assert (
+        _moment_peak_amplitude(image[None], bg_map[None], bg, quantile=99.0) > measured
+    )
+
+
+def test_expected_peak_amplitude_defaults_to_measuring_it():
+    """None means 'derive it from the first batch', the contract
+    expected_background already has."""
+    from subhkl.search.matrix_free import _FRAG_PEAK_AMP, MatrixFreeSparseRBFPeakFinder
+
+    auto = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=5)
+    assert auto._amp_is_auto
+    # Construction still needs a number, and uses the declared nominal.
+    assert auto.expected_peak_amplitude == _FRAG_PEAK_AMP
+
+    explicit = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5, max_sigma=6.5, num_sigmas=5, expected_peak_amplitude=42.0
+    )
+    assert not explicit._amp_is_auto
+    assert explicit.expected_peak_amplitude == 42.0
