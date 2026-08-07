@@ -28,77 +28,98 @@ from jax import jit, lax, vmap
 # bracketing pair (no small-gap expansion: at the narrow end of a uniform
 # bank the relative gap is O(1) and a Taylor form is badly wrong).  The tax
 # is the flux-matched carpet surcharge priced at the calibrated per-height
-# threshold lam_k ~ z sqrt(pi sigma_k^2 / bg) (sigma_k/ref)^gamma.  In the
-# bright-peak limit both sides are linear in peak height, so the criterion is
-# amplitude-free; brightness only enters through the assumed peak/background
-# contrast in the weight.  Two constants tie the model to a measured
-# fragmentation case (bank [1,25]x5, truth sigma*=15 at height 120 over
-# background 7.6): the collected tax is only ~32% of the nominal flux-matched
-# assessment, because the carpet's many small coefficients soft-threshold
-# pointwise and shed their skirt into the background estimate, which a rigid
-# 2-atom mixture cannot; and the realised fidelity gap was 3.8x the idealised
-# projection residual (886 vs 233 nats), dominated by the background bias
-# under wide peaks that the carpet absorbs and the pair cannot.
-
-# The criterion's constants, and why each is safe to fix.  The decisive fact
-# is the steepness of the mechanism: the fidelity/tax ratio grows with the
-# ~3.5th power of the gap, so the bank size responds to any multiplicative
-# error in a constant only as its ~0.28th power -- doubling a constant moves
-# a 12-channel bank by about 2 channels.  Measured over plausible ranges:
+# threshold lam_k ~ a_corr(z * w_k) sqrt(pi sigma_k^2 / bg), with z solved
+# from the finder's own false-alarm calibration sum_k N_k Q(z w_k) = m0 --
+# the same equation effective_alpha solves -- and the same Cornish-Fisher
+# skew correction at low counts.  Because z multiplies the raw weights
+# w_k = (sigma_k/ref_sigma)**gamma, any rescaling of the weights (any choice
+# of ref_sigma) is absorbed into z exactly, so the criterion inherits the
+# calibration's ref_sigma invariance by construction.
 #
-#   z in [3, 5]           -> +-1 channel (the calibrated z-score varies only
-#                            logarithmically with image size and bank count)
-#   margin x/÷ 2          -> +-2..3 channels
-#   contrast 4x           -> +-1..2 channels (logarithmic)
+# What each input does, measured on [1, 25] at gamma = 0 (the steepness of
+# the mechanism bounds every influence: the fidelity/tax ratio grows with
+# the ~3.5th power of the gap, so the bank size responds to a multiplicative
+# error in any input only as its ~0.28th power):
 #
-# The one genuinely scene-dependent input is the background rate: the
-# per-height threshold scales as 1/sqrt(bg), so a brighter background weakens
-# the anti-carpet tax (0.4 photons/px sizes [1,25] at 7 channels; 16 at 13).
-# It is therefore a constructor argument (``expected_background``) rather
-# than a constant, and find_peaks_batch re-checks the built bank against the
-# measured rate map and warns when the data exceeds the sizing assumption.
+#   peak amplitude    the real scene driver: 40/160/640 photons -> 9/11/14
+#                     channels.  Brighter peaks put more photons behind the
+#                     same shape mismatch while the tax stays fixed.
+#   background        nearly cancels at fixed amplitude: 0.4..40 photons/px
+#                     -> 10..11 channels.  A darker background raises the
+#                     tax (lam ~ 1/sqrt(bg)) but raises the contrast, and
+#                     with it the misfit weight, by the same order.  (A
+#                     fixed-contrast sweep suggests a strong bg dependence,
+#                     but fixing contrast silently scales the peak with the
+#                     background and answers a different question.)
+#   frame size, m0    enter only through z, logarithmically: +-1 channel
+#                     across frames 64..4096 and m0 0.1..10.
+#   residual x/÷ 2    -> 9..14 channels.
+#
+# The construction-time frame side is nominal (z is re-evaluated against the
+# real frame and the measured background in find_peaks_batch, which warns if
+# the built bank falls short on the actual data).
 
-_FRAG_MODEL_MARGIN = 11.9  # realised / idealised fidelity-to-tax advantage of
-# the carpet, the one empirical constant: measured 9.3 on the calibration
-# case (886/245 nats against the model's 233/600), kept with a ~1.3 safety
-# factor.  It absorbs what the idealised projection model omits -- the
-# carpet's pointwise-shrinkage evasion of the flux-matched tax and its
-# absorption of the background-estimate bias under wide peaks.
-_FRAG_CONTRAST = 16.0  # peak/background contrast the bank protects; brighter
-# peaks fragment first, and each 4x of protected contrast costs ~1-2 channels
+_FRAG_FID_RESIDUAL = 9.9  # realised / idealised carpet advantage, the one
+# empirical constant left: the measured factor (bank [1,25]x5, truth
+# sigma*=15 at height 120 over background 7.6: 886/245 nats measured against
+# the model's idealised ratio) by which reality favours the carpet beyond
+# the projection model.  It absorbs the carpet's pointwise-shrinkage evasion
+# of the flux-matched tax and its absorption of the background-estimate bias
+# under wide peaks, neither of which the idealised model prices.
+_FRAG_PEAK_AMP = 160.0  # default expected_peak_amplitude [photons]
 _FRAG_BG = 10.0  # default expected_background [photons/Pixel]
-_FRAG_Z = 4.0  # nominal calibrated threshold z-score
+_FRAG_NOMINAL_SIDE = 512  # frame side assumed at construction [Pixel]
 _NUM_SIGMAS_SOFT_CAP = 16  # solve cost is linear in the channel count
 
 
-def _frag_pair_ratio(sa, sb, gamma, bg=_FRAG_BG):
+def _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width):
+    """Solve the false-alarm calibration sum_k N_k Q(z w_k) = m0 for z.
+
+    Numpy twin of the bisection in effective_alpha, for use at bank-sizing
+    time (before any jax tracing is warranted)."""
+    from scipy.special import erfc
+
+    sig = np.asarray(sigmas, dtype=float)
+    w = (sig / ref_sigma) ** gamma
+    n_k = np.maximum(height * width / (2.0 * np.pi * np.maximum(sig**2, 1e-6)), 2.0)
+    lo, hi = 0.5, 12.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if float(np.sum(n_k * 0.5 * erfc(mid * w / np.sqrt(2.0)))) > m0:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp):
     """Worst fidelity/tax ratio over off-grid widths in the gap (sa, sb).
 
-    A value above 1 predicts that some bright peak of width inside the gap
-    is cheaper to represent as a carpet of sigma-sa atoms than as a point
-    mixture of the two bracketing atoms, i.e. that the fit will fragment it.
-    """
+    A value above 1 predicts that a peak of amplitude ``amp`` and some width
+    inside the gap is cheaper to represent as a carpet of sigma-sa atoms
+    than as a point mixture of the two bracketing atoms, i.e. that the fit
+    will fragment it.  ``z`` is the calibrated threshold for the bank under
+    construction (see _frag_calibrated_z)."""
+    contrast = amp / bg
     va, vb = sa * sa, sb * sb
     r = np.linspace(0.0, 6.0 * sb, 1500)
     dA = 2.0 * np.pi * r
     fa = np.exp(-r * r / (2.0 * va))
     fb = np.exp(-r * r / (2.0 * vb))
-    # The production threshold is z * (sigma_k/ref_sigma)**gamma with z solved
-    # from E[FP] = m0, which absorbs any constant rescaling of the weights --
-    # ref_sigma provably cancels there (see effective_alpha).  A fixed nominal
-    # z therefore must be paired with weights normalised locally, not with the
-    # raw ref_sigma-scaled ones, or the bank size would depend on ref_sigma,
-    # which no observable quantity does.  Normalising at the pair's geometric
-    # mean prices the pair at ~z and keeps the criterion a function of
-    # (sa, sb, gamma) only.
-    s_ref = np.sqrt(sa * sb)
-    lam_a = _FRAG_Z * np.sqrt(np.pi * va / bg) * (sa / s_ref) ** gamma
-    lam_b = _FRAG_Z * np.sqrt(np.pi * vb / bg) * (sb / s_ref) ** gamma
+    # Per-height threshold exactly as the solver builds it: calibrated
+    # z * w_k, Cornish-Fisher corrected with the pure-background skewness
+    # gamma1 = (2/3) / sqrt(pi sigma^2 bg), times sqrt(H_diag).
+    lam = []
+    for s, v in ((sa, va), (sb, vb)):
+        a = z * (s / ref_sigma) ** gamma
+        g1 = np.clip((2.0 / 3.0) / np.sqrt(np.pi * v * bg), 0.0, 2.0)
+        lam.append((a + g1 * (a * a - 1.0) / 6.0) * np.sqrt(np.pi * v / bg))
+    lam_a, lam_b = lam
     worst = 0.0
     for t in (0.2, 0.35, 0.5, 0.65, 0.8):
         vs = (1.0 - t) * va + t * vb
         fs = np.exp(-r * r / (2.0 * vs))
-        wt = dA / (fs + 1.0 / _FRAG_CONTRAST)
+        wt = dA / (fs + 1.0 / contrast)
         G = np.array(
             [
                 [np.trapezoid(fa * fa * wt, r), np.trapezoid(fa * fb * wt, r)],
@@ -109,59 +130,111 @@ def _frag_pair_ratio(sa, sb, gamma, bg=_FRAG_BG):
         w = np.maximum(np.linalg.solve(G, h), 0.0)
         fid = 0.5 * (np.trapezoid(fs * fs * wt, r) - 2.0 * w @ h + w @ G @ w)
         tax = max(lam_a * vs / va - (w[0] * lam_a + w[1] * lam_b), 0.0)
-        worst = max(worst, _FRAG_MODEL_MARGIN * fid / max(tax, 1e-12))
+        worst = max(worst, _FRAG_FID_RESIDUAL * fid / max(tax, 1e-12))
     return worst
 
 
-def _frag_worst_ratio(sigmas, gamma, bg=_FRAG_BG):
-    """Worst pair ratio over a bank; returns (ratio, sigma near the worst gap)."""
+def _frag_bank_ratio(sigmas, gamma, ref_sigma, m0, bg, amp, height, width):
+    """Worst pair ratio over a built bank, with z calibrated for that bank.
+
+    Returns (ratio, sigma near the worst gap)."""
+    z = _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width)
     worst, where = 0.0, float(sigmas[0])
     for sa, sb in zip(sigmas[:-1], sigmas[1:]):
-        ratio = _frag_pair_ratio(float(sa), float(sb), gamma, bg)
+        ratio = _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma, z, bg, amp)
         if ratio > worst:
             worst, where = ratio, float(np.sqrt(0.5 * (sa * sa + sb * sb)))
     return worst, where
 
 
-def _required_uniform_num_sigmas(min_sigma, max_sigma, gamma, bg=_FRAG_BG, nmax=64):
+def _required_uniform_num_sigmas(
+    min_sigma, max_sigma, gamma, ref_sigma, m0, bg, amp, nmax=64
+):
     """Smallest uniform-grid num_sigmas with no fragmenting gap, or None."""
+    side = _FRAG_NOMINAL_SIDE
     for n in range(2, nmax + 1):
         sigmas = np.linspace(min_sigma, max_sigma, n)
+        z = _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, side, side)
         if all(
-            _frag_pair_ratio(float(sa), float(sb), gamma, bg) <= 1.0
+            _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma, z, bg, amp) <= 1.0
             for sa, sb in zip(sigmas[:-1], sigmas[1:])
         ):
             return n
     return None
 
 
-def _auto_sigma_grid(min_sigma, max_sigma, gamma, bg=_FRAG_BG):
+def _auto_sigma_grid(min_sigma, max_sigma, gamma, ref_sigma, m0, bg, amp):
     """Smallest bank with no fragmenting gap: greedy widest-safe-step placement.
 
     The safe gap is roughly a constant *ratio* (~1.3-1.6x, tightening as
     sigma**(1-gamma) toward the wide end), so the minimal grid is close to
     geometric.  A uniform grid pays that ratio at the narrowest pair and
     needs several times more channels for the same guarantee -- e.g. 38
-    uniform vs ~12 adaptive over [1, 25] at gamma = 0.
+    uniform vs ~11 adaptive over [1, 25] at gamma = 0.
+
+    The calibrated z depends on the bank being built, so the build runs as a
+    short fixed-point iteration: place the grid under the current z, re-solve
+    z for that grid, repeat until the grid reproduces itself.  z varies only
+    logarithmically with the channel count, so this settles in 2-3 passes.
     """
-    grid = [float(min_sigma)]
-    while grid[-1] < max_sigma * (1.0 - 1e-9) and len(grid) < 64:
-        sa = grid[-1]
-        if _frag_pair_ratio(sa, max_sigma, gamma, bg) <= 1.0:
+    side = _FRAG_NOMINAL_SIDE
+    z, prev = 4.0, None
+    for _ in range(4):
+        grid = [float(min_sigma)]
+        while grid[-1] < max_sigma * (1.0 - 1e-9) and len(grid) < 64:
+            sa = grid[-1]
+            if _frag_pair_ratio(sa, max_sigma, gamma, ref_sigma, z, bg, amp) <= 1.0:
+                grid.append(float(max_sigma))
+                break
+            lo, hi = sa, float(max_sigma)
+            for _ in range(20):
+                mid = 0.5 * (lo + hi)
+                if _frag_pair_ratio(sa, mid, gamma, ref_sigma, z, bg, amp) <= 1.0:
+                    lo = mid
+                else:
+                    hi = mid
+            # A vanishing safe step means the criterion cannot be met locally
+            # (pathological parameters); take a small fixed ratio, don't spin.
+            grid.append(max(lo, sa * 1.05))
+        if grid[-1] < max_sigma:
             grid.append(float(max_sigma))
+        if prev is not None and len(grid) == len(prev) and np.allclose(grid, prev):
             break
-        lo, hi = sa, float(max_sigma)
-        for _ in range(20):
-            mid = 0.5 * (lo + hi)
-            if _frag_pair_ratio(sa, mid, gamma, bg) <= 1.0:
-                lo = mid
-            else:
-                hi = mid
-        # A vanishing safe step means the criterion cannot be met locally
-        # (pathological parameters); take a small fixed ratio rather than spin.
-        grid.append(max(lo, sa * 1.05))
-    if grid[-1] < max_sigma:
-        grid.append(float(max_sigma))
+        prev = grid
+        z = _frag_calibrated_z(grid, gamma, ref_sigma, m0, side, side)
+
+    # Greedy-from-below leaves its remnant at the wide end -- when the last
+    # bisection lands just short of max_sigma the forced endpoint creates a
+    # near-duplicate pair (e.g. ..., 4.94, 5), a wasted channel next to an
+    # unevenly stretched gap.  Relax the interior points to equalise the two
+    # adjacent pair margins (left ratio rises and right ratio falls in s_i,
+    # so the balance point is unique); this spreads the slack over the whole
+    # grid without changing the channel count.  Keep the greedy grid if the
+    # relaxed one ever violates the criterion.
+    if len(grid) > 2:
+        relaxed = list(grid)
+        for _ in range(6):
+            for i in range(1, len(relaxed) - 1):
+                lo, hi = relaxed[i - 1] * 1.001, relaxed[i + 1] * 0.999
+                for _ in range(15):
+                    mid = np.sqrt(lo * hi)
+                    left = _frag_pair_ratio(
+                        relaxed[i - 1], mid, gamma, ref_sigma, z, bg, amp
+                    )
+                    right = _frag_pair_ratio(
+                        mid, relaxed[i + 1], gamma, ref_sigma, z, bg, amp
+                    )
+                    if left > right:
+                        hi = mid
+                    else:
+                        lo = mid
+                relaxed[i] = float(np.sqrt(lo * hi))
+        ok = all(
+            _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp) <= 1.0
+            for sa, sb in zip(relaxed[:-1], relaxed[1:])
+        )
+        if ok:
+            grid = relaxed
     return grid
 
 
@@ -280,6 +353,7 @@ class MatrixFreeSparseRBFPeakFinder:
         boundary_sigma_frac: float = 0.98,
         false_alarms_per_image: float = 1.0,
         expected_background: float = _FRAG_BG,
+        expected_peak_amplitude: float = _FRAG_PEAK_AMP,
         **kwargs,
     ):
         if max_sigma < min_sigma:
@@ -316,7 +390,13 @@ class MatrixFreeSparseRBFPeakFinder:
         sigma_grid = None
         if num_sigmas is None:
             sigma_grid = _auto_sigma_grid(
-                min_sigma, max_sigma, gamma, expected_background
+                min_sigma,
+                max_sigma,
+                gamma,
+                ref_sigma,
+                false_alarms_per_image,
+                expected_background,
+                expected_peak_amplitude,
             )
             num_sigmas = len(sigma_grid)
             print(
@@ -337,17 +417,36 @@ class MatrixFreeSparseRBFPeakFinder:
                     stacklevel=2,
                 )
         elif num_sigmas >= 2 and max_sigma > min_sigma:
-            ratio, near = _frag_worst_ratio(
+            ratio, near = _frag_bank_ratio(
                 np.linspace(min_sigma, max_sigma, num_sigmas),
                 gamma,
+                ref_sigma,
+                false_alarms_per_image,
                 expected_background,
+                expected_peak_amplitude,
+                _FRAG_NOMINAL_SIDE,
+                _FRAG_NOMINAL_SIDE,
             )
             if ratio > 1.0:
                 n_req = _required_uniform_num_sigmas(
-                    min_sigma, max_sigma, gamma, expected_background
+                    min_sigma,
+                    max_sigma,
+                    gamma,
+                    ref_sigma,
+                    false_alarms_per_image,
+                    expected_background,
+                    expected_peak_amplitude,
                 )
                 n_auto = len(
-                    _auto_sigma_grid(min_sigma, max_sigma, gamma, expected_background)
+                    _auto_sigma_grid(
+                        min_sigma,
+                        max_sigma,
+                        gamma,
+                        ref_sigma,
+                        false_alarms_per_image,
+                        expected_background,
+                        expected_peak_amplitude,
+                    )
                 )
                 warnings.warn(
                     f"num_sigmas={num_sigmas} is below the fragmentation "
@@ -371,6 +470,7 @@ class MatrixFreeSparseRBFPeakFinder:
         self.show_steps = show_steps
         self.ref_sigma = ref_sigma
         self.expected_background = float(expected_background)
+        self.expected_peak_amplitude = float(expected_peak_amplitude)
         self.chunk_size = chunk_size
         self.refine_positions = refine_positions
         self.reject_boundary_sigma = reject_boundary_sigma
@@ -1642,31 +1742,44 @@ class MatrixFreeSparseRBFPeakFinder:
 
         self._last_bg_map = bg_map
 
-        # The bank was sized against expected_background; the anti-carpet tax
-        # scales as 1/sqrt(bg), so data brighter than the assumption can push
-        # a safe bank back over the fragmentation threshold.  Re-check against
-        # the measured rate map (a high quantile, since fragmentation is a
-        # bright-region failure) and warn -- the bank is already built, so
-        # this cannot resize it, but it names the fix.
+        # The bank was sized against expected_background and
+        # expected_peak_amplitude, with z calibrated for a nominal frame.
+        # Amplitude is the driver (a brighter peak puts more photons behind
+        # the same shape mismatch while the tax stays fixed; the background
+        # nearly cancels at fixed amplitude), so re-check the built bank with
+        # the quantities this batch actually measured -- the rate map's bright
+        # quantile for the background, a top-quantile count above it as the
+        # bright-peak amplitude proxy, and the real frame for z -- and warn.
+        # The bank is already built, so this cannot resize it, but it names
+        # the fix.
         if self.num_sigmas >= 2:
             bg_hi = float(np.percentile(bg_map, 90.0))
-            if bg_hi > self.expected_background:
-                ratio, near = _frag_worst_ratio(
-                    np.asarray(self.sigmas), self.gamma, bg_hi
+            amp_hi = max(float(np.percentile(images_batch, 99.99)) - bg_hi, 1.0)
+            ratio, near = _frag_bank_ratio(
+                np.asarray(self.sigmas),
+                self.gamma,
+                self.ref_sigma,
+                self.false_alarms_per_image,
+                bg_hi,
+                amp_hi,
+                H,
+                W,
+            )
+            if ratio > 1.0:
+                warnings.warn(
+                    f"the sigma bank (sized for peaks of "
+                    f"{self.expected_peak_amplitude:g} photons over a "
+                    f"{self.expected_background:g} photons/px background) is "
+                    "predicted to fragment the brightest peaks in this data "
+                    f"(measured background ~{bg_hi:.2f} photons/px, peak "
+                    f"amplitudes up to ~{amp_hi:.0f}; worst near sigma ~ "
+                    f"{near:.1f}, fidelity/tax ratio {ratio:.1f}): they may "
+                    "be reported as clusters of narrower atoms.  Reconstruct "
+                    f"the finder with expected_peak_amplitude={amp_hi:.0f} "
+                    f"(and expected_background={bg_hi:.1f}, num_sigmas=None) "
+                    "to size the bank for this data.",
+                    stacklevel=2,
                 )
-                if ratio > 1.0:
-                    warnings.warn(
-                        f"measured background (90th percentile "
-                        f"{bg_hi:.2f} photons/px) exceeds the "
-                        f"expected_background={self.expected_background:g} "
-                        "the sigma bank was sized against, and the built bank "
-                        "is predicted to fragment bright off-grid peaks "
-                        f"(worst near sigma ~ {near:.1f}, fidelity/tax ratio "
-                        f"{ratio:.1f}).  Reconstruct the finder with "
-                        f"expected_background={bg_hi:.1f} (and num_sigmas="
-                        "None) to size the bank for this data.",
-                        stacklevel=2,
-                    )
 
         PAD = 2 * self.max_k_rad + 1
         pad_y = PAD // 2
