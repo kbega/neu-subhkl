@@ -240,7 +240,7 @@ def _measure_radial_profile(
                         break
                     sigma_w = 0.5 * (sigma_w + new_sigma)
                 # A width at the window scale was never bracketed.
-                if not (0.5 <= sigma_w <= step / 2.5):
+                if sigma_w < 0.5 or sigma_w > step / 2.5:
                     continue
                 u = np.sqrt(d2[disk]).ravel() / sigma_w
                 v = win[disk].ravel() / flux_d
@@ -930,7 +930,8 @@ class MatrixFreeSparseRBFPeakFinder:
         elif not gaussian_trunk:
             import json as _json
 
-            _prof = _json.load(open(mode))
+            with open(mode, encoding="utf-8") as fh:
+                _prof = _json.load(fh)
             _u = np.asarray(_prof["u"], dtype=float)
             _f = np.asarray(_prof["f"], dtype=float)
 
@@ -954,7 +955,7 @@ class MatrixFreeSparseRBFPeakFinder:
         # Guard against double expansion on a rebuild that did not reset
         # ``sigmas``: an expanded bank repeats each scale len(shapes) times.
         n_sh = len(shapes)
-        if base.size % n_sh == 0 and base.size >= n_sh and n_sh > 1:
+        if n_sh > 1 and base.size >= n_sh and base.size % n_sh == 0:
             folded = base.reshape(-1, n_sh)
             if np.all(folded == folded[:, :1]):
                 base = folded[:, 0]

@@ -145,7 +145,7 @@ def finder(
         ),
     ] = 1.0,
     sparse_rbf_profile_file: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             help="Peak profile replacing the Gaussian atom.  'auto' (default) "
             "measures the radial profile f(u), u = r/sigma, from the first "
