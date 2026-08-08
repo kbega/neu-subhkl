@@ -11,6 +11,7 @@ from subhkl.io.export import ImageStackMerger, MTZExporter
 from subhkl.viz import replay
 from subhkl.instrument.plot_metrics import plot_metric
 from subhkl.viz import detector_assembly, replay
+from subhkl.instrument.error_analysis import analyze_errors
 from typing import List
 
 

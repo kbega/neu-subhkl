@@ -158,62 +158,6 @@ def extract_xyz_from_file(file_path, instrument=None):
 
     return None, None
 
-def compute_hkl_statistics(h, k, l, d_err, ang_err):
-    """
-    Compute statistics for every unique Miller index.
-
-    Returns
-    -------
-    stats : structured numpy array
-    """
-
-    h = np.asarray(h)
-    k = np.asarray(k)
-    l = np.asarray(l)
-
-    hkls = np.column_stack((h, k, l))
-
-    unique_hkl, inverse = np.unique(
-        hkls,
-        axis=0,
-        return_inverse=True,
-    )
-
-    dtype = np.dtype([
-        ("h", np.int32),
-        ("k", np.int32),
-        ("l", np.int32),
-        ("n", np.int32),
-        ("median_d_err", np.float32),
-        ("mean_d_err", np.float32),
-        ("max_d_err", np.float32),
-        ("median_ang_err", np.float32),
-        ("mean_ang_err", np.float32),
-        ("max_ang_err", np.float32),
-    ])
-
-    table = np.zeros(len(unique_hkl), dtype=dtype)
-
-    for i, (hh, kk, ll) in enumerate(unique_hkl):
-
-        mask = inverse == i
-
-        table[i]["h"] = hh
-        table[i]["k"] = kk
-        table[i]["l"] = ll
-
-        table[i]["n"] = np.count_nonzero(mask)
-
-        table[i]["median_d_err"] = np.median(d_err[mask])
-        table[i]["mean_d_err"] = np.mean(d_err[mask])
-        table[i]["max_d_err"] = np.max(d_err[mask])
-
-        table[i]["median_ang_err"] = np.median(ang_err[mask])
-        table[i]["mean_ang_err"] = np.mean(ang_err[mask])
-        table[i]["max_ang_err"] = np.max(ang_err[mask])
-
-    return table
-
 def compute_metrics(
     file1: str,
     file2: str | None = None,
@@ -475,26 +419,36 @@ def compute_metrics(
             "max_ang_err": float(np.max(ang_err)),
             "num_peaks": len(h),
         }
-        print("computing error per_hkl")
-        
-        if per_hkl:
-            hkl_table = compute_hkl_statistics(h, k, l, d_err, ang_err)
+        print("error per_peak")
+        with h5py.File(file1, "a") as fout:
 
-            with h5py.File(file1, "a") as fout:
-                metrics_grp = fout.require_group("metrics")
-                print("Datasets now:", list(metrics_grp.keys()))
+            metrics = fout.require_group("metrics")
 
-                if "per_hkl" in metrics_grp:
-                    del metrics_grp["per_hkl"]
+            if "per_peak" in metrics:
+                del metrics["per_peak"]
 
-                metrics_grp.create_dataset(
-                    "per_hkl",
-		    data=hkl_table,
-		    compression="gzip",
+            peak_grp = metrics.create_group("per_peak")
+
+            peak_grp.create_dataset("h", data=h.astype(np.int32))
+            peak_grp.create_dataset("k", data=k.astype(np.int32))
+            peak_grp.create_dataset("l", data=l.astype(np.int32))
+
+            peak_grp.create_dataset("run", data=run_index.astype(np.int32))
+            peak_grp.create_dataset("lambda", data=lam.astype(np.float32))
+ 
+            peak_grp.create_dataset(
+                "d_err",
+                 data=d_err.astype(np.float32),
+                 compression="gzip",
             )
 
-            print("Finished writing per_hkl")
- 
+            peak_grp.create_dataset(
+                "ang_err",
+                 data=ang_err.astype(np.float32),
+                 compression="gzip",
+            )
+        print("Finished writing metrics/per_peak")
+        
         if d_filter_message:
             result["filter_message"] = d_filter_message
 
