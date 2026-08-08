@@ -2163,3 +2163,86 @@ def test_fragmentation_rate_maps_to_protected_quantile():
     scanning = _moment_census(image[None], bg_map[None], 0.6)
     assert 1 <= counting.size <= 6
     assert scanning.size > counting.size
+
+
+def test_learned_basis_default_is_exactly_the_gaussian_bank():
+    """profile_file=None, shape_ratio=1.0 must leave the Gaussian path -- and
+    its separable fast path -- byte-for-byte alone."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    f = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=6)
+    assert f.use_separable
+    assert np.asarray(f.K_weights).shape[0] == 6
+    assert getattr(f, "_nk_multiplicity_scale", 1.0) == 1.0
+
+
+def test_learned_basis_keeps_the_flux_scale_family(tmp_path):
+    """Every kernel must keep flux = C * sigma^2 with one C: the width-mixture
+    collapse in _read_chunk depends on it exactly."""
+    import json
+
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    u = np.linspace(0, 4, 41)
+    profile = tmp_path / "trunk.json"
+    profile.write_text(
+        json.dumps({"u": u.tolist(), "f": np.exp(-0.5 * u**2.8 / 1.4).tolist()})
+    )
+
+    f = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5,
+        max_sigma=6.5,
+        num_sigmas=6,
+        profile_file=str(profile),
+        shape_ratio=1.2,
+        shape_orientations=4,
+    )
+    kernels = np.asarray(f.K_weights)[:, 0]
+    sigmas = np.asarray(f.sigmas)
+    assert kernels.shape[0] == 30  # 6 scales x (1 iso + 4 orientations)
+    flux = kernels.sum(axis=(1, 2))
+    ratio = flux / sigmas**2
+    assert np.allclose(ratio, ratio[0], rtol=0.02)
+
+
+def test_shape_variants_do_not_multiply_the_false_alarm_count(tmp_path):
+    """The calibration sum-pools N_k over channels as if independent.  Shape
+    variants at one (site, scale) are nearly the same test -- Gram K_eff ~ 1 of
+    5 at ratio 1.2 -- and counting them 5x inflates the solved threshold.
+    Measured cost of not correcting: the faint half of all detections
+    (243 -> 120 atoms on cg4d-garnet run 2038)."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    f = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5,
+        max_sigma=6.5,
+        num_sigmas=6,
+        shape_ratio=1.2,
+        shape_orientations=4,
+    )
+    scale = f._nk_multiplicity_scale
+    # 5 near-identical shapes: the effective count is ~1 of 5.
+    assert 0.15 < scale < 0.35
+    # And the calibrated threshold with the correction must sit close to the
+    # 6-channel Gaussian bank's, not a 30-channel one's.
+    g = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=6)
+    z_shaped = float(np.asarray(f.effective_alpha(512, 512)).ravel()[0])
+    z_gauss = float(np.asarray(g.effective_alpha(512, 512)).ravel()[0])
+    assert abs(z_shaped - z_gauss) / z_gauss < 0.05
+
+
+def test_fragmentation_criterion_survives_a_shape_expanded_bank():
+    """Repeated scales made the pair criterion's 2x2 Gram singular."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _frag_bank_ratio
+
+    sigmas = np.repeat(np.linspace(1.5, 6.5, 6), 5)  # the expanded pattern
+    ratio, near = _frag_bank_ratio(sigmas, 0.0, 1.0, 1.0, 1.0, 160.0, 512, 512)
+    assert np.isfinite(ratio)

@@ -250,6 +250,10 @@ def _frag_bank_ratio(
     """Worst pair ratio over a built bank, with z calibrated for that bank.
 
     Returns (ratio, sigma near the worst gap)."""
+    # A shape-expanded bank repeats each scale once per variant; the pair
+    # criterion is about scale gaps, and a zero-width gap makes its 2x2 Gram
+    # singular.
+    sigmas = np.unique(np.round(np.asarray(sigmas, dtype=float), 6))
     z = _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width)
     worst, where = 0.0, float(sigmas[0])
     for sa, sb in zip(sigmas[:-1], sigmas[1:]):
@@ -486,6 +490,9 @@ class MatrixFreeSparseRBFPeakFinder:
         expected_peak_amplitude: float | None = None,
         fid_residual: float | None = None,
         max_fragmentation_rate: float = 1.0,
+        profile_file: str | None = None,
+        shape_ratio: float = 1.0,
+        shape_orientations: int = 4,
         **kwargs,
     ):
         if max_sigma < min_sigma:
@@ -628,6 +635,9 @@ class MatrixFreeSparseRBFPeakFinder:
         # measured brightness census the auto bank protects (see
         # _frag_protected_quantile).  Non-positive keeps the fixed p90.
         self.max_fragmentation_rate = float(max_fragmentation_rate)
+        self.profile_file = profile_file
+        self.shape_ratio = float(shape_ratio)
+        self.shape_orientations = int(shape_orientations)
         self.chunk_size = chunk_size
         self.refine_positions = refine_positions
         self.reject_boundary_sigma = reject_boundary_sigma
@@ -732,7 +742,9 @@ class MatrixFreeSparseRBFPeakFinder:
         """
         w = (self.sigmas / self.ref_sigma) ** self.gamma
         n_k = jnp.maximum(
-            (height * width) / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6)),
+            (height * width)
+            / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6))
+            * getattr(self, "_nk_multiplicity_scale", 1.0),
             2.0,
         )
         m0 = self.false_alarms_per_image
@@ -762,6 +774,112 @@ class MatrixFreeSparseRBFPeakFinder:
         return jnp.maximum(self.alpha, z_star) * w
 
     def _build_kernel_bank(self):
+        """The atom family: Gaussian by default, measured-profile on request.
+
+        ``profile_file`` points at a radial profile ``f(u)``, ``u = r/sigma``
+        (JSON ``{"u": [...], "f": [...]}``), measured by stacking bright
+        isolated peaks recentred on their moment centroids and rescaled by
+        their moment widths.  On cg4d-garnet the family is essentially rank-1
+        after scale: the mean profile carries 95.5% of the energy, and it is
+        flat-topped -- 14-24% above a Gaussian at u = 1-2.
+
+        ``shape_ratio > 1`` adds elliptical variants of the trunk at
+        ``shape_orientations`` position angles, area-preserving (a*b =
+        sigma^2), so every kernel keeps flux = C * sigma^2 with a single C and
+        the width-mixture collapse in ``_read_chunk`` stays exactly valid.
+        The residual after the mean profile *is* anisotropy (the leading
+        scale-normalised PCA modes), and a radially symmetric atom -- Gaussian
+        or measured -- cannot represent a ratio-1.2 peak with one atom at any
+        bank density.
+
+        Non-Gaussian or anisotropic kernels are not separable, so the solver
+        uses its FFT path; the separable erf fast path stays for the default
+        Gaussian bank.
+        """
+        if self.profile_file is None and self.shape_ratio == 1.0:
+            return self._build_gaussian_bank()
+
+        import json as _json
+
+        if self.profile_file is not None:
+            _prof = _json.load(open(self.profile_file))
+            _u = np.asarray(_prof["u"], dtype=float)
+            _f = np.asarray(_prof["f"], dtype=float)
+
+            def trunk(u):
+                return np.interp(u, _u, _f, left=float(_f[0]), right=0.0)
+
+        else:
+
+            def trunk(u):
+                return np.exp(-0.5 * u * u)
+
+        if self.shape_ratio > 1.0:
+            angles = (
+                np.pi * np.arange(self.shape_orientations) / self.shape_orientations
+            )
+            shapes = [(1.0, 0.0)] + [(self.shape_ratio, float(a)) for a in angles]
+        else:
+            shapes = [(1.0, 0.0)]
+
+        base = np.asarray(self.sigmas, dtype=float)
+        # Guard against double expansion on a rebuild that did not reset
+        # ``sigmas``: an expanded bank repeats each scale len(shapes) times.
+        n_sh = len(shapes)
+        if base.size % n_sh == 0 and base.size >= n_sh and n_sh > 1:
+            folded = base.reshape(-1, n_sh)
+            if np.all(folded == folded[:, :1]):
+                base = folded[:, 0]
+
+        grid = np.arange(-self.max_k_rad, self.max_k_rad + 1, dtype=float)
+        # Pixel integration by 3x3 supersampling: adequate for the smooth
+        # measured profile at sigma >= 1 px, where the erf shortcut for the
+        # Gaussian is not available.
+        off = (np.arange(3) - 1.0) / 3.0
+        kernels, sig_out = [], []
+        for s in base:
+            for ratio, theta in shapes:
+                a = s * np.sqrt(ratio)
+                b = s / np.sqrt(ratio)
+                co, si = np.cos(theta), np.sin(theta)
+                acc = np.zeros((grid.size, grid.size))
+                for dy in off:
+                    for dx in off:
+                        yy, xx = np.meshgrid(grid + dy, grid + dx, indexing="ij")
+                        uu = (yy * co + xx * si) / a
+                        vv = (-yy * si + xx * co) / b
+                        acc += trunk(np.hypot(uu, vv))
+                kernels.append(acc / 9.0)
+                sig_out.append(s)
+        kernels_2d = jnp.asarray(np.stack(kernels), dtype=jnp.float32)
+        sq_norms = jnp.sum(kernels_2d**2, axis=(1, 2))
+        self.sigmas = jnp.asarray(np.asarray(sig_out), dtype=jnp.float32)
+        self.num_sigmas = int(self.sigmas.shape[0])
+        self.use_separable = False
+
+        # Effective multiplicity of the shape variants, from the kernel Gram.
+        # The false-alarm calibration sum-pools N_k over channels as if each
+        # were an independent test; shape variants at one (site, scale) are
+        # nearly the same test (measured K_eff = 1.01 of 5 at ratio 1.2), and
+        # counting them n_sh times inflates the solved z.  Measured cost of
+        # not correcting: the faint half of all detections (243 -> 120 atoms
+        # on cg4d-garnet run 2038, every lost cluster below intensity 172).
+        mid = kernels[(len(base) // 2) * n_sh : (len(base) // 2 + 1) * n_sh]
+        M = np.array([m.ravel() for m in mid])
+        norms = np.linalg.norm(M, axis=1)
+        C = (M @ M.T) / np.outer(norms, norms)
+        lam = np.linalg.eigvalsh(C)
+        k_eff = float(lam.sum() ** 2 / np.sum(lam**2))
+        self._nk_multiplicity_scale = k_eff / n_sh
+        if self.show_steps:
+            print(
+                f"  > learned basis: {len(base)} scales x {n_sh} shape(s) = "
+                f"{self.num_sigmas} channels; shape K_eff = {k_eff:.2f}, "
+                f"N_k scaled by {self._nk_multiplicity_scale:.3f}"
+            )
+        return kernels_2d[:, None, :, :], sq_norms
+
+    def _build_gaussian_bank(self):
         k_grid = jnp.arange(-self.max_k_rad, self.max_k_rad + 1)
         yy, xx = jnp.meshgrid(k_grid, k_grid, indexing="ij")
 
