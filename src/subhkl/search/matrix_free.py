@@ -2405,17 +2405,25 @@ class MatrixFreeSparseRBFPeakFinder:
                 imgs = device_util.pad_to_multiple(images_padded[start:stop], n_dev)
                 bgs = device_util.pad_to_multiple(bg_padded[start:stop], n_dev)
                 per_device = int(imgs.shape[0]) // n_dev
-                # All calls are dispatched before any result is awaited, so
-                # the devices solve concurrently.
-                parts = []
+                # Enqueue every slice-and-transfer before dispatching any
+                # solve.  The chunk arrays live on the default device, so the
+                # slice that feeds device d is an op on device 0's in-order
+                # stream: dispatch solve 0 first and the transfer to device 1
+                # queues behind the whole of solve 0, which serializes the
+                # devices into taking perfectly alternating turns (observed as
+                # one GPU pegged while the other idles, then swapping).  With
+                # all transfers enqueued first and every solve dispatched
+                # before any result is awaited, the devices solve concurrently.
+                pieces = []
                 for d, device in enumerate(devices):
                     piece = slice(d * per_device, (d + 1) * per_device)
-                    parts.append(
-                        solve_batch(
+                    pieces.append(
+                        (
                             jax.device_put(imgs[piece], device),
                             jax.device_put(bgs[piece], device),
                         )
                     )
+                parts = [solve_batch(im, bg) for im, bg in pieces]
 
                 def coeff(local, _parts=parts, _per=per_device):
                     return _parts[local // _per][local % _per]
