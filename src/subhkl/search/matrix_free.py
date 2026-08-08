@@ -1,4 +1,5 @@
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import jax
@@ -2395,7 +2396,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 f"({n_shapes} shape variants share the channel budget)"
             )
         # Opted in via multi_gpu, each device solves its own slice of the
-        # chunk as an *independent* jitted call, dispatched asynchronously --
+        # chunk as an *independent* jitted call on its own dispatch thread --
         # deliberately not one jit sharded over a mesh.  The solver's outer
         # SSN loop is a lax.while_loop; under vmap its condition is "any image
         # in the batch still active", and under GSPMD sharding that predicate
@@ -2403,9 +2404,9 @@ class MatrixFreeSparseRBFPeakFinder:
         # march in lockstep until the globally slowest image converges, with
         # converged images burning masked iterations all the while.  Measured
         # on a two-GPU run, that decomposition held each card at ~150 W of a
-        # 400 W budget.  Independent per-device calls need zero collectives,
-        # confine a straggler to its own card, and overlap through JAX's
-        # async dispatch.
+        # 400 W budget.  Independent per-device calls need zero collectives
+        # and confine a straggler to its own card; why they also need their
+        # own threads is explained at the pool below.
         #
         # The global chunk grows by the device count so the per-device share
         # stays at the configured chunk_size budget, and a partial final chunk
@@ -2422,6 +2423,19 @@ class MatrixFreeSparseRBFPeakFinder:
                     f"as {n_dev} independent per-device solves"
                 )
         solve_batch = jax.jit(jax.vmap(self._solve_ssn_cg_global))
+        # One dispatch thread per device, and not as an optimisation: the
+        # solver is built on lax.while_loop, and XLA:GPU has no device-side
+        # control flow, so each iteration copies the loop predicate back to
+        # the host to decide whether to launch the next one.  That makes the
+        # whole execute run inline on the calling thread -- a jitted call
+        # containing a while_loop is synchronous, JAX's async dispatch
+        # notwithstanding.  Every single-thread scheme therefore serializes
+        # the devices no matter how the data is decomposed (measured twice:
+        # a mesh-sharded solve and an async-dispatch attempt both ran one
+        # GPU at a time).  Blocking in a thread releases the GIL inside the
+        # executor, so per-device threads are what actually overlap the
+        # solves -- and the per-device compiles on the first chunk.
+        solve_pool = ThreadPoolExecutor(max_workers=n_dev) if n_dev > 1 else None
 
         for start in range(0, B, solve_chunk):
             stop = min(start + solve_chunk, B)
@@ -2429,15 +2443,10 @@ class MatrixFreeSparseRBFPeakFinder:
                 imgs = device_util.pad_to_multiple(images_padded[start:stop], n_dev)
                 bgs = device_util.pad_to_multiple(bg_padded[start:stop], n_dev)
                 per_device = int(imgs.shape[0]) // n_dev
-                # Enqueue every slice-and-transfer before dispatching any
-                # solve.  The chunk arrays live on the default device, so the
-                # slice that feeds device d is an op on device 0's in-order
-                # stream: dispatch solve 0 first and the transfer to device 1
-                # queues behind the whole of solve 0, which serializes the
-                # devices into taking perfectly alternating turns (observed as
-                # one GPU pegged while the other idles, then swapping).  With
-                # all transfers enqueued first and every solve dispatched
-                # before any result is awaited, the devices solve concurrently.
+                # Enqueue every slice-and-transfer before handing the solves
+                # to the pool: the chunk arrays live on the default device,
+                # so the slice that feeds device d is an op on device 0's
+                # in-order stream and must precede device 0's solve there.
                 pieces = []
                 for d, device in enumerate(devices):
                     piece = slice(d * per_device, (d + 1) * per_device)
@@ -2447,7 +2456,12 @@ class MatrixFreeSparseRBFPeakFinder:
                             jax.device_put(bgs[piece], device),
                         )
                     )
-                parts = [solve_batch(im, bg) for im, bg in pieces]
+                parts = [
+                    f.result()
+                    for f in [
+                        solve_pool.submit(solve_batch, im, bg) for im, bg in pieces
+                    ]
+                ]
 
                 def coeff(local, _parts=parts, _per=per_device):
                     return _parts[local // _per][local % _per]
@@ -2542,6 +2556,11 @@ class MatrixFreeSparseRBFPeakFinder:
                 del parts
             else:
                 del c_tensors
+
+        if solve_pool is not None:
+            # Workers are idle here; on an exception path the pool is instead
+            # reclaimed when the executor is collected.
+            solve_pool.shutdown(wait=False)
 
         self.n_boundary_rejected = rejected_counts
 
