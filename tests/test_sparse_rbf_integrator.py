@@ -1787,7 +1787,9 @@ def test_extraction_returns_full_support_beyond_any_chunk_size():
     # Refinement is exercised by the solver-level tests; here it would only
     # slide the synthetic delta atoms around and obscure the counting claim.
     finder.refine_positions = False
-    K = len(np.asarray(finder.sigmas))
+    # The coefficient tensor's channel dimension is the bank's, which with
+    # shape variants is num_sigmas * n_shapes; ``sigmas`` stays the scale grid.
+    K = int(finder.K_weights.shape[0])
     H = W = 130
     y_img = np.zeros((H, W), dtype=np.float32)
     bg_img = np.full((H, W), 1.0, dtype=np.float32)
