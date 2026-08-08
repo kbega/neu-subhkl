@@ -1908,7 +1908,9 @@ def test_num_sigmas_decouples_bank_resolution_from_the_ceiling():
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
-    coarse = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0)
+    # The subject is the explicit-num_sigmas contract (uniform grid at a
+    # chosen count); the auto-sized default is covered elsewhere.
+    coarse = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0, num_sigmas=5)
     assert len(np.asarray(coarse.sigmas)) == 5
     assert np.isclose(np.diff(np.asarray(coarse.sigmas)).mean(), 1.0)
 
@@ -2021,12 +2023,16 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
     assert sized.fit_metrics["bic"] < starved.fit_metrics["bic"]
 
     # m0 plumbing: reaches the finder and tightens the threshold.
+    # Pinned bank: m0 legitimately couples into auto bank sizing (stricter
+    # budget -> higher z -> stronger anti-carpet tax -> fewer channels), and
+    # elementwise threshold comparisons need a common grid.
     strict = MatrixFreeSparseRBFPeakFinder(
         alpha=None,
         gamma=0.5,
         min_sigma=1.0,
         max_sigma=6.0,
         false_alarms_per_image=0.01,
+        num_sigmas=6,
     )
     lax_f = MatrixFreeSparseRBFPeakFinder(
         alpha=None,
@@ -2034,6 +2040,7 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
         min_sigma=1.0,
         max_sigma=6.0,
         false_alarms_per_image=10.0,
+        num_sigmas=6,
     )
     assert np.all(
         np.array(strict.effective_alpha(128, 128))
@@ -2136,8 +2143,8 @@ def test_fragmentation_rate_maps_to_protected_quantile():
     assert _frag_protected_quantile(8.0, 4.0) == 50.0
     assert _frag_protected_quantile(0.0, 4.0) == 100.0
 
-    # The counting census tiles disjoint windows so one peak lands in ~one
-    # window; the overlapping amplitude scan sees the same peak several times.
+    # The counting census assigns each peak to the one window that owns its
+    # centroid; the amplitude scan keeps every window the peak's flux reaches.
     def pixel_integrated(shape, r0, c0, sigma, amp):
         rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
         s2 = sigma * np.sqrt(2.0)
@@ -2152,7 +2159,7 @@ def test_fragmentation_rate_maps_to_protected_quantile():
     image = rng.poisson(frame).astype(float)
     bg_map = np.full_like(image, 0.6)
 
-    counting = _moment_census(image[None], bg_map[None], 0.6, disjoint=True)
+    counting = _moment_census(image[None], bg_map[None], 0.6, counting=True)
     scanning = _moment_census(image[None], bg_map[None], 0.6)
     assert 1 <= counting.size <= 6
     assert scanning.size > counting.size

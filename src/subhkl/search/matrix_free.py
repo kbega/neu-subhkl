@@ -59,9 +59,12 @@ from jax import jit, lax, vmap
 # real frame and the measured background in find_peaks_batch, which warns if
 # the built bank falls short on the actual data).
 
-_FRAG_FID_RESIDUAL = 9.9  # realised / idealised carpet advantage; factory
+_FRAG_FID_RESIDUAL = 20.0  # realised / idealised carpet advantage; factory
 # default of the fid_residual constructor argument, and the one empirical
-# constant left.  calibrate_fragmentation_residual fits it per instrument
+# constant left.  Measured 9.3-9.9 on the calibration case and kept at ~2x
+# that, so the bank errs dense: the steepness of the mechanism prices the
+# safety factor at only a few channels (e.g. [1,25] at gamma 0: 11 -> 14).
+# calibrate_fragmentation_residual fits it per instrument
 # against a requested unsupported-atom rate, the way m0 fixes the threshold: the measured factor (bank [1,25]x5, truth
 # sigma*=15 at height 120 over background 7.6: 886/245 nats measured against
 # the model's idealised ratio) by which reality favours the carpet beyond
@@ -96,16 +99,16 @@ def _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width):
     return 0.5 * (lo + hi)
 
 
-def _moment_census(images, bg_map, bg_hi, disjoint=False):
+def _moment_census(images, bg_map, bg_hi, counting=False):
     """Moment amplitudes ``A = F / (2 pi sigma^2)`` of every window that
     carries enough flux to measure, as an array (possibly empty).
 
-    ``disjoint=True`` tiles the frame with non-overlapping windows so that
-    one peak lands in ~one window: that is the *counting* configuration,
-    used to estimate the bright-peak population for the fragmentation-rate
-    mapping.  The default overlapping scan (stride = half window) is the
-    *amplitude* configuration -- a peak straddling a window boundary still
-    gets one well-centred window -- used for quantile estimates.
+    ``counting=True`` keeps only the window that *owns* its flux centroid
+    (|centroid| <= stride/2 in both axes) -- a Voronoi assignment of peaks
+    to window centres, so each bright peak is counted exactly once however
+    it sits relative to the grid.  That is the population estimate for the
+    fragmentation-rate mapping.  The default scan keeps every measurable
+    window and is the *amplitude* configuration used for quantiles.
     """
     excess = np.asarray(images, dtype=np.float64) - np.asarray(bg_map, dtype=np.float64)
     if excess.ndim == 2:
@@ -114,12 +117,22 @@ def _moment_census(images, bg_map, bg_hi, disjoint=False):
     for frame in excess:
         H, W = frame.shape
         step = max(8, int(H // 64))
-        stride = 2 * step + 1 if disjoint else step
-        for r0 in range(step, H - step, stride):
-            for c0 in range(step, W - step, stride):
+        for r0 in range(step, H - step, step):
+            for c0 in range(step, W - step, step):
                 win = frame[r0 - step : r0 + step + 1, c0 - step : c0 + step + 1]
                 flux = float(win.sum())
-                if flux < max(20.0 * bg_hi, 50.0):
+                # The floor must clear the Poisson noise of the window sum,
+                # not just an absolute count: on a peak-free frame the excess
+                # sum fluctuates with sd sqrt(area * bg), and a fixed floor of
+                # 50 sits within reach of its tail (measured: a flat
+                # Poisson(0.5) frame produced a census entry of 0.41 photons
+                # that resized the bank to protect nothing).  Eight sigma
+                # keeps every real peak -- their fluxes are thousands -- and
+                # nothing else.
+                area = float(win.size)
+                if flux < max(
+                    20.0 * bg_hi, 50.0, 8.0 * np.sqrt(area * max(bg_hi, 1e-3))
+                ):
                     continue
                 w = np.maximum(win, 0.0)
                 tot = w.sum()
@@ -128,11 +141,12 @@ def _moment_census(images, bg_map, bg_hi, disjoint=False):
                 rr, cc = np.mgrid[-step : step + 1, -step : step + 1]
                 dr = (w * rr).sum() / tot
                 dc = (w * cc).sum() / tot
-                # Counting mode: a bright peak's skirt spills enough flux into
-                # neighbouring tiles to clear the floor, but a spill tile's
-                # centroid sits at its border.  Requiring an interior centroid
-                # counts the peak where it lives and nowhere else.
-                if disjoint and max(abs(dr), abs(dc)) > 0.5 * step:
+                # Counting mode: neighbouring windows see the same peak (the
+                # skirt clears the flux floor several windows out), but only
+                # the window nearest the peak owns the centroid.  Half the
+                # stride in each axis tiles the plane exactly once, so the
+                # ownership test counts each peak once wherever it sits.
+                if counting and max(abs(dr), abs(dc)) > 0.5 * step:
                     continue
                 m2 = (w * ((rr - dr) ** 2 + (cc - dc) ** 2)).sum() / tot
                 if not np.isfinite(m2) or m2 <= 0:
@@ -280,8 +294,8 @@ def _auto_sigma_grid(
     The safe gap is roughly a constant *ratio* (~1.3-1.6x, tightening as
     sigma**(1-gamma) toward the wide end), so the minimal grid is close to
     geometric.  A uniform grid pays that ratio at the narrowest pair and
-    needs several times more channels for the same guarantee -- e.g. 38
-    uniform vs ~11 adaptive over [1, 25] at gamma = 0.
+    needs several times more channels for the same guarantee (roughly 3x,
+    e.g. ~14 adaptive over [1, 25] at gamma = 0).
 
     The calibrated z depends on the bank being built, so the build runs as a
     short fixed-point iteration: place the grid under the current z, re-solve
@@ -647,7 +661,14 @@ class MatrixFreeSparseRBFPeakFinder:
         self.K_weights, self.kernel_sq_norms = self._build_kernel_bank()
         self.K_sq = self.K_weights**2
         self.K_cu = self.K_weights**3
+        # Both transform caches key on id(weights).  Emptying them is not
+        # optional tidiness: the freed old bank's id can be recycled by a
+        # later allocation -- the replacement bank included -- and a recycled
+        # id would resurrect stale entries with the old channel count.
+        # (Observed as a K x K' shape error in the FFT solve path on CPU,
+        # where the allocator reuses the freed block readily.)
         self._pc_cache = {}
+        self._fft_cache = {}
         # The jitted methods take `self` as a static argument, so their
         # compiled traces bake in the bank tensors read at trace time.  A
         # rebuilt bank with unchanged input shapes would otherwise hit those
@@ -1933,7 +1954,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 # disjoint-window census -- no solve involved (see
                 # _frag_protected_quantile).
                 if self.max_fragmentation_rate > 0:
-                    census = _moment_census(images_batch, bg_map, bg_hi, disjoint=True)
+                    census = _moment_census(images_batch, bg_map, bg_hi, counting=True)
                     if census.size:
                         q = _frag_protected_quantile(
                             self.max_fragmentation_rate, census.size / B
@@ -2158,6 +2179,34 @@ class MatrixFreeSparseRBFPeakFinder:
                 "pass this test; failing it means redundancy -- a peak "
                 "reported as a cluster of atoms none of which the data "
                 "support alone."
+            )
+
+        # The false-positive diagnostic, parallel to the unsupported count:
+        # an atom admitted on a marginal noise excursion carries the
+        # admission bar's worth of leave-one-out support and no more --
+        # ~z_bar^2 plus the median chi^2_3 refit gain.  Atoms inside
+        # [chi^2_4 95%, z_bar^2 + 2.4) are therefore consistent with a noise
+        # admission.  This bounds rather than counts false positives --
+        # genuinely dim peaks land in the same band -- but the calibration
+        # holds E[FP] = m0, so a count far above m0 means either a large dim
+        # population or a broken calibration, and a count near m0 says the
+        # budget is being spent as designed.
+        a_bar = float(np.mean(np.asarray(self.effective_alpha(H, W))))
+        fp_band_hi = a_bar * a_bar + 2.4
+        n_fp_like = sum(
+            int(np.count_nonzero((d >= 9.49) & (d < fp_band_hi)))
+            for d in self.peak_deviance
+        )
+        self.fp_consistent_atoms_per_image = n_fp_like / max(B, 1)
+        if self.show_steps:
+            print(
+                f"  > False-positive-consistent atoms: {n_fp_like} "
+                f"({self.fp_consistent_atoms_per_image:.2f}/image), with "
+                f"leave-one-out support in [9.5, {fp_band_hi:.1f}) nats -- "
+                "no more than a marginal admission carries -- against the "
+                f"budget m0 = {self.false_alarms_per_image:g}/image.  An "
+                "upper bound on realised false positives: dim real peaks "
+                "land in this band too."
             )
 
         # Bank-edge report, both ends.  An atom pinned at the ceiling is a
