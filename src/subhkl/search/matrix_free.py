@@ -1902,11 +1902,27 @@ class MatrixFreeSparseRBFPeakFinder:
         bit-identical to refining everything jointly.
 
         Returns the valid peaks only, [n, 4], already mask-applied.
+
+        Split into rank / dispatch / finalize so the batched caller can
+        pipeline: rank every image, then dispatch every image's measurement
+        and refinement (all asynchronous, each queued on the device that
+        holds its coefficient tensor), and only then start pulling results.
+        Interleaving the host syncs with the dispatch -- what this method
+        does when called whole -- serializes the devices in multi-GPU runs:
+        the refinement is the dominant per-image cost, and a per-image
+        sync-dispatch-sync sequence keeps exactly one device busy at a time.
         """
-        order, count = self._rank_support(c_tensor, border=border)
+        ranked = self._rank_support(c_tensor, border=border)
+        state = self._extract_dispatch(c_tensor, y_img, bg_img, ranked)
+        return self._extract_finalize(state)
+
+    def _extract_dispatch(self, c_tensor, y_img, bg_img, ranked):
+        """Dispatch one image's measurement and refinement; sync only on the
+        support count.  Returns opaque state for :meth:`_extract_finalize`."""
+        order, count = ranked
         n = int(count)
         if n == 0:
-            return np.zeros((0, 4), dtype=np.float32)
+            return None
 
         chunk = self.EXTRACT_CHUNK
         n_chunks = -(-n // chunk)
@@ -1936,6 +1952,14 @@ class MatrixFreeSparseRBFPeakFinder:
                 refined.append(self._refine_peaks(y_img, bg_eff, p, jnp.asarray(m)))
             peaks_chunks = refined
 
+        return peaks_chunks, masks
+
+    @staticmethod
+    def _extract_finalize(state):
+        """Pull one image's dispatched extraction back to the host."""
+        if state is None:
+            return np.zeros((0, 4), dtype=np.float32)
+        peaks_chunks, masks = state
         peaks_all = np.concatenate([np.asarray(p) for p in peaks_chunks])
         mask_all = np.concatenate(masks)
         return peaks_all[mask_all].astype(np.float32)
@@ -2435,16 +2459,31 @@ class MatrixFreeSparseRBFPeakFinder:
                 def coeff(local, _c=c_tensors):
                     return _c[local]
 
-            for i in range(start, stop):
-                # Extraction and sliding refinement in one chunked sweep; the
-                # coordinates still match the padded image the model is
-                # rendered on, and only the valid rows come back.
-                valid_peaks = self._extract_peaks_all(
-                    coeff(i - start),
-                    images_padded[i],
-                    bg_padded[i],
-                    border=pad_y + MARGIN,
+            # Extraction and sliding refinement in one chunked sweep; the
+            # coordinates still match the padded image the model is rendered
+            # on, and only the valid rows come back.
+            #
+            # Pipelined in three phases rather than image-by-image, because
+            # refinement dominates the per-image cost and every image's work
+            # runs on the device that holds its coefficient tensor.  The
+            # sequential form -- sync on image i's support count, dispatch its
+            # refinement, pull its peaks, only then look at image i+1 -- kept
+            # exactly one GPU busy at a time on a two-device run (part 0's
+            # images all live on device 0, part 1's on device 1).  Ranking
+            # everything first, then dispatching every image's measurement and
+            # refinement before pulling any result, fills both device queues
+            # and lets the pulls drain them in order.
+            tensors = [coeff(local) for local in range(stop - start)]
+            ranked = [self._rank_support(c, border=pad_y + MARGIN) for c in tensors]
+            states = [
+                self._extract_dispatch(
+                    c, images_padded[start + local], bg_padded[start + local], r
                 )
+                for local, (c, r) in enumerate(zip(tensors, ranked))
+            ]
+
+            for i in range(start, stop):
+                valid_peaks = self._extract_finalize(states[i - start])
 
                 valid_peaks[:, 1] -= pad_y
                 valid_peaks[:, 2] -= pad_x
@@ -2498,7 +2537,7 @@ class MatrixFreeSparseRBFPeakFinder:
             # device memory stays at one chunk rather than two.  `coeff` holds
             # the coefficient tensors (whole in c_tensors, or per-device in
             # its closure), so it must go with them.
-            del coeff
+            del coeff, tensors, ranked, states
             if n_dev > 1:
                 del parts
             else:
