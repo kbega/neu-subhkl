@@ -147,12 +147,13 @@ def finder(
     sparse_rbf_profile_file: Annotated[
         Optional[str],
         typer.Option(
-            help="Radial peak profile f(u), u = r/sigma, as JSON {u: [...], f: "
-            "[...]} measured from the data (e.g. by stacking bright isolated "
-            "peaks).  Replaces the Gaussian atom; the default None keeps the "
-            "Gaussian."
+            help="Peak profile replacing the Gaussian atom.  'auto' (default) "
+            "measures the radial profile f(u), u = r/sigma, from the first "
+            "batch's own bright peaks and rebuilds the bank; a path reads a "
+            "measured profile as JSON {u: [...], f: [...]}; 'gaussian' keeps "
+            "the analytic Gaussian."
         ),
-    ] = None,
+    ] = "auto",
     sparse_rbf_shape_ratio: Annotated[
         float,
         typer.Option(

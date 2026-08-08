@@ -2166,8 +2166,9 @@ def test_fragmentation_rate_maps_to_protected_quantile():
 
 
 def test_learned_basis_default_is_exactly_the_gaussian_bank():
-    """profile_file=None, shape_ratio=1.0 must leave the Gaussian path -- and
-    its separable fast path -- byte-for-byte alone."""
+    """The default is profile_file='auto': construction starts on the Gaussian
+    bank (and its separable fast path) and only the first data batch can swap
+    in a measured trunk.  Before any data, auto and 'gaussian' are identical."""
     import numpy as np
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
@@ -2246,3 +2247,54 @@ def test_fragmentation_criterion_survives_a_shape_expanded_bank():
     sigmas = np.repeat(np.linspace(1.5, 6.5, 6), 5)  # the expanded pattern
     ratio, near = _frag_bank_ratio(sigmas, 0.0, 1.0, 1.0, 1.0, 160.0, 512, 512)
     assert np.isfinite(ratio)
+
+
+def test_radial_profile_measurement_ranks_shapes_correctly():
+    """The in-line profile measurement must read a flat-top as flatter than a
+    Gaussian, and a Gaussian as not flat.  Absolute width is allowed a uniform
+    stretch (~6% measured, from neighbour-tail spill) because a stretch of the
+    u axis is absorbed by the sigma grid; the *shape* ordering is what the
+    solver pays atoms for."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _measure_radial_profile
+
+    def peak(shape, r0, c0, s, amp, beta):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        q = np.hypot(rr - r0, cc - c0) / s
+        return amp * np.exp(-0.5 * np.power(np.maximum(q, 1e-12), beta))
+
+    rng = np.random.default_rng(9)
+    ratios = {}
+    for beta in (2.0, 2.8):
+        frame = np.full((512, 512), 0.7)
+        for _ in range(25):
+            r, c = rng.uniform(50, 462, 2)
+            frame += peak(
+                frame.shape, r, c, rng.uniform(2.5, 5.0), rng.uniform(60, 300), beta
+            )
+        image = rng.poisson(frame).astype(float)
+        u, f = _measure_radial_profile(
+            image[None], np.full_like(image, 0.7)[None], 0.7, max_sigma=6.5
+        )
+        i = int(np.argmin(np.abs(u - 1.5)))
+        ratios[beta] = f[i] / np.exp(-0.5 * u[i] ** 2)
+    assert ratios[2.8] > ratios[2.0] + 0.1, ratios
+    assert 0.7 < ratios[2.0] < 1.15, ratios
+
+
+def test_radial_profile_measurement_refuses_a_peak_free_frame():
+    """A frame with nothing in it must return None -- the caller stays on the
+    Gaussian -- rather than a profile made of noise windows."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _measure_radial_profile
+
+    rng = np.random.default_rng(3)
+    image = rng.poisson(np.full((512, 512), 0.7)).astype(float)
+    assert (
+        _measure_radial_profile(
+            image[None], np.full_like(image, 0.7)[None], 0.7, max_sigma=6.5
+        )
+        is None
+    )

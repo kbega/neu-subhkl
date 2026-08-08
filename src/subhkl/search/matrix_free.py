@@ -155,6 +155,119 @@ def _moment_census(images, bg_map, bg_hi, counting=False):
     return np.asarray(amps, dtype=np.float64)
 
 
+def _measure_radial_profile(
+    images, bg_map, bg_hi, max_sigma, min_windows=8, u_max=4.0, du=0.1
+):
+    """The peak family's radial profile, measured from the frames themselves.
+
+    The low-rank result that motivates this: stacking bright isolated peaks
+    (recentred on moment centroids, rescaled by moment widths) leaves the mean
+    profile carrying ~95% of the family's energy, so one measured trunk is the
+    family up to anisotropy.  Measuring it is the same box arithmetic as the
+    amplitude census -- no solve, no fit, no functional form:
+
+      per qualifying window: float centroid, m2 -> sigma_w; bin the
+      background-subtracted counts by u = r/sigma_w; normalise to unit flux;
+      average windows weighted by flux.
+
+    Binning around the *float* centroid handles sub-pixel centring without
+    interpolation.  Windows are the Voronoi (counting) census, so each peak
+    contributes once; the flux floor already clears 8 sigma of window-sum
+    noise, so a peak-free frame contributes nothing rather than a noise
+    profile.  Returns ``(u, f)`` with ``f[0] = 1``, or ``None`` when fewer
+    than ``min_windows`` qualify -- the caller then stays on the Gaussian,
+    which is the safe default rather than a profile made of too few peaks.
+    """
+    excess = np.asarray(images, dtype=np.float64) - np.asarray(bg_map, dtype=np.float64)
+    if excess.ndim == 2:
+        excess = excess[None, ...]
+    edges = np.arange(0.0, u_max + du, du)
+    centres = 0.5 * (edges[1:] + edges[:-1])
+    acc = np.zeros(centres.size)
+    wgt = np.zeros(centres.size)
+    n_used = 0
+    for frame in excess:
+        H, W = frame.shape
+        # The window must hold a max_sigma peak out to ~2.5 sigma, or its
+        # second moment is so truncated that every measured width -- and with
+        # it the u = r/sigma axis -- is wrong.  Measured cost of the census
+        # default (17 px on a 512 frame, sigma up to 6.5): a pure-Gaussian
+        # synthetic read 43% too broad at u = 1.5.
+        step = max(8, int(np.ceil(2.5 * float(max_sigma))))
+        yy, xx = np.mgrid[-step : step + 1, -step : step + 1].astype(float)
+        for r0 in range(step, H - step, step):
+            for c0 in range(step, W - step, step):
+                win = frame[r0 - step : r0 + step + 1, c0 - step : c0 + step + 1]
+                flux = float(win.sum())
+                area = win.size
+                if flux < max(
+                    20.0 * bg_hi, 50.0, 8.0 * np.sqrt(max(bg_hi, 0.05) * area)
+                ):
+                    continue
+                # Centroid from clipped weights (stability); everything after
+                # from *unclipped* values inside a *circular* mask.  Clipping
+                # rectifies background noise into a pedestal that inflates m2,
+                # and a square window's corners do the same relative to the
+                # circular truncation model inverted below -- together they
+                # read a pure-Gaussian synthetic 20-40% wrong in width.
+                w = np.maximum(win, 0.0)
+                tot = w.sum()
+                if tot <= 0:
+                    continue
+                dr = (w * yy).sum() / tot
+                dc = (w * xx).sum() / tot
+                # Voronoi ownership: only the window that owns its centroid.
+                if abs(dr) > step / 2 or abs(dc) > step / 2:
+                    continue
+                d2 = (yy - dr) ** 2 + (xx - dc) ** 2
+                disk = d2 <= step**2
+                flux_d = float(win[disk].sum())
+                if flux_d <= 0:
+                    continue
+                m2 = float((win[disk] * d2[disk]).sum()) / flux_d
+                # Invert the truncation: inside radius R a Gaussian returns
+                # m2 = sigma^2 * 2(1 - (1+x)e^-x)/(1 - e^-x), x = R^2/2sigma^2.
+                # A damped fixed point converges in a few steps and needs no
+                # bracketing solver.
+                sigma_w = np.sqrt(max(m2, 1e-9) / 2.0)
+                for _ in range(8):
+                    x = step**2 / (2.0 * sigma_w**2)
+                    ex = np.exp(-min(x, 60.0))
+                    ratio = 2.0 * (1.0 - (1.0 + x) * ex) / max(1.0 - ex, 1e-9)
+                    new_sigma = np.sqrt(max(m2, 1e-9) / max(ratio, 1e-9))
+                    if abs(new_sigma - sigma_w) < 0.005:
+                        sigma_w = new_sigma
+                        break
+                    sigma_w = 0.5 * (sigma_w + new_sigma)
+                # A width at the window scale was never bracketed.
+                if not (0.5 <= sigma_w <= step / 2.5):
+                    continue
+                u = np.sqrt(d2[disk]).ravel() / sigma_w
+                v = win[disk].ravel() / flux_d
+                which = np.clip((u / du).astype(int), 0, centres.size - 1)
+                inside = u < u_max
+                # Flux-weighted mean of the unit-flux pixel values per u bin:
+                # acc/wgt is then the average profile, bright peaks weighted by
+                # their better statistics.
+                np.add.at(acc, which[inside], flux * v[inside])
+                counts = np.bincount(which[inside], minlength=centres.size).astype(
+                    float
+                )
+                wgt += flux * counts
+                n_used += 1
+    if n_used < min_windows:
+        return None
+    ok = wgt > 0
+    f = np.zeros(centres.size)
+    f[ok] = acc[ok] / wgt[ok]
+    # Per-bin averages of per-pixel values: convert back to a profile by
+    # normalising the centre to 1; the kernel builder only needs the shape.
+    if f[0] <= 0:
+        return None
+    f = np.maximum(f / f[0], 0.0)
+    return centres[ok], f[ok]
+
+
 def _moment_peak_amplitude(images, bg_map, bg_hi, quantile=90.0):
     """Bright-peak amplitude from window moments, not from a top-quantile count.
 
@@ -490,7 +603,7 @@ class MatrixFreeSparseRBFPeakFinder:
         expected_peak_amplitude: float | None = None,
         fid_residual: float | None = None,
         max_fragmentation_rate: float = 1.0,
-        profile_file: str | None = None,
+        profile_file: str | None = "auto",
         shape_ratio: float = 1.0,
         shape_orientations: int = 4,
         **kwargs,
@@ -635,7 +748,12 @@ class MatrixFreeSparseRBFPeakFinder:
         # measured brightness census the auto bank protects (see
         # _frag_protected_quantile).  Non-positive keeps the fixed p90.
         self.max_fragmentation_rate = float(max_fragmentation_rate)
+        # "auto" (default): measure the radial profile from the first batch and
+        # rebuild the bank -- the same first-batch contract as the background
+        # and amplitude.  A path uses that measured profile file; "gaussian"
+        # or None keeps the analytic Gaussian.
         self.profile_file = profile_file
+        self._measured_trunk = None
         self.shape_ratio = float(shape_ratio)
         self.shape_orientations = int(shape_orientations)
         self.chunk_size = chunk_size
@@ -796,13 +914,23 @@ class MatrixFreeSparseRBFPeakFinder:
         uses its FFT path; the separable erf fast path stays for the default
         Gaussian bank.
         """
-        if self.profile_file is None and self.shape_ratio == 1.0:
+        mode = self.profile_file
+        gaussian_trunk = mode in (None, "gaussian", "none") or (
+            mode == "auto" and self._measured_trunk is None
+        )
+        if gaussian_trunk and self.shape_ratio == 1.0:
             return self._build_gaussian_bank()
 
-        import json as _json
+        if mode == "auto" and self._measured_trunk is not None:
+            _u, _f = self._measured_trunk
 
-        if self.profile_file is not None:
-            _prof = _json.load(open(self.profile_file))
+            def trunk(u):
+                return np.interp(u, _u, _f, left=float(_f[0]), right=0.0)
+
+        elif not gaussian_trunk:
+            import json as _json
+
+            _prof = _json.load(open(mode))
             _u = np.asarray(_prof["u"], dtype=float)
             _f = np.asarray(_prof["f"], dtype=float)
 
@@ -2063,6 +2191,38 @@ class MatrixFreeSparseRBFPeakFinder:
             # The moment amplitude may stand in for the top-quantile count: its
             # inputs are aggregates over a footprint, so it is safe to let into
             # the resize, which is what amp_hi itself is excluded from.
+            # Default preprocessing: the peak family's own radial profile,
+            # measured from this batch by the same box arithmetic as the
+            # amplitude census, replaces the Gaussian trunk.  One uniform
+            # stretch of the u axis (measured ~6% on synthetics, from
+            # neighbour-tail spill in the window moments) is absorbed by the
+            # sigma grid, so only the shape relative to a Gaussian at fixed
+            # second moment matters -- which is exactly what the solver pays
+            # atoms for.  Too few qualifying peaks leaves the Gaussian in
+            # place, stated rather than silent.
+            if self.profile_file == "auto" and self._measured_trunk is None:
+                measured_trunk = _measure_radial_profile(
+                    images_batch, bg_map, bg_hi, self.max_sigma
+                )
+                if measured_trunk is not None:
+                    self._measured_trunk = measured_trunk
+                    self._set_bank(np.unique(np.round(np.asarray(self.sigmas), 6)))
+                    if self.show_steps:
+                        u, f = measured_trunk
+                        g = np.exp(-0.5 * u**2)
+                        i = int(np.argmin(np.abs(u - 1.5)))
+                        print(
+                            f"  > peak profile measured from this batch "
+                            f"({len(u)} radial bins; f/gaussian at u=1.5: "
+                            f"{f[i] / max(g[i], 1e-9):.2f}); bank rebuilt "
+                            "on the measured trunk"
+                        )
+                elif self.show_steps:
+                    print(
+                        "  > peak profile: too few qualifying peaks in this "
+                        "batch; keeping the Gaussian atom"
+                    )
+
             amp_for_resize = self.expected_peak_amplitude
             if self._amp_is_auto:
                 # The requested fragmentation rate selects which quantile of
