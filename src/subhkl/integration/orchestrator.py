@@ -170,6 +170,7 @@ def prepare_harvest_tasks(
                 shape_ratio=harvest_peaks_kwargs.get("shape_ratio", 1.2),
                 shape_orientations=harvest_peaks_kwargs.get("shape_orientations", 4),
                 chunk_size=harvest_peaks_kwargs.get("chunk_size", 64),
+                multi_gpu=harvest_peaks_kwargs.get("multi_gpu", False),
             )
         batch_coords = alg.find_peaks_batch(img_stack)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}

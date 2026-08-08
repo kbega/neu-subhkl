@@ -105,6 +105,7 @@ def run_index(
     input_data: dict | None = None,
     num_candidates: int | None = None,
     no_index: bool | None = None,
+    multi_gpu: bool = False,
 ):
     input_data = input_data or {}
 
@@ -583,6 +584,7 @@ def run_index(
         freeze_orientation=freeze_orientation,
         num_candidates=num_candidates,
         no_index=no_index,
+        multi_gpu=multi_gpu,
     )
 
     print(f"\nOptimization complete. Best solution indexed {num} peaks.")
@@ -753,6 +755,7 @@ def run_finder(
     sparse_rbf_auto_tune_alpha: bool = False,
     sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",
     max_workers: int = 16,
+    multi_gpu: bool = False,
 ):
     print(f"Creating peaks from {filename} for instrument {instrument}")
 
@@ -799,6 +802,7 @@ def run_finder(
                 "shape_ratio": sparse_rbf_shape_ratio,
                 "shape_orientations": sparse_rbf_shape_orientations,
                 "chunk_size": sparse_rbf_chunk_size,
+                "multi_gpu": multi_gpu,
                 "show_steps": show_steps,
                 "show_scale": "linear",
                 "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),

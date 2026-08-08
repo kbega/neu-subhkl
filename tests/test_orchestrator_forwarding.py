@@ -47,6 +47,7 @@ def test_every_forwarded_finder_option_reaches_the_constructor(monkeypatch):
         "shape_ratio": 1.0,
         "shape_orientations": 2,
         "chunk_size": 7,
+        "multi_gpu": True,
     }
     image_data = ImageData(ims={0: np.zeros((8, 8))})
     tasks, _ = orchestrator.prepare_harvest_tasks(

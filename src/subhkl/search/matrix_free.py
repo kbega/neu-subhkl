@@ -8,6 +8,8 @@ import jax.scipy.sparse.linalg
 import numpy as np
 from jax import jit, lax, vmap
 
+from subhkl.utils import devices as device_util
+
 # --- Carpet-fragmentation control --------------------------------------------
 #
 # A truth width sigma* strictly between two bank widths can be rendered two
@@ -606,6 +608,7 @@ class MatrixFreeSparseRBFPeakFinder:
         profile_file: str | None = "auto",
         shape_ratio: float = 1.2,
         shape_orientations: int = 4,
+        multi_gpu: bool = False,
         **kwargs,
     ):
         if max_sigma < min_sigma:
@@ -757,6 +760,10 @@ class MatrixFreeSparseRBFPeakFinder:
         self.shape_ratio = float(shape_ratio)
         self.shape_orientations = int(shape_orientations)
         self.chunk_size = chunk_size
+        # Opt-in: spreads each solve chunk's image axis over every visible
+        # device.  See subhkl.utils.devices for why this must not be the
+        # default.
+        self.multi_gpu = bool(multi_gpu)
         self.refine_positions = refine_positions
         self.reject_boundary_sigma = reject_boundary_sigma
         self.boundary_sigma_frac = boundary_sigma_frac
@@ -2363,11 +2370,38 @@ class MatrixFreeSparseRBFPeakFinder:
                 f"  > solve chunk {self.chunk_size} -> {solve_chunk} images "
                 f"({n_shapes} shape variants share the channel budget)"
             )
+        # Opted in via multi_gpu, the chunk's image axis is sharded across the
+        # visible devices.  The images are solved independently, so the mesh
+        # never has to split the solver itself -- each device takes a disjoint
+        # slice of the batch.  The global chunk grows by the device count so
+        # that the per-device share stays at the configured chunk_size budget,
+        # and a partial final chunk is padded up to the device count by
+        # repeating its last image (the padded solves are discarded).  With
+        # one device this path is byte-for-byte the loop below it.
+        devices = device_util.batch_devices(self.multi_gpu)
+        n_dev = len(devices)
+        if n_dev > 1:
+            solve_chunk *= n_dev
+            batch_sharding = device_util.batch_sharding(devices)
+            if self.show_steps:
+                print(
+                    f"  > sharding solve chunks of {solve_chunk} images "
+                    f"across {n_dev} devices"
+                )
         solve_batch = jax.jit(jax.vmap(self._solve_ssn_cg_global))
 
         for start in range(0, B, solve_chunk):
             stop = min(start + solve_chunk, B)
-            c_tensors = solve_batch(images_padded[start:stop], bg_padded[start:stop])
+            if n_dev > 1:
+                imgs = device_util.pad_to_multiple(images_padded[start:stop], n_dev)
+                bgs = device_util.pad_to_multiple(bg_padded[start:stop], n_dev)
+                imgs = jax.device_put(imgs, batch_sharding)
+                bgs = jax.device_put(bgs, batch_sharding)
+                c_tensors = solve_batch(imgs, bgs)[: stop - start]
+            else:
+                c_tensors = solve_batch(
+                    images_padded[start:stop], bg_padded[start:stop]
+                )
 
             for i in range(start, stop):
                 # Extraction and sliding refinement in one chunked sweep; the

@@ -6,6 +6,7 @@ import typer
 import h5py
 import os
 
+from subhkl.utils.devices import restrict_to_first_device
 from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
 
 from subhkl.commands import (
@@ -211,7 +212,19 @@ def finder(
         str, typer.Option(help="Candidate SNR thresholds alpha for auto-tuning")
     ] = "3.0,5.0,10.0,15.0,20.0,25.0,30.0",
     max_workers: int = 16,
+    multi_gpu: Annotated[
+        bool,
+        typer.Option(
+            "--multi-gpu",
+            help="Shard the solve across every visible GPU (the image axis "
+            "of each chunk).  Off by default so one process never claims "
+            "every device in the machine; scope visibility with "
+            "CUDA_VISIBLE_DEVICES.",
+        ),
+    ] = False,
 ):
+    if not multi_gpu:
+        restrict_to_first_device()
     # Pass everything straight into the core logic function
     run_finder(
         filename=filename,
@@ -258,6 +271,7 @@ def finder(
         sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
         sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
         max_workers=max_workers,
+        multi_gpu=multi_gpu,
     )
 
 
@@ -383,7 +397,19 @@ def indexer(
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
     index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
+    multi_gpu: Annotated[
+        bool,
+        typer.Option(
+            "--multi-gpu",
+            help="Shard the independent optimization runs across every "
+            "visible GPU.  Off by default so one process never claims every "
+            "device in the machine; scope visibility with "
+            "CUDA_VISIBLE_DEVICES.",
+        ),
+    ] = False,
 ) -> None:
+    if not multi_gpu:
+        restrict_to_first_device()
     # 1. Safely Parse Comma-Separated Strings into Python Lists
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
     gonio_axes_parsed = (
@@ -468,6 +494,7 @@ def indexer(
         batch_size=batch_size,
         num_candidates=num_candidates,
         no_index=not index if index is not None else None,
+        multi_gpu=multi_gpu,
     )
 
 
