@@ -2348,7 +2348,21 @@ class MatrixFreeSparseRBFPeakFinder:
         # solver is the expensive stage, chunk_size is the knob documented to
         # control exactly this, and subdividing a batch that already fits only
         # gives up vmap parallelism.
-        solve_chunk = max(1, min(self.chunk_size, B))
+        #
+        # ``chunk_size`` is calibrated in Gaussian-bank memory: solver memory
+        # goes as chunk x channels, and shape variants multiply the channels
+        # without the caller's chunk_size knowing.  A configuration tuned for
+        # a 19-channel Gaussian bank asked for 95 channels x 64 images and
+        # 200 GiB on its first suite run.  Scale the images per chunk down by
+        # the shape multiplicity, so a given chunk_size means the same memory
+        # whatever the atom family.
+        n_shapes = max(1, int(self.K_weights.shape[0]) // max(self.num_sigmas, 1))
+        solve_chunk = max(1, min(self.chunk_size // n_shapes, B))
+        if n_shapes > 1 and self.show_steps and B > solve_chunk:
+            print(
+                f"  > solve chunk {self.chunk_size} -> {solve_chunk} images "
+                f"({n_shapes} shape variants share the channel budget)"
+            )
         solve_batch = jax.jit(jax.vmap(self._solve_ssn_cg_global))
 
         for start in range(0, B, solve_chunk):
