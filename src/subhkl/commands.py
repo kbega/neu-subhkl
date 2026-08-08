@@ -745,7 +745,7 @@ def run_finder(
     sparse_rbf_profile_file: str | None = "auto",
     sparse_rbf_shape_ratio: float = 1.2,
     sparse_rbf_shape_orientations: int = 4,
-    sparse_rbf_chunk_size: int = 512,
+    sparse_rbf_chunk_size: int = 64,
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
     sparse_rbf_loss: str = "poisson",

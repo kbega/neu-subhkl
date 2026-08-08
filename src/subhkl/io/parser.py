@@ -183,7 +183,11 @@ def finder(
             "explicit value below that density warns at startup."
         ),
     ] = None,
-    sparse_rbf_chunk_size: int = 512,
+    # 64, matching MatrixFreeSparseRBFPeakFinder's own default.  This said 512
+    # while the orchestrator was not forwarding it, so 512 was never what
+    # actually ran -- aligning the defaults keeps "no flag given" meaning what
+    # it always meant now that the flag is honored.
+    sparse_rbf_chunk_size: int = 64,
     sparse_rbf_loss: Annotated[
         str,
         typer.Option(

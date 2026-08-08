@@ -158,6 +158,18 @@ def prepare_harvest_tasks(
                     "false_alarms_per_image", 1.0
                 ),
                 show_steps=harvest_peaks_kwargs.get("show_steps", False),
+                # These four were not forwarded at first, and the omission was
+                # invisible from the CLI: the constructor's **kwargs swallows
+                # nothing, the class defaults are sensible, and every unit test
+                # builds the class directly.  The visible symptoms were that
+                # --sparse-rbf-profile-file gaussian (the documented opt-out
+                # of the learned family) did nothing, and that a suite tuned
+                # to --sparse-rbf-chunk-size 64 was actually running at
+                # whatever the class default happened to be.
+                profile_file=harvest_peaks_kwargs.get("profile_file", "auto"),
+                shape_ratio=harvest_peaks_kwargs.get("shape_ratio", 1.2),
+                shape_orientations=harvest_peaks_kwargs.get("shape_orientations", 4),
+                chunk_size=harvest_peaks_kwargs.get("chunk_size", 64),
             )
         batch_coords = alg.find_peaks_batch(img_stack)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}
