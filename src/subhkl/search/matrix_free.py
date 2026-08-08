@@ -2370,23 +2370,32 @@ class MatrixFreeSparseRBFPeakFinder:
                 f"  > solve chunk {self.chunk_size} -> {solve_chunk} images "
                 f"({n_shapes} shape variants share the channel budget)"
             )
-        # Opted in via multi_gpu, the chunk's image axis is sharded across the
-        # visible devices.  The images are solved independently, so the mesh
-        # never has to split the solver itself -- each device takes a disjoint
-        # slice of the batch.  The global chunk grows by the device count so
-        # that the per-device share stays at the configured chunk_size budget,
-        # and a partial final chunk is padded up to the device count by
-        # repeating its last image (the padded solves are discarded).  With
-        # one device this path is byte-for-byte the loop below it.
+        # Opted in via multi_gpu, each device solves its own slice of the
+        # chunk as an *independent* jitted call, dispatched asynchronously --
+        # deliberately not one jit sharded over a mesh.  The solver's outer
+        # SSN loop is a lax.while_loop; under vmap its condition is "any image
+        # in the batch still active", and under GSPMD sharding that predicate
+        # is a cross-device all-reduce on every solver iteration: the devices
+        # march in lockstep until the globally slowest image converges, with
+        # converged images burning masked iterations all the while.  Measured
+        # on a two-GPU run, that decomposition held each card at ~150 W of a
+        # 400 W budget.  Independent per-device calls need zero collectives,
+        # confine a straggler to its own card, and overlap through JAX's
+        # async dispatch.
+        #
+        # The global chunk grows by the device count so the per-device share
+        # stays at the configured chunk_size budget, and a partial final chunk
+        # is padded up to the device count by repeating its last image (the
+        # padded solves are discarded).  With one device this path is
+        # byte-for-byte the loop below it.
         devices = device_util.batch_devices(self.multi_gpu)
         n_dev = len(devices)
         if n_dev > 1:
             solve_chunk *= n_dev
-            batch_sharding = device_util.batch_sharding(devices)
             if self.show_steps:
                 print(
-                    f"  > sharding solve chunks of {solve_chunk} images "
-                    f"across {n_dev} devices"
+                    f"  > dispatching solve chunks of {solve_chunk} images "
+                    f"as {n_dev} independent per-device solves"
                 )
         solve_batch = jax.jit(jax.vmap(self._solve_ssn_cg_global))
 
@@ -2395,20 +2404,35 @@ class MatrixFreeSparseRBFPeakFinder:
             if n_dev > 1:
                 imgs = device_util.pad_to_multiple(images_padded[start:stop], n_dev)
                 bgs = device_util.pad_to_multiple(bg_padded[start:stop], n_dev)
-                imgs = jax.device_put(imgs, batch_sharding)
-                bgs = jax.device_put(bgs, batch_sharding)
-                c_tensors = solve_batch(imgs, bgs)[: stop - start]
+                per_device = int(imgs.shape[0]) // n_dev
+                # All calls are dispatched before any result is awaited, so
+                # the devices solve concurrently.
+                parts = []
+                for d, device in enumerate(devices):
+                    piece = slice(d * per_device, (d + 1) * per_device)
+                    parts.append(
+                        solve_batch(
+                            jax.device_put(imgs[piece], device),
+                            jax.device_put(bgs[piece], device),
+                        )
+                    )
+
+                def coeff(local, _parts=parts, _per=per_device):
+                    return _parts[local // _per][local % _per]
             else:
                 c_tensors = solve_batch(
                     images_padded[start:stop], bg_padded[start:stop]
                 )
+
+                def coeff(local, _c=c_tensors):
+                    return _c[local]
 
             for i in range(start, stop):
                 # Extraction and sliding refinement in one chunked sweep; the
                 # coordinates still match the padded image the model is
                 # rendered on, and only the valid rows come back.
                 valid_peaks = self._extract_peaks_all(
-                    c_tensors[i - start],
+                    coeff(i - start),
                     images_padded[i],
                     bg_padded[i],
                     border=pad_y + MARGIN,
@@ -2463,8 +2487,14 @@ class MatrixFreeSparseRBFPeakFinder:
                 results.append(valid_peaks[keep])
 
             # Release the chunk before the next one is dispatched, so peak
-            # device memory stays at one chunk rather than two.
-            del c_tensors
+            # device memory stays at one chunk rather than two.  `coeff` holds
+            # the coefficient tensors (whole in c_tensors, or per-device in
+            # its closure), so it must go with them.
+            del coeff
+            if n_dev > 1:
+                del parts
+            else:
+                del c_tensors
 
         self.n_boundary_rejected = rejected_counts
 
