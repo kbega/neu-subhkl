@@ -10,6 +10,7 @@ from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
 from subhkl.viz import replay
 from subhkl.instrument.plot_metrics import plot_metric
+from subhkl.viz import detector_assembly, replay
 from typing import List
 
 
@@ -736,9 +737,11 @@ def run_finder(
     peak_pixel_outlier_threshold: float = 2.0,
     hull_filter: bool = True,
     sparse_rbf_alpha: float | None = None,
-    sparse_rbf_gamma: float = 0.5,
+    sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
+    sparse_rbf_num_sigmas: int = 5,
+    sparse_rbf_false_alarms_per_image: float = 1.0,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
@@ -786,6 +789,8 @@ def run_finder(
                 "gamma": sparse_rbf_gamma,
                 "min_sigma": sparse_rbf_min_sigma,
                 "max_sigma": sparse_rbf_max_sigma,
+                "num_sigmas": sparse_rbf_num_sigmas,
+                "false_alarms_per_image": sparse_rbf_false_alarms_per_image,
                 "chunk_size": sparse_rbf_chunk_size,
                 "show_steps": show_steps,
                 "show_scale": "linear",
@@ -1758,6 +1763,7 @@ def run_finder_visualize(
     instrument: str | None = None,
     output_dir: str | None = None,
     dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
     max_workers: int | None = None,
     show_progress: bool = True,
 ):
@@ -1774,6 +1780,7 @@ def run_finder_visualize(
         instrument=instrument,
         output_dir=output_dir,
         dpi=dpi,
+        n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
     )
@@ -1787,6 +1794,7 @@ def run_integrator_visualize(
     instrument: str | None = None,
     output_dir: str | None = None,
     dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
     max_workers: int | None = None,
     show_progress: bool = True,
 ):
@@ -1802,6 +1810,7 @@ def run_integrator_visualize(
         instrument=instrument,
         output_dir=output_dir,
         dpi=dpi,
+        n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
     )

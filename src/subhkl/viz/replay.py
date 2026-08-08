@@ -33,6 +33,7 @@ import numpy as np
 from tqdm import tqdm
 
 from subhkl.integration.api import Peaks
+from subhkl.viz import detector_assembly
 
 #: Value of the `quantity` attribute on `peaks/sigma` that marks the column as
 #: the finder's per-peak Gaussian width in pixels, rather than the integrator's
@@ -186,7 +187,7 @@ def _select(peaks: PlotPeaks, mask) -> PlotPeaks:
 
 def _render(args):
     """Draw one run's plot.  Runs in a worker process, so it takes one tuple."""
-    out_name, peaks, images, detectors, instrument, dpi = args
+    out_name, peaks, images, detectors, instrument, dpi, n_sigma = args
 
     import matplotlib.pyplot as plt
 
@@ -202,6 +203,7 @@ def _render(args):
         out_name=out_name,
         instrument=instrument,
         dpi=dpi,
+        n_sigma=n_sigma,
     )
     return out_name
 
@@ -213,6 +215,7 @@ def replay_plots(
     instrument: str | None = None,
     output_dir: str | None = None,
     dpi: int = 600,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
     max_workers: int | None = None,
     show_progress: bool = True,
 ) -> list[str]:
@@ -261,6 +264,7 @@ def replay_plots(
                 {key: images.get_detector_by_img(key) for key in img_keys},
                 instrument,
                 dpi,
+                n_sigma,
             )
         )
 

@@ -8,10 +8,15 @@ scale coordinate, and because extra atoms always absorb a little more noise the
 fit breaks the tie towards splitting -- a single peak is reported as a cluster.
 See docs/matrix_free_theory.md, Theorem 1.
 
-``gamma=0.5`` is used uniformly so that no test depends on its own tuning.  It
-sits inside the usable range on both sides: ``gamma=1`` fragments, while
-``gamma=0`` over-merges and swallows genuine neighbours.  A case needing a
-different value should say why at its own call site.
+``gamma=0.5`` is used uniformly so that no test depends on its own tuning.
+It is a fixed historical operating point, not the shipped default -- that is
+now ``gamma=0``, the flux-matched value; see the finder's class docstring for
+the derivation.  Only the upper end is a wall --
+``gamma=1`` fragments, for the reason above.  Below the default the penalty
+simply prefers broader atoms more strongly, continuously and through zero into
+negative values, so ``gamma<=0`` is a legitimate setting for diffuse features
+rather than a failure mode; see the finder's class docstring for the measured
+sweep.  A case needing a different value should say why at its own call site.
 
 Integrator call sites keep their original gamma deliberately.  The degeneracy
 above requires unknown positions *and* unknown scale at once; integration is
@@ -1150,23 +1155,40 @@ def test_boundary_sigma_rejection_fires_on_unmodelled_background():
     )
 
 
-def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
-    """`alpha=None` should set the threshold level from the data, not a constant.
+def test_alpha_none_solves_the_false_alarm_calibration_equation():
+    """`alpha=None` must satisfy E[FP] = m0 exactly, for every gamma.
 
-    Solving globally tests every (pixel, scale) coefficient at once, so the
-    level that keeps the expected number of false detections at O(1) over the
-    image is ``sqrt(2 log N_k)`` with ``N_k`` the resolution-element count at
-    that scale.  That level depends on how big the image is, which a hard-coded
-    constant cannot express: the same constant is too strict for a small crop
-    and too permissive for a full detector frame.
+    Admission is a binary classification over every (position, scale)
+    resolution element, so the threshold is fixed by the calibration equation
 
-    What must be preserved is the ``sigma**gamma`` *shape* of the threshold,
-    since that is what sets the merge/split balance.  Using the floor alone
-    flattens it and over-merges, losing weak peaks in the tails of strong ones.
+        E[FP](z) = sum_k N_k * Q(z * w_k) = m0,
+
+    with N_k = area / (2 pi sigma_k^2), w_k the sigma**gamma prior and
+    m0 = false_alarms_per_image.  Three properties are pinned: the realised
+    E[FP] equals m0 independent of gamma (the earlier anchored scheme drifted
+    0.40 -> 0.095 across gamma 0 -> 1, so gamma sweeps silently changed the
+    detection budget); the sigma**gamma *shape* survives; and rescaling the
+    weights -- e.g. any choice of ref_sigma -- is absorbed into z exactly.
     """
     import numpy as np
+    from scipy.stats import norm
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    def realised_efp(finder, side):
+        a = np.array(finder.effective_alpha(side, side))
+        sigmas = np.array(finder.sigmas)
+        n_k = np.maximum((side * side) / (2 * np.pi * sigmas**2), 2.0)
+        return float((n_k * norm.sf(a)).sum())
+
+    for gamma in (0.0, 0.5, 1.0, -0.5):
+        finder = MatrixFreeSparseRBFPeakFinder(
+            alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        )
+        efp = realised_efp(finder, 256)
+        assert np.isclose(efp, 1.0, rtol=1e-3), (
+            f"gamma={gamma}: E[FP] = {efp:.4f}, not the calibrated 1.0"
+        )
 
     gamma = 0.5
     finder = MatrixFreeSparseRBFPeakFinder(
@@ -1175,38 +1197,53 @@ def test_alpha_none_derives_threshold_from_the_false_alarm_floor():
     sigmas = np.array(finder.sigmas)
     weights = (sigmas / finder.ref_sigma) ** gamma
 
-    def floor_for(side):
-        n = np.maximum((side * side) / (2 * np.pi * sigmas**2), 2.0)
-        return np.sqrt(2 * np.log(n))
-
     a_small = np.array(finder.effective_alpha(64, 64))
     a_large = np.array(finder.effective_alpha(4096, 4096))
 
-    # It must never sit below the false-alarm floor at any scale.
-    assert np.all(a_small >= floor_for(64) - 1e-4)
-    assert np.all(a_large >= floor_for(4096) - 1e-4)
-
-    # It must be the *smallest* such level, i.e. touching the floor somewhere,
-    # otherwise it is needlessly throwing away real peaks.
-    assert np.isclose(np.min(a_small - floor_for(64)), 0.0, atol=1e-4)
-
     # The sigma**gamma shape must survive: alpha_eff / w is one constant.
-    assert np.allclose(a_small / weights, (a_small / weights)[0])
+    assert np.allclose(a_small / weights, (a_small / weights)[0], rtol=1e-5)
 
     # A bigger image tests more coefficients, so it must demand more evidence.
     assert np.all(a_large > a_small)
 
+    # ref_sigma provably cancels: the calibration absorbs any weight rescaling.
+    other_ref = MatrixFreeSparseRBFPeakFinder(
+        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, ref_sigma=3.0
+    )
+    assert np.allclose(
+        np.array(other_ref.effective_alpha(256, 256)),
+        np.array(finder.effective_alpha(256, 256)),
+        rtol=1e-5,
+    )
+
+    # m0 is the honest knob: demanding fewer false alarms raises the bar.
+    stricter = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=gamma,
+        min_sigma=1.0,
+        max_sigma=5.0,
+        false_alarms_per_image=0.1,
+    )
+    assert np.all(np.array(stricter.effective_alpha(256, 256)) > a_small)
+    assert np.isclose(realised_efp(stricter, 256), 0.1, rtol=1e-3)
+
     # An explicit alpha is a lower bound on significance, not a way under the
-    # floor: too small a request is raised, a strict one is honoured.
+    # calibration: too small a request is raised, a strict one is honoured.
     lax_finder = MatrixFreeSparseRBFPeakFinder(
         alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0
     )
-    assert np.allclose(np.array(lax_finder.effective_alpha(130, 130)), floor_for(130))
+    assert np.allclose(
+        np.array(lax_finder.effective_alpha(130, 130)),
+        np.array(finder.effective_alpha(130, 130)),
+        rtol=1e-5,
+    )
 
     strict = MatrixFreeSparseRBFPeakFinder(
         alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0
     )
-    assert np.all(np.array(strict.effective_alpha(130, 130)) > floor_for(130))
+    assert np.allclose(
+        np.array(strict.effective_alpha(130, 130)), 20.0 * weights, rtol=1e-5
+    )
 
     # And it must still work: a clear peak on a flat background is found.
     H = W = 60
@@ -1288,10 +1325,21 @@ def test_global_solve_reaches_first_order_optimality():
     w_ref = 1.0 / jnp.maximum(bg4, 1e-3)
     h_diag = jnp.maximum(finder._adjoint_op(w_ref, finder.K_sq), 1e-6)
     lam = (
-        finder.effective_alpha(*ip.shape)[None, :, None, None]
+        # Same interior test area the solver uses: the padded border holds
+        # no admissible candidates, so it is excluded from the multiplicity.
+        finder.effective_alpha(
+            max(ip.shape[0] - 2 * (finder.max_k_rad + max(3, finder.max_k_rad)), 8),
+            max(ip.shape[1] - 2 * (finder.max_k_rad + max(3, finder.max_k_rad)), 8),
+        )[None, :, None, None]
         * h_diag
         * jnp.sqrt(1.0 / h_diag)
     )
+    # Mirror the solver's Cornish-Fisher skewness correction so the KKT
+    # measure tests the objective the solver actually minimised.
+    a_gauss = lam / jnp.sqrt(h_diag)
+    kappa3 = finder._adjoint_op(w_ref * w_ref, finder.K_cu)
+    gamma1 = jnp.clip(kappa3 / h_diag**1.5, 0.0, 2.0)
+    lam = (a_gauss + gamma1 * (a_gauss**2 - 1.0) / 6.0) * jnp.sqrt(h_diag)
 
     def power_step(_, v):
         av = finder._adjoint_op(
@@ -1364,10 +1412,21 @@ def test_sparse_regime_certificate_and_shadow_deactivation():
     w_ref = 1.0 / jnp.maximum(bg4, 1e-3)
     h_diag = jnp.maximum(finder._adjoint_op(w_ref, finder.K_sq), 1e-6)
     lam = (
-        finder.effective_alpha(*ip.shape)[None, :, None, None]
+        # Same interior test area the solver uses: the padded border holds
+        # no admissible candidates, so it is excluded from the multiplicity.
+        finder.effective_alpha(
+            max(ip.shape[0] - 2 * (finder.max_k_rad + max(3, finder.max_k_rad)), 8),
+            max(ip.shape[1] - 2 * (finder.max_k_rad + max(3, finder.max_k_rad)), 8),
+        )[None, :, None, None]
         * h_diag
         * jnp.sqrt(1.0 / h_diag)
     )
+    # Mirror the solver's Cornish-Fisher skewness correction so the KKT
+    # measure tests the objective the solver actually minimised.
+    a_gauss = lam / jnp.sqrt(h_diag)
+    kappa3 = finder._adjoint_op(w_ref * w_ref, finder.K_cu)
+    gamma1 = jnp.clip(kappa3 / h_diag**1.5, 0.0, 2.0)
+    lam = (a_gauss + gamma1 * (a_gauss**2 - 1.0) / 6.0) * jnp.sqrt(h_diag)
 
     def power_step(_, v):
         av = finder._adjoint_op(
@@ -1804,4 +1863,156 @@ def test_stray_counts_on_sparse_background_are_not_peaks():
     assert len(peaks2) >= 1 and dists.min() < 2.0, (
         f"real peak lost on sparse background: {len(peaks2)} peaks, "
         f"nearest {dists.min() if len(peaks2) else np.inf:.1f} px"
+    )
+
+
+def test_num_sigmas_decouples_bank_resolution_from_the_ceiling():
+    """Bank resolution is settable without moving the ceiling.
+
+    With `num_sigmas` fixed, `max_sigma` sets the ceiling *and* the spacing
+    ((max - min) / (n - 1)), so a wider range can only be bought by coarsening
+    the bank -- and a coarse bank approximates a peak whose true width falls
+    between two available scales with several atoms instead of one.  Exposing
+    `num_sigmas` makes those independent, which is what lets the duplicate
+    mechanism be tested rather than inferred.
+    """
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    coarse = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0)
+    assert len(np.asarray(coarse.sigmas)) == 5
+    assert np.isclose(np.diff(np.asarray(coarse.sigmas)).mean(), 1.0)
+
+    # Same ceiling, finer bank: spacing falls, ceiling does not move.
+    fine = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0, num_sigmas=17)
+    fine_s = np.asarray(fine.sigmas)
+    assert len(fine_s) == 17
+    assert np.isclose(fine_s[-1], 5.0) and np.isclose(fine_s[0], 1.0)
+    assert np.isclose(np.diff(fine_s).mean(), 0.25)
+
+    # It reaches the finder through the harvest kwargs the CLI populates.
+    import inspect
+
+    from subhkl.integration import orchestrator
+
+    src = inspect.getsource(orchestrator.prepare_harvest_tasks)
+    assert 'harvest_peaks_kwargs.get("num_sigmas"' in src
+
+
+def test_degenerate_single_width_bank_collapses_instead_of_duplicating():
+    """min_sigma == max_sigma must not silently solve N copies of one channel.
+
+    `linspace(s, s, n)` yields n identical widths: n times the solve cost, and
+    gamma -- which only ever weighs scales against each other -- becomes inert,
+    so runs at different gamma come back bit-identical.  A single-width bank is
+    a legitimate request; the duplication is not.
+    """
+    import numpy as np
+    import pytest
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    degenerate = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=1.5)
+    assert degenerate.num_sigmas == 1
+    assert np.asarray(degenerate.sigmas).tolist() == [1.5]
+    assert degenerate.K_weights.shape[0] == 1
+
+    # An explicitly single-scale bank is unchanged, and an inverted range is an
+    # error rather than an empty bank.
+    single = MatrixFreeSparseRBFPeakFinder(min_sigma=2.0, max_sigma=2.0, num_sigmas=1)
+    assert single.num_sigmas == 1
+    with pytest.raises(ValueError, match="below min_sigma"):
+        MatrixFreeSparseRBFPeakFinder(min_sigma=4.0, max_sigma=2.0)
+    with pytest.raises(ValueError, match="at least 1"):
+        MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0, num_sigmas=0)
+
+
+def test_bank_saturation_report_flags_a_ceiling_starved_bank():
+    """The bank-edge report is the configuration-selection statistic.
+
+    Three broad sigma = 4.5 reflections under a ceiling of 3.0 must show
+    heavy ceiling saturation (widths imposed, reflections tiled), and the
+    same frame under a ceiling of 6.0 must show none, with the correct
+    atom count.  The per-peak residual deviance cannot make this call --
+    tiling *improves* it -- which is exactly why the saturation fractions
+    are computed unconditionally.  The m0 knob must also reach the finder
+    through the harvest kwargs, like the sigma bounds.
+    """
+    import inspect
+
+    import numpy as np
+
+    from subhkl.integration import orchestrator
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    H = W = 120
+    rng = np.random.default_rng(3)
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    truth = np.full((H, W), 5.0)
+    for r0, c0 in ((40.0, 40.0), (40.0, 80.0), (85.0, 60.0)):
+        truth += generate_erf_peak(yy, xx, r0, c0, 4.5, 60.0)
+    image = rng.poisson(truth).astype(np.float32)[np.newaxis, ...]
+
+    starved = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=0.5,
+        loss="poisson",
+        min_sigma=1.0,
+        max_sigma=3.0,
+        num_sigmas=9,
+    )
+    n_starved = len(starved.find_peaks_batch(image)[0])
+    # The magnitude is realization-dependent (0.29-0.67 across seeds, since
+    # refinement can slide fragments just off the 0.98 line); the invariant
+    # is the contrast: clearly nonzero here, exactly zero for a sized bank.
+    assert starved.bank_saturation["ceiling"] > 0.15, (
+        f"ceiling-starved bank not flagged: {starved.bank_saturation}"
+    )
+
+    sized = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=0.5,
+        loss="poisson",
+        min_sigma=1.0,
+        max_sigma=6.0,
+        num_sigmas=21,
+    )
+    peaks = sized.find_peaks_batch(image)[0]
+    assert sized.bank_saturation["ceiling"] == 0.0
+    # All three truths recovered; a stray or two is legitimate under the
+    # m0 = 1 false-alarm budget, so total count is bounded by contrast with
+    # the tiled solution rather than pinned exactly.
+    for r0, c0 in ((40.0, 40.0), (40.0, 80.0), (85.0, 60.0)):
+        d = np.sqrt((peaks[:, 1] - r0) ** 2 + (peaks[:, 2] - c0) ** 2)
+        assert d.min() < 2.0, f"reflection at ({r0},{c0}) lost"
+    assert len(peaks) < n_starved
+
+    # The global BIC agrees with the saturation verdict; the per-peak
+    # residual cannot (tiling scores at least as clean).
+    assert sized.fit_metrics["bic"] < starved.fit_metrics["bic"]
+
+    # m0 plumbing: reaches the finder and tightens the threshold.
+    strict = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=0.5,
+        min_sigma=1.0,
+        max_sigma=6.0,
+        false_alarms_per_image=0.01,
+    )
+    lax_f = MatrixFreeSparseRBFPeakFinder(
+        alpha=None,
+        gamma=0.5,
+        min_sigma=1.0,
+        max_sigma=6.0,
+        false_alarms_per_image=10.0,
+    )
+    assert np.all(
+        np.array(strict.effective_alpha(128, 128))
+        > np.array(lax_f.effective_alpha(128, 128))
+    )
+    src = inspect.getsource(orchestrator.prepare_harvest_tasks)
+    assert (
+        'harvest_peaks_kwargs.get(\n                    "false_alarms_per_image"' in src
+        or ("false_alarms_per_image" in src)
     )

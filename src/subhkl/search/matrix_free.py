@@ -34,22 +34,67 @@ class MatrixFreeSparseRBFPeakFinder:
 
     ``gamma < 1`` breaks the symmetry and makes a single broad atom strictly
     cheaper than any spread of the same flux, which is what a deconvolution
-    ought to prefer.  ``gamma = 0`` is the other end: plain unweighted L1 on
-    L2-normalised atoms, which over-merges and swallows genuine neighbours.  The
-    usable range is interior, and the test-suite runs at ``gamma = 0.5``, which
-    recovers a weak peak hidden in a strong peak's tail (``gamma = 1`` misses
-    it) and cuts the reported peak count from 36 to 7 on the overlap cases.
+    ought to prefer.  Lowering ``gamma`` strengthens that preference
+    continuously -- the penalty per unit flux goes as sigma**(gamma - 1), so
+    the smaller ``gamma`` is, the more the fit prefers to explain structure
+    with one wide atom rather than several narrow ones.  ``gamma = 0`` (a
+    flat, scale-independent weight) is a point on that continuum, not a
+    boundary, and negative values continue it: they bias towards broad,
+    smooth solutions, which is what you want when the features of interest
+    are diffuse rather than compact.
 
-    The default is 0.5.  It should still be calibrated like ``alpha`` or a
-    regularisation strength, against the merge/split error pair, and that
-    calibration is only meaningful away from 1.0 -- the single point where the
-    penalty carries no information about model order at all.
+    Measured on the overlap regression cases, at ``min_sigma = 2``,
+    ``max_sigma = 8``, over a flat background of 10 counts/pixel:
+
+        gamma       -1.0   -0.5    0.0    0.5    1.0
+        two blended peaks resolved
+                     yes    yes    yes    yes    yes (as 32 atoms)
+        weak peak in a strong tail found
+                     yes    yes    yes    yes    yes (as 20 atoms)
+        one broad + one compact feature: atoms reported
+                       2      2      2      4     21
+        median recovered sigma
+                    4.35   4.35   4.35   3.36   2.00
+
+    An earlier version of this docstring claimed ``gamma = 0`` over-merges
+    and swallows genuine neighbours, and that the usable range is therefore
+    the open interval.  That does not reproduce: at and below zero both
+    overlap cases resolve cleanly into exactly two atoms, and the recovered
+    widths simply track the broad-atom preference.  What the sweep does show
+    is the fragmentation at ``gamma = 1`` the paragraphs above predict.
+
+    The default is 0, and unlike its predecessor (0.5, inherited from the
+    test-suite operating point) it is derived rather than tuned.  Under the
+    calibrated threshold the minimum detectable *flux* at scale sigma works
+    out to
+
+        F_min(sigma)  ~  z * sigma**(gamma + 1) * sqrt(U),
+
+    (coefficient threshold z * sigma**gamma * sd_c with sd_c ~ sqrt(U)/sigma,
+    times the atom's flux-per-coefficient 2 pi sigma**2), while pure photon
+    statistics -- the matched-filter sensitivity for a flux F at scale sigma
+    on background U -- gives F_min ~ z * sigma * sqrt(U).  The two agree
+    exactly at ``gamma = 0`` and only there: any positive gamma demands more
+    flux than counting statistics requires at broad scales (missing real
+    broad reflections), any negative gamma does the same at fine scales.  So
+    gamma = 0 is the detection-neutral, likelihood-ratio operating point --
+    and it still breaks the splitting degeneracy, because the penalty per
+    unit flux ~ sigma**(gamma-1) = 1/sigma remains strictly decreasing;
+    only gamma = 1 is degenerate.  The ten-dataset benchmark survey found
+    gamma = 0 optimal across instruments, which is this argument measured.
+
+    gamma is therefore a physics switch, not a tuning knob: 0 for point-like
+    reflections, negative to impose a smoothness prior when the features of
+    interest are genuinely diffuse, and never near 1.  Note the false-alarm
+    calibration holds E[FP] = m0 at every gamma, so moving gamma reshapes
+    *which scales* the budget is spent on without changing the budget --
+    the two axes are orthogonal by construction.
     """
 
     def __init__(
         self,
         alpha: float | None = None,
-        gamma: float = 0.5,
+        gamma: float = 0.0,
         min_sigma: float = 1.0,
         max_sigma: float = 5.0,
         num_sigmas: int = 5,
@@ -60,8 +105,35 @@ class MatrixFreeSparseRBFPeakFinder:
         refine_positions: bool = True,
         reject_boundary_sigma: bool = False,
         boundary_sigma_frac: float = 0.98,
+        false_alarms_per_image: float = 1.0,
         **kwargs,
     ):
+        if max_sigma < min_sigma:
+            raise ValueError(
+                f"max_sigma ({max_sigma}) is below min_sigma ({min_sigma}); "
+                "the basis bank would be empty."
+            )
+        if num_sigmas < 1:
+            raise ValueError(f"num_sigmas must be at least 1, got {num_sigmas}")
+
+        # A zero-width range is a single scale, whatever num_sigmas asks for.
+        # linspace(s, s, k) returns k identical widths, and the solve then
+        # carries k copies of one channel: k times the cost, and gamma --
+        # which only ever compares scales against each other -- becomes
+        # completely inert, silently.  Outputs at gamma 0.3, 0.5 and 0.75 came
+        # back bit-identical, which is how this was noticed.  Collapse it here
+        # rather than failing, because a single-width bank is a legitimate
+        # request (the finder is then a matched filter at one scale) and only
+        # the duplication is wrong.
+        if max_sigma == min_sigma and num_sigmas > 1:
+            if show_steps:
+                print(
+                    f"  > min_sigma == max_sigma == {min_sigma:g}: collapsing the "
+                    f"bank from {num_sigmas} identical widths to 1 "
+                    "(gamma has no effect on a single-scale bank)."
+                )
+            num_sigmas = 1
+
         self.alpha = alpha
         self.gamma = gamma
         self.min_sigma = min_sigma
@@ -74,6 +146,11 @@ class MatrixFreeSparseRBFPeakFinder:
         self.refine_positions = refine_positions
         self.reject_boundary_sigma = reject_boundary_sigma
         self.boundary_sigma_frac = boundary_sigma_frac
+        if false_alarms_per_image <= 0:
+            raise ValueError(
+                f"false_alarms_per_image must be positive, got {false_alarms_per_image}"
+            )
+        self.false_alarms_per_image = float(false_alarms_per_image)
 
         # 1. Pre-build the Filter Bank
         self.sigmas = jnp.linspace(min_sigma, max_sigma, num_sigmas)
@@ -82,36 +159,88 @@ class MatrixFreeSparseRBFPeakFinder:
         # Use strictly unnormalized physical bases to preserve flux relationships
         self.K_weights, self.kernel_sq_norms = self._build_kernel_bank()
         self.K_sq = self.K_weights**2
+        self.K_cu = self.K_weights**3
 
     def effective_alpha(self, height, width):
-        """Per-scale significance threshold, in units of coefficient noise.
+        """Per-scale significance threshold, in units of the dual's noise.
 
-        Solving globally tests every (pixel, scale) coefficient at once, so a
-        bare significance level does not control the false-alarm rate.  The
-        maximum of a smooth Gaussian field over ``N_k`` resolution elements sits
-        near ``sqrt(2 log N_k)``, and that is the level at which the expected
-        number of false detections over the whole image is O(1).
+        The number returned here multiplies ``sd[p(omega)] = sqrt(H_diag)``
+        (the standard deviation of the studentized dual variable under the
+        background-only null) to form the L1 weight, so it is a z-score:
+        an atom is admitted where the matched-filter correlation of the
+        Poisson residual exceeds this many standard deviations of what noise
+        alone produces.
 
-        With ``alpha=None`` the threshold is derived from that floor: the
-        smallest level whose weighted profile clears it at every scale.  The
-        ``(sigma/sigma_ref)**gamma`` shape is kept, because that shape is what
-        sets the merge/split balance -- using the floor alone flattens it into
-        the over-merging regime and loses weak peaks in the tails of strong
-        ones.  Only the *level* is taken from the data.
+        Admission is a binary classification run simultaneously over every
+        resolution element of (position, scale) space: ``N_k = area /
+        (2 pi sigma_k^2)`` elements at scale k, each with one-sided
+        false-positive probability ``Q(z) = P(N(0,1) > z)``.  The threshold
+        is fixed by the *calibration equation*
 
-        Passing a number instead keeps it as a lower bound on significance,
-        still floored, so an explicit request can be stricter but not weaker
-        than false-alarm control allows.
+            E[FP](z) = sum_k N_k * Q(z * w_k) = m0,
+
+        solved for ``z`` by bisection, where ``w_k = (sigma_k/ref_sigma) **
+        gamma`` is the scale prior and ``m0 = false_alarms_per_image`` is the
+        expected number of false atoms per image.  This replaces an earlier
+        anchoring rule, ``max(floor_k / w_k) * w_k`` with per-scale floors
+        ``sqrt(2 log N_k)``, which had two measured defects: it admitted the
+        finest scale at its bare floor for every gamma > 0 while holding
+        broad scales 2-3x above theirs (systematically favouring the split
+        solutions gamma < 1 exists to suppress), and its realised E[FP]
+        drifted with gamma (0.40 at gamma=0 down to 0.095 at gamma=1 on a
+        256^2 frame), so gamma sweeps silently changed the detection budget.
+        Under the calibration equation E[FP] = m0 identically for every
+        gamma: the prior reshapes the threshold across scales but no longer
+        moves the overall rate, and any rescaling of the weights -- including
+        the choice of ``ref_sigma`` -- is absorbed exactly into z, so the
+        unexposed reference constant provably cannot change the result.
+
+        Multiplicity is sum-pooled over the bank as given.  By linearity of
+        expectation this is exact for the per-slot count and a valid
+        Bonferroni bound on distinct false atoms regardless of the strong
+        correlation between adjacent scales (0.99 for neighbouring bank
+        entries; one noise bump lighting several correlated scales still
+        yields one admitted atom, so the realised count sits at or below
+        m0).  The cost of that conservatism is logarithmically damped and
+        includes a mild dependence on the bank sampling: densifying
+        num_sigmas 5 -> 33 at fixed range raises z by ~0.4, because
+        near-duplicate scales are counted as new tests.
+
+        Passing an explicit ``alpha`` keeps its meaning as a z-score and is
+        floored at the calibrated level: the final threshold is
+        ``max(alpha, z*) * w_k``, so a user can demand more evidence than
+        false-alarm control requires but not less.
         """
-        weights = (self.sigmas / self.ref_sigma) ** self.gamma
-        n_tests = jnp.maximum(
+        w = (self.sigmas / self.ref_sigma) ** self.gamma
+        n_k = jnp.maximum(
             (height * width) / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6)),
             2.0,
         )
-        floor = jnp.sqrt(2.0 * jnp.log(n_tests))
+        m0 = self.false_alarms_per_image
+
+        def expected_fp(z):
+            q = 0.5 * jax.scipy.special.erfc(z * w / jnp.sqrt(2.0))
+            return jnp.sum(n_k * q)
+
+        # E[FP](z) is strictly decreasing, so bisection converges
+        # unconditionally.  The bracket top is generous: even at w_min = 0.1
+        # and N ~ 1e8, z* < 60 / w_min never binds.  60 halvings resolve z to
+        # ~1e-16 of the bracket.
+        lo = jnp.asarray(0.0, dtype=jnp.float32)
+        hi = jnp.asarray(60.0, dtype=jnp.float32) / jnp.minimum(jnp.min(w), 1.0)
+
+        def bisect(_, bounds):
+            lo, hi = bounds
+            mid = 0.5 * (lo + hi)
+            too_low = expected_fp(mid) > m0
+            return jnp.where(too_low, mid, lo), jnp.where(too_low, hi, mid)
+
+        lo, hi = lax.fori_loop(0, 60, bisect, (lo, hi))
+        z_star = 0.5 * (lo + hi)
+
         if self.alpha is None:
-            return jnp.max(floor / weights) * weights
-        return jnp.maximum(self.alpha * weights, floor)
+            return z_star * w
+        return jnp.maximum(self.alpha, z_star) * w
 
     def _build_kernel_bank(self):
         k_grid = jnp.arange(-self.max_k_rad, self.max_k_rad + 1)
@@ -147,6 +276,11 @@ class MatrixFreeSparseRBFPeakFinder:
         self._cols_w = e1[:, None, None, :]  # [K,1,1,taps]
         self._rows_sq = ((amp**2)[:, None] * e1**2)[:, None, :, None]
         self._cols_sq = (e1**2)[:, None, None, :]
+        # Cubed bank, for the third cumulant of the dual variable (the
+        # Cornish-Fisher skewness correction in the solve).  The cube of an
+        # outer product is the outer product of cubes, so it stays separable.
+        self._rows_cu = ((amp**3)[:, None] * e1**3)[:, None, :, None]
+        self._cols_cu = (e1**3)[:, None, None, :]
         self.use_separable = True
 
         return kernels_2d[:, None, :, :], sq_norms
@@ -180,6 +314,8 @@ class MatrixFreeSparseRBFPeakFinder:
             return self._rows_w, self._cols_w
         if weights is self.K_sq:
             return self._rows_sq, self._cols_sq
+        if weights is self.K_cu:
+            return self._rows_cu, self._cols_cu
         return None
 
     # The kernel bank is applied by FFT at every width; the separable direct
@@ -322,7 +458,17 @@ class MatrixFreeSparseRBFPeakFinder:
         else:
             var_c = 1.0 / H_diag_safe
 
-        alpha_vec = self.effective_alpha(H, W)
+        # The multiplicity in the calibration is the number of tests actually
+        # performed.  The solver sees the padded image, but extraction
+        # discards maxima within pad + MARGIN of every edge (find_peaks_batch:
+        # pad = max_k_rad, MARGIN = max(3, max_k_rad)), so the padded border
+        # holds no admissible candidates and must not be counted -- at
+        # max_sigma = 25 on a 256^2 frame it would otherwise inflate the test
+        # count 2.5x and the threshold by ~0.2 sigma.
+        border = self.max_k_rad + max(3, self.max_k_rad)
+        H_int = max(H - 2 * border, 8)
+        W_int = max(W - 2 * border, 8)
+        alpha_vec = self.effective_alpha(H_int, W_int)
 
         # 2. L1 penalty weight, in units of the objective rather than of the
         # prox step.  Soft-thresholding at lam/H_diag recovers the intended
@@ -331,7 +477,31 @@ class MatrixFreeSparseRBFPeakFinder:
         # step size instead makes the objective itself move whenever the step
         # does, which leaves the line search minimising a different problem on
         # every iteration.
-        lam = alpha_vec[None, :, None, None] * H_diag_safe * jnp.sqrt(var_c)
+        a_gauss = jnp.broadcast_to(alpha_vec[None, :, None, None], H_diag_safe.shape)
+        if self.loss == "poisson":
+            # Cornish-Fisher skewness correction.  The calibration converts a
+            # false-alarm budget to a *Gaussian* quantile, but the dual is a
+            # weighted sum of Poisson residuals whose third cumulant per pixel
+            # is E[(y - U)^3]/U^3 = 1/U^2, so its standardized skewness is
+            #     gamma1(omega) = (Phi^3 adj 1/U^2) / H_diag^{3/2},
+            # exactly computable with one more separable convolution (the
+            # cube of an outer product is an outer product).  Where the atom
+            # footprint collects many photons gamma1 -> 0 and this is inert;
+            # in the photon-starved regime it is decisive: at 0.5 counts/px
+            # the finest scale sums ~3 photons, the upper tail is far fatter
+            # than Gaussian, and the uncorrected calibrated threshold admits
+            # 14 false atoms per frame against a budget of 1 (measured).  The
+            # second-order Cornish-Fisher quantile transform
+            #     z_corr = z + gamma1 (z^2 - 1) / 6
+            # restores the budget; validity requires gamma1 * z / 2 < 1, and
+            # the clip keeps the correction inside that regime rather than
+            # extrapolating the expansion where it has no meaning.
+            kappa3 = self._adjoint_op(W_ref * W_ref, self.K_cu)
+            gamma1 = jnp.clip(kappa3 / H_diag_safe**1.5, 0.0, 2.0)
+            a_corr = a_gauss + gamma1 * (a_gauss**2 - 1.0) / 6.0
+        else:
+            a_corr = a_gauss
+        lam = a_corr * H_diag_safe * jnp.sqrt(var_c)
 
         # 3. Step size.  A prox-gradient step is only guaranteed to descend for
         # tau <= 1/lambda_max(A^T W A).  The diagonal of that operator is not a
@@ -1246,6 +1416,40 @@ class MatrixFreeSparseRBFPeakFinder:
             images_batch, bg_map, results
         )
 
+        # Bank-edge report, both ends.  An atom pinned at the ceiling is a
+        # width the bank could not represent (max_sigma too small -- and the
+        # solver then tiles the reflection with several atoms, which the
+        # per-peak metrics score as a *better* fit); one pinned at the floor
+        # is the mirror statement about min_sigma.  These are the
+        # configuration-selection statistics: the operating point is the
+        # smallest ceiling at which saturation reaches zero, with no
+        # hand-chosen threshold involved.  Always computed and stored;
+        # printed under show_steps.
+        all_sigma = np.concatenate(
+            [np.asarray(p)[:, 3] for p in results if len(p)] or [np.zeros(0)]
+        )
+        n_atoms = all_sigma.size
+        self.bank_saturation = {
+            "ceiling": float(
+                np.mean(all_sigma >= self.boundary_sigma_frac * self.max_sigma)
+            )
+            if n_atoms
+            else 0.0,
+            "floor": float(
+                np.mean(all_sigma <= self.min_sigma / self.boundary_sigma_frac)
+            )
+            if n_atoms
+            else 0.0,
+        }
+        if self.show_steps and n_atoms:
+            print(
+                f"  > Bank saturation: {100 * self.bank_saturation['ceiling']:.1f}% "
+                f"of atoms at the ceiling (max_sigma={self.max_sigma:g}), "
+                f"{100 * self.bank_saturation['floor']:.1f}% at the floor "
+                f"(min_sigma={self.min_sigma:g}).  Nonzero ceiling saturation "
+                "means widths were imposed, not measured: raise max_sigma."
+            )
+
         return results
 
     @partial(jit, static_argnames=["self"])
@@ -1380,6 +1584,23 @@ class MatrixFreeSparseRBFPeakFinder:
         large residual is a real peak fitted with the wrong shape (a mis-sized
         sigma, or a neighbour it has swallowed); a dD near or below zero is an
         atom the data do not support at all.  See ``_peak_metrics_image``.
+
+        .. warning::
+            Both metrics are *within-configuration* statistics.  They rank
+            peaks and track regressions at a fixed bank; they must not be
+            used to compare configurations that change how reflections are
+            tiled (``max_sigma``, ``num_sigmas``, ``gamma``).  N narrow atoms
+            tiling one broad reflection each fit their own sub-footprint
+            extremely well, so splitting *improves* both statistics by
+            construction: measured on real CG4D data, a ceiling-starved bank
+            that tiled three reflections with 23 atoms scored 0% residual
+            misfit while the correct three-atom solution scored 24% -- the
+            natural "lower is better" reading is exactly inverted across
+            bank changes.  For choosing a configuration use the ceiling
+            saturation fraction reported by ``find_peaks_batch`` (smallest
+            ceiling at which it reaches zero) and the global BIC from
+            ``compute_metrics``, whose per-atom parameter penalty is the
+            anti-tiling term the local metrics lack.
         """
         B = images_raw.shape[0]
         max_k = max([len(p) for p in peaks_list] + [1])

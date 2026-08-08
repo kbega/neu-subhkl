@@ -17,7 +17,7 @@ from PIL import Image
 
 from subhkl.io.parser import finder, finder_visualize, integrator_visualize
 from subhkl.io.parser import rbf_integrator
-from subhkl.viz import replay
+from subhkl.viz import detector_assembly, replay
 
 INSTRUMENT = "MANDI"
 BANKS = [1, 2]
@@ -293,8 +293,8 @@ def _gaussian_frame(
     return rng.poisson(background + peak).astype(np.float32)
 
 
-def _run_finder(images, peaks, algorithm, **extra):
-    """Run the real finder, told not to draw anything.
+def _run_finder(images, peaks, algorithm, create_visualizations=False, **extra):
+    """Run the real finder, told not to draw anything unless asked.
 
     The integration defaults are tuned for real frames; a single narrow
     synthetic spot needs the same failsafes `test_finder_integration` passes,
@@ -305,7 +305,7 @@ def _run_finder(images, peaks, algorithm, **extra):
         instrument=INSTRUMENT,
         output_filename=str(peaks),
         finder_algorithm=algorithm,
-        create_visualizations=False,
+        create_visualizations=create_visualizations,
         show_progress=False,
         peak_local_max_min_relative_intensity=0.5,
         peak_local_max_min_pixel_distance=5,
@@ -472,3 +472,203 @@ def test_drawing_nothing_at_all_is_an_error(tmp_path):
             max_workers=1,
             show_progress=False,
         )
+
+
+def test_an_outline_grows_with_the_peak(tmp_path):
+    """The point of the whole exercise: radius follows sigma, not a constant."""
+    narrow_r, narrow_c = detector_assembly.peak_outline(50.0, 50.0, 4.0, 4.0, 0.0)
+    wide_r, wide_c = detector_assembly.peak_outline(50.0, 50.0, 16.0, 16.0, 0.0)
+
+    # sigma 2 -> 4 doubles the radius, and the outline stays centred.  The
+    # ratio is exact; the absolute width is a hair under 2 * n_sigma * sigma
+    # because 50 sampled points do not land exactly on the extremes.
+    assert np.ptp(wide_c) == pytest.approx(2 * np.ptp(narrow_c))
+    assert np.ptp(narrow_c) == pytest.approx(
+        2 * 2.0 * detector_assembly.DEFAULT_N_SIGMA, rel=0.01
+    )
+    for points in (narrow_r, narrow_c, wide_r, wide_c):
+        assert (np.max(points) + np.min(points)) / 2 == pytest.approx(50.0, abs=0.05)
+
+
+def test_an_isotropic_peak_is_drawn_as_a_circle():
+    rows, cols = detector_assembly.peak_outline(0.0, 0.0, 9.0, 9.0, 0.0)
+
+    radius = np.sqrt(rows**2 + cols**2)
+    assert np.allclose(radius, 3.0 * detector_assembly.DEFAULT_N_SIGMA)
+
+
+def test_an_anisotropic_peak_keeps_its_shape_and_tilt():
+    """A correlated covariance is an ellipse turned off the pixel axes."""
+    rows, cols = detector_assembly.peak_outline(0.0, 0.0, 16.0, 4.0, 0.0)
+    assert np.ptp(cols) > np.ptp(rows)  # wider than it is tall, untilted
+
+    tilted_rows, tilted_cols = detector_assembly.peak_outline(0.0, 0.0, 10.0, 10.0, 6.0)
+    # Equal variances with a positive correlation: the long axis runs diagonally,
+    # so the extreme point is off both axes rather than on one of them.
+    furthest = np.argmax(tilted_rows**2 + tilted_cols**2)
+    assert abs(tilted_rows[furthest]) > 1.0
+    assert abs(tilted_cols[furthest]) > 1.0
+
+
+def test_n_sigma_sets_the_contour():
+    one, _ = detector_assembly.peak_outline(0.0, 0.0, 4.0, 4.0, 0.0, n_sigma=1.0)
+    three, _ = detector_assembly.peak_outline(0.0, 0.0, 4.0, 4.0, 0.0, n_sigma=3.0)
+
+    assert np.ptp(three) == pytest.approx(3 * np.ptp(one))
+
+
+def test_candidates_are_drawn_at_their_own_radius(tmp_path):
+    """A candidate list carrying a width per peak is drawn peak by peak.
+
+    Each outline is a separate `plot` call, and the wide candidate has to come
+    out wider than the narrow one -- which is exactly what a constant marker
+    size cannot show.
+    """
+    from subhkl.instrument.detector import Detector
+    from subhkl.config import beamlines
+
+    drawn = []
+
+    class _RecordingAxes:
+        def plot(self, x, y, **kwargs):
+            drawn.append((np.asarray(x), np.asarray(y)))
+
+    detector = Detector(beamlines[INSTRUMENT]["1"])
+    # [intensity, row, col, sigma], the finder's candidate layout.
+    candidates = [(100.0, 100.0, 1.0), (150.0, 150.0, 4.0)]
+
+    detector_assembly._draw_outlines(
+        _RecordingAxes(),
+        detector,
+        np.zeros(3),
+        candidates,
+        n_sigma=detector_assembly.DEFAULT_N_SIGMA,
+        color="blue",
+        label="Finder Candidates",
+        wrapped=False,
+        compress=lambda r: r,
+    )
+
+    assert len(drawn) == 2
+    narrow, wide = (np.ptp(y) for _, y in drawn)
+    assert wide == pytest.approx(4.0 * narrow, rel=0.05)
+
+
+def test_a_candidate_with_no_usable_width_is_skipped():
+    """A width of zero or NaN describes no peak, so nothing is drawn for it."""
+    from subhkl.instrument.detector import Detector
+    from subhkl.config import beamlines
+
+    drawn = []
+
+    class _RecordingAxes:
+        def plot(self, x, y, **kwargs):
+            drawn.append(x)
+
+    detector_assembly._draw_outlines(
+        _RecordingAxes(),
+        Detector(beamlines[INSTRUMENT]["1"]),
+        np.zeros(3),
+        [(100.0, 100.0, 0.0), (110.0, 110.0, np.nan), (120.0, 120.0, 2.0)],
+        n_sigma=detector_assembly.DEFAULT_N_SIGMA,
+        color="blue",
+        label="",
+        wrapped=False,
+        compress=lambda r: r,
+    )
+
+    assert len(drawn) == 1
+
+
+_WORKER_DET = {
+    "m": 64,
+    "n": 64,
+    "width": 0.1,
+    "height": 0.1,
+    "center": [0, 0, 0.2],
+    "vhat": [0, 1, 0],
+    "uhat": [1, 0, 0],
+    "panel": "flat",
+}
+
+_WORKER_PARAMS = {
+    "peak_center_box_size": 3,
+    "peak_smoothing_window_size": 3,
+    "peak_minimum_pixels": 3,
+    "peak_minimum_signal_to_noise": 0.0,
+    "peak_pixel_outlier_threshold": 4.0,
+    "region_growth_distance_threshold": 1.5,
+    "region_growth_minimum_intensity": 20.0,
+    "region_growth_maximum_pixel_radius": 5.0,
+    "region_growth_minimum_sigma": None,
+}
+
+
+def _harvest(finder_info):
+    """One bright peak through the real harvest worker, on a 64x64 panel."""
+    from subhkl.integration.worker import process_single_image
+
+    image = np.full((64, 64), 5.0)
+    image[18:23, 18:23] = 400.0
+
+    res, _ = process_single_image(
+        0,
+        "test-image",
+        1,
+        image,
+        _WORKER_DET,
+        finder_info,
+        dict(_WORKER_PARAMS),
+        (None, None),
+        (np.eye(3), None, 0.5, 3.5),
+    )
+    return res
+
+
+def test_the_finder_reports_widths_under_a_name_that_means_one_thing():
+    """`sigma` is a width for one finder and an uncertainty for the others.
+
+    Anything that draws a peak at its true size needs to know which it has, so
+    the width also travels under its own key -- absent rather than ambiguous.
+    """
+    res = _harvest(
+        (
+            "sparse_rbf",
+            {},
+            (
+                np.array([20.0]),
+                np.array([20.0]),
+                np.array([2.0]),
+                np.array([5000.0]),
+                np.array([1.1]),
+            ),
+        )
+    )
+
+    assert res["width"] == pytest.approx([2.0])
+    assert res["sigma"] == pytest.approx(res["width"])
+
+
+def test_a_finder_that_fits_no_width_reports_none():
+    res = _harvest(("peak_local_max", {"min_pix": 3, "min_rel_intensity": 0.5}, None))
+
+    assert res["width"] is None
+    # `sigma` is still populated -- with an intensity uncertainty, which is why
+    # it cannot be used as a size.
+    assert len(res["sigma"]) == res["count"]
+
+
+def test_the_inline_finder_plot_still_works_without_widths(tmp_path):
+    """Regression guard: the finder draws its own plot for every algorithm.
+
+    `peak_local_max` fits no width, so the plot falls back to plain markers
+    rather than failing to find a size to draw.
+    """
+    images = _write_single_frame(
+        tmp_path / "images.h5", _gaussian_frame((128.0, 128.0))
+    )
+    peaks = tmp_path / "found.h5"
+
+    _run_finder(images, peaks, "peak_local_max", create_visualizations=True)
+
+    assert (tmp_path / "img0-found.png").stat().st_size > 0
