@@ -215,7 +215,7 @@ def finder(
     multi_gpu: Annotated[
         bool,
         typer.Option(
-            "--multi-gpu",
+            "--multi-gpu/--no-multi-gpu",
             help="Shard the solve across every visible GPU (the image axis "
             "of each chunk).  Off by default so one process never claims "
             "every device in the machine; scope visibility with "
@@ -400,7 +400,7 @@ def indexer(
     multi_gpu: Annotated[
         bool,
         typer.Option(
-            "--multi-gpu",
+            "--multi-gpu/--no-multi-gpu",
             help="Shard the independent optimization runs across every "
             "visible GPU.  Off by default so one process never claims every "
             "device in the machine; scope visibility with "
