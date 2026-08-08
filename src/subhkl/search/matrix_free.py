@@ -782,6 +782,11 @@ class MatrixFreeSparseRBFPeakFinder:
         construction-time assumptions did."""
         self.num_sigmas = len(sigma_grid)
         self.sigmas = jnp.asarray(np.asarray(sigma_grid), dtype=jnp.float32)
+        # Per-channel scale.  ``sigmas`` is the public scale grid and never
+        # expands; shape variants multiply *channels*, tracked here, so the
+        # explicit-count contract (num_sigmas == len(sigmas)) and the
+        # calibration equation keep their historical meaning.
+        self._channel_sigmas = self.sigmas
         # Use strictly unnormalized physical bases to preserve flux
         # relationships.  _build_kernel_bank also refreshes the separable
         # row/column factors; the identity-dispatch caches key on the new
@@ -858,11 +863,16 @@ class MatrixFreeSparseRBFPeakFinder:
         ``max(alpha, z*) * w_k``, so a user can demand more evidence than
         false-alarm control requires but not less.
         """
+        # The calibration sums over *scales*, not channels.  Shape variants at
+        # one (site, scale) are the same statistical test -- their kernels
+        # correlate at ~0.99 -- so counting each channel would solve z against
+        # a multiplicity ~n_shapes too high; measured cost when that happened:
+        # the faint half of every detection.  Summing over the scale grid is
+        # the exact deduplication, and on the Gaussian path it is identical to
+        # the historical equation.
         w = (self.sigmas / self.ref_sigma) ** self.gamma
         n_k = jnp.maximum(
-            (height * width)
-            / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6))
-            * getattr(self, "_nk_multiplicity_scale", 1.0),
+            (height * width) / (2.0 * jnp.pi * jnp.maximum(self.sigmas**2, 1e-6)),
             2.0,
         )
         m0 = self.false_alarms_per_image
@@ -887,9 +897,11 @@ class MatrixFreeSparseRBFPeakFinder:
         lo, hi = lax.fori_loop(0, 60, bisect, (lo, hi))
         z_star = 0.5 * (lo + hi)
 
+        # The returned vector is applied per *channel*.
+        w_channel = (self._channel_sigmas / self.ref_sigma) ** self.gamma
         if self.alpha is None:
-            return z_star * w
-        return jnp.maximum(self.alpha, z_star) * w
+            return z_star * w_channel
+        return jnp.maximum(self.alpha, z_star) * w_channel
 
     def _build_kernel_bank(self):
         """The atom family: Gaussian by default, measured-profile on request.
@@ -982,29 +994,14 @@ class MatrixFreeSparseRBFPeakFinder:
                 sig_out.append(s)
         kernels_2d = jnp.asarray(np.stack(kernels), dtype=jnp.float32)
         sq_norms = jnp.sum(kernels_2d**2, axis=(1, 2))
-        self.sigmas = jnp.asarray(np.asarray(sig_out), dtype=jnp.float32)
-        self.num_sigmas = int(self.sigmas.shape[0])
+        self._channel_sigmas = jnp.asarray(np.asarray(sig_out), dtype=jnp.float32)
         self.use_separable = False
 
-        # Effective multiplicity of the shape variants, from the kernel Gram.
-        # The false-alarm calibration sum-pools N_k over channels as if each
-        # were an independent test; shape variants at one (site, scale) are
-        # nearly the same test (measured K_eff = 1.01 of 5 at ratio 1.2), and
-        # counting them n_sh times inflates the solved z.  Measured cost of
-        # not correcting: the faint half of all detections (243 -> 120 atoms
-        # on cg4d-garnet run 2038, every lost cluster below intensity 172).
-        mid = kernels[(len(base) // 2) * n_sh : (len(base) // 2 + 1) * n_sh]
-        M = np.array([m.ravel() for m in mid])
-        norms = np.linalg.norm(M, axis=1)
-        C = (M @ M.T) / np.outer(norms, norms)
-        lam = np.linalg.eigvalsh(C)
-        k_eff = float(lam.sum() ** 2 / np.sum(lam**2))
-        self._nk_multiplicity_scale = k_eff / n_sh
         if self.show_steps:
             print(
                 f"  > learned basis: {len(base)} scales x {n_sh} shape(s) = "
-                f"{self.num_sigmas} channels; shape K_eff = {k_eff:.2f}, "
-                f"N_k scaled by {self._nk_multiplicity_scale:.3f}"
+                f"{len(sig_out)} channels; threshold calibrated over the "
+                "scale grid (shape variants are one statistical test)"
             )
         return kernels_2d[:, None, :, :], sq_norms
 
@@ -1244,7 +1241,10 @@ class MatrixFreeSparseRBFPeakFinder:
         y = y_img[None, None, :, :]
         bg = bg_img[None, None, :, :]
 
-        K = self.num_sigmas
+        # Channel count from the bank itself: with shape variants the bank
+        # carries num_sigmas * n_shapes channels while ``num_sigmas`` keeps
+        # its public meaning as the scale count.
+        K = int(self.K_weights.shape[0])
         c_init = jnp.zeros((1, K, H, W))
         q_init = jnp.zeros((1, K, H, W))
 
@@ -1778,7 +1778,7 @@ class MatrixFreeSparseRBFPeakFinder:
 
             # Exact Flux & Variance Preservation
             # Flux of basis k is A_k * sigma_k^2
-            flux_k = c_channels * (self.sigmas**2)
+            flux_k = c_channels * (self._channel_sigmas**2)
             total_flux_scaled = jnp.sum(flux_k) + 1e-9
 
             # Variance of mixture is sum(Flux_k * sigma_k^2) / sum(Flux_k).
@@ -1788,7 +1788,7 @@ class MatrixFreeSparseRBFPeakFinder:
             # validity mask, but an infinity multiplied by a zero mask is a NaN,
             # which then contaminates anything that consumes the whole array.
             sigma_sq_eff = jnp.maximum(
-                jnp.sum(flux_k * (self.sigmas**2)) / total_flux_scaled,
+                jnp.sum(flux_k * (self._channel_sigmas**2)) / total_flux_scaled,
                 float(self.min_sigma) ** 2,
             )
             sigma_eff = jnp.sqrt(sigma_sq_eff)
@@ -2207,7 +2207,7 @@ class MatrixFreeSparseRBFPeakFinder:
                 )
                 if measured_trunk is not None:
                     self._measured_trunk = measured_trunk
-                    self._set_bank(np.unique(np.round(np.asarray(self.sigmas), 6)))
+                    self._set_bank(np.asarray(self.sigmas))
                     if self.show_steps:
                         u, f = measured_trunk
                         g = np.exp(-0.5 * u**2)
@@ -2278,7 +2278,7 @@ class MatrixFreeSparseRBFPeakFinder:
                     self._set_bank(grid)
                     if self.show_steps:
                         print(
-                            f"  > sigma bank re-sized to {self.num_sigmas} "
+                            f"  > sigma bank re-sized to {int(self.K_weights.shape[0])} "
                             f"channels for this data (frame {H}x{W}, measured "
                             f"background ~{bg_hi:.2f} photons/px): "
                             + ", ".join(f"{v:.3g}" for v in grid)
