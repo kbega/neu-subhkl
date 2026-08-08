@@ -739,7 +739,7 @@ def run_finder(
     sparse_rbf_max_sigma: float = 10.0,
     sparse_rbf_num_sigmas: int | None = None,
     sparse_rbf_false_alarms_per_image: float = 1.0,
-    sparse_rbf_max_fragmentation_rate: float | None = None,
+    sparse_rbf_max_fragmentation_rate: float = 1.0,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,

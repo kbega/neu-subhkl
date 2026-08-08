@@ -125,35 +125,6 @@ def prepare_harvest_tasks(
                 candidate_alphas=harvest_peaks_kwargs.get("candidate_alphas", None),
             )
         else:
-            # Optional calibration of the fragmentation criterion's one
-            # empirical constant against the requested unsupported-atom rate
-            # -- the bank-sizing analogue of false_alarms_per_image.  Each
-            # ladder rung is a full solve of the first frame, so it runs
-            # once, up front, and only when the rate was asked for.
-            fid_residual = None
-            max_frag = harvest_peaks_kwargs.get("max_fragmentation_rate")
-            if max_frag is not None:
-                fid_residual, frag_rows = (
-                    MatrixFreeSparseRBFPeakFinder.calibrate_fragmentation_residual(
-                        img_stack[:1],
-                        max_fragmentation_rate=max_frag,
-                        alpha=harvest_peaks_kwargs.get("alpha"),
-                        gamma=harvest_peaks_kwargs.get("gamma", 0.0),
-                        loss=harvest_peaks_kwargs.get("loss", "poisson"),
-                        min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
-                        max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
-                        false_alarms_per_image=harvest_peaks_kwargs.get(
-                            "false_alarms_per_image", 1.0
-                        ),
-                    )
-                )
-                print(
-                    "  > fragmentation calibration (target "
-                    f"{max_frag:g} unsupported atoms/image): "
-                    f"fid_residual = {fid_residual:g}; ladder "
-                    "(residual, channels, rate/image): "
-                    + ", ".join(f"({r:g}, {n}, {rate:g})" for r, n, rate in frag_rows)
-                )
             alg = MatrixFreeSparseRBFPeakFinder(
                 # None means "derive it from the image size"; see
                 # MatrixFreeSparseRBFPeakFinder.effective_alpha.
@@ -169,9 +140,14 @@ def prepare_harvest_tasks(
                 # finder auto-size the bank against carpet fragmentation; an
                 # explicit count keeps the historical uniform grid.
                 num_sigmas=harvest_peaks_kwargs.get("num_sigmas"),
-                # None keeps the factory calibration; set when the
-                # max_fragmentation_rate calibration above ran.
-                fid_residual=fid_residual,
+                # Tolerable unsupported atoms per image.  Mapped onto the
+                # brightness quantile the auto bank protects, via the moment
+                # census of each batch -- arithmetic, no extra solves; see
+                # _frag_protected_quantile.  Non-positive keeps the fixed
+                # p90 census quantile.
+                max_fragmentation_rate=harvest_peaks_kwargs.get(
+                    "max_fragmentation_rate", 1.0
+                ),
                 # The m0 of the false-alarm calibration: expected false peaks
                 # per image.  The one knob that sets the detection budget.
                 false_alarms_per_image=harvest_peaks_kwargs.get(

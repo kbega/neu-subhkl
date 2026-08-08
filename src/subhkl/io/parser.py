@@ -112,18 +112,20 @@ def finder(
         ),
     ] = 1.0,
     sparse_rbf_max_fragmentation_rate: Annotated[
-        float | None,
+        float,
         typer.Option(
-            help="Calibrate the sigma bank against this many tolerable "
-            "unsupported atoms per image -- the bank-sizing analogue of "
-            "--sparse-rbf-false-alarms-per-image.  An unsupported atom is one "
-            "whose leave-one-out deviance falls below the chi^2_4 95% point: "
-            "the signature of one peak reported as a cluster of fragments.  "
-            "Runs one full solve of the first frame per calibration rung "
-            "before the main pass, so it costs a few extra solves up front.  "
-            "Unset keeps the factory calibration."
+            help="Tolerable unsupported atoms per image -- the bank-sizing "
+            "analogue of --sparse-rbf-false-alarms-per-image.  An unsupported "
+            "atom is one whose leave-one-out deviance falls below the chi^2_4 "
+            "95% point: the signature of one peak reported as a cluster of "
+            "fragments.  Costs nothing extra: the rate maps onto the "
+            "brightness quantile of the measured peak census the bank "
+            "protects (peaks above it may fragment, ~2 unsupported atoms "
+            "each), so it is arithmetic on window moments, not extra solves.  "
+            "The realised rate is reported with the final statistics.  Set "
+            "to 0 (or negative) to keep the fixed p90 census quantile."
         ),
-    ] = None,
+    ] = 1.0,
     sparse_rbf_num_sigmas: Annotated[
         int | None,
         typer.Option(

@@ -96,6 +96,51 @@ def _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width):
     return 0.5 * (lo + hi)
 
 
+def _moment_census(images, bg_map, bg_hi, disjoint=False):
+    """Moment amplitudes ``A = F / (2 pi sigma^2)`` of every window that
+    carries enough flux to measure, as an array (possibly empty).
+
+    ``disjoint=True`` tiles the frame with non-overlapping windows so that
+    one peak lands in ~one window: that is the *counting* configuration,
+    used to estimate the bright-peak population for the fragmentation-rate
+    mapping.  The default overlapping scan (stride = half window) is the
+    *amplitude* configuration -- a peak straddling a window boundary still
+    gets one well-centred window -- used for quantile estimates.
+    """
+    excess = np.asarray(images, dtype=np.float64) - np.asarray(bg_map, dtype=np.float64)
+    if excess.ndim == 2:
+        excess = excess[None, ...]
+    amps = []
+    for frame in excess:
+        H, W = frame.shape
+        step = max(8, int(H // 64))
+        stride = 2 * step + 1 if disjoint else step
+        for r0 in range(step, H - step, stride):
+            for c0 in range(step, W - step, stride):
+                win = frame[r0 - step : r0 + step + 1, c0 - step : c0 + step + 1]
+                flux = float(win.sum())
+                if flux < max(20.0 * bg_hi, 50.0):
+                    continue
+                w = np.maximum(win, 0.0)
+                tot = w.sum()
+                if tot <= 0:
+                    continue
+                rr, cc = np.mgrid[-step : step + 1, -step : step + 1]
+                dr = (w * rr).sum() / tot
+                dc = (w * cc).sum() / tot
+                # Counting mode: a bright peak's skirt spills enough flux into
+                # neighbouring tiles to clear the floor, but a spill tile's
+                # centroid sits at its border.  Requiring an interior centroid
+                # counts the peak where it lives and nowhere else.
+                if disjoint and max(abs(dr), abs(dc)) > 0.5 * step:
+                    continue
+                m2 = (w * ((rr - dr) ** 2 + (cc - dc) ** 2)).sum() / tot
+                if not np.isfinite(m2) or m2 <= 0:
+                    continue
+                amps.append(flux / (2.0 * np.pi * (0.5 * m2)))  # 2D: m2 = 2 sigma^2
+    return np.asarray(amps, dtype=np.float64)
+
+
 def _moment_peak_amplitude(images, bg_map, bg_hi, quantile=90.0):
     """Bright-peak amplitude from window moments, not from a top-quantile count.
 
@@ -114,33 +159,31 @@ def _moment_peak_amplitude(images, bg_map, bg_hi, quantile=90.0):
     Returns ``None`` when nothing carries enough flux to measure, leaving the
     caller on its declared default.
     """
-    excess = np.asarray(images, dtype=np.float64) - np.asarray(bg_map, dtype=np.float64)
-    if excess.ndim == 2:
-        excess = excess[None, ...]
-    amps = []
-    for frame in excess:
-        H, W = frame.shape
-        step = max(8, int(H // 64))
-        for r0 in range(step, H - step, step):
-            for c0 in range(step, W - step, step):
-                win = frame[r0 - step : r0 + step + 1, c0 - step : c0 + step + 1]
-                flux = float(win.sum())
-                if flux < max(20.0 * bg_hi, 50.0):
-                    continue
-                w = np.maximum(win, 0.0)
-                tot = w.sum()
-                if tot <= 0:
-                    continue
-                rr, cc = np.mgrid[-step : step + 1, -step : step + 1]
-                dr = (w * rr).sum() / tot
-                dc = (w * cc).sum() / tot
-                m2 = (w * ((rr - dr) ** 2 + (cc - dc) ** 2)).sum() / tot
-                if not np.isfinite(m2) or m2 <= 0:
-                    continue
-                amps.append(flux / (2.0 * np.pi * (0.5 * m2)))  # 2D: m2 = 2 sigma^2
-    if not amps:
+    amps = _moment_census(images, bg_map, bg_hi)
+    if not amps.size:
         return None
-    return float(np.percentile(np.asarray(amps), quantile))
+    return float(np.percentile(amps, quantile))
+
+
+def _frag_protected_quantile(max_fragmentation_rate, n_bright_per_image):
+    """The brightness quantile the bank must protect to meet the rate.
+
+    The scaling argument that replaces the solve ladder: given a bank, the
+    criterion already says which peaks fragment -- those brighter than the
+    protected amplitude -- and a marginally fragmented peak is a pair, both
+    atoms of which fail the leave-one-out support test.  So
+
+        E[unsupported/image] ~ 2 * (bright peaks above the quantile)/image,
+
+    and inverting for the quantile is arithmetic on the moment census (box
+    sums, no solve):  q = 1 - rate / (2 * N_bright).  Floored at the median
+    -- allowing more fragmentation than the census can express just means
+    every measured peak is fair game -- and capped at protecting the
+    brightest censused peak outright.
+    """
+    allowed_peaks = max_fragmentation_rate / 2.0
+    q = 1.0 - allowed_peaks / max(n_bright_per_image, 1e-9)
+    return 100.0 * float(np.clip(q, 0.5, 1.0))
 
 
 def _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp, fid_res=None):
@@ -428,6 +471,7 @@ class MatrixFreeSparseRBFPeakFinder:
         expected_background: float = _FRAG_BG,
         expected_peak_amplitude: float | None = None,
         fid_residual: float | None = None,
+        max_fragmentation_rate: float = 1.0,
         **kwargs,
     ):
         if max_sigma < min_sigma:
@@ -566,6 +610,10 @@ class MatrixFreeSparseRBFPeakFinder:
         self.expected_peak_amplitude = amp_for_build
         self._amp_is_auto = amp_is_auto
         self.fid_residual = fid_residual
+        # Tolerable unsupported atoms per image; drives which quantile of the
+        # measured brightness census the auto bank protects (see
+        # _frag_protected_quantile).  Non-positive keeps the fixed p90.
+        self.max_fragmentation_rate = float(max_fragmentation_rate)
         self.chunk_size = chunk_size
         self.refine_positions = refine_positions
         self.reject_boundary_sigma = reject_boundary_sigma
@@ -1878,7 +1926,23 @@ class MatrixFreeSparseRBFPeakFinder:
             # the resize, which is what amp_hi itself is excluded from.
             amp_for_resize = self.expected_peak_amplitude
             if self._amp_is_auto:
-                measured = _moment_peak_amplitude(images_batch, bg_map, bg_hi)
+                # The requested fragmentation rate selects which quantile of
+                # the measured brightness distribution the bank protects:
+                # peaks above it may fragment, and each contributes ~2
+                # unsupported atoms, so the quantile is arithmetic on the
+                # disjoint-window census -- no solve involved (see
+                # _frag_protected_quantile).
+                if self.max_fragmentation_rate > 0:
+                    census = _moment_census(images_batch, bg_map, bg_hi, disjoint=True)
+                    if census.size:
+                        q = _frag_protected_quantile(
+                            self.max_fragmentation_rate, census.size / B
+                        )
+                        measured = float(np.percentile(census, q))
+                    else:
+                        measured = None
+                else:
+                    measured = _moment_peak_amplitude(images_batch, bg_map, bg_hi)
                 if measured is not None:
                     amp_for_resize = measured
                     self.expected_peak_amplitude = measured
@@ -2073,6 +2137,29 @@ class MatrixFreeSparseRBFPeakFinder:
             images_batch, bg_map, results
         )
 
+        # Unsupported-atom rate: atoms whose leave-one-out deviance falls
+        # below the chi^2_4 95% point are atoms the data do not independently
+        # support.  This is a different statistic from the m0 false-alarm
+        # budget, not a restatement of it: a false positive was admitted on a
+        # >= z noise excursion, so its leave-one-out deviance is typically
+        # ~ z^2 (~17 nats) and it *passes* this test.  What fails it is
+        # redundancy -- an atom whose contribution its neighbours absorb,
+        # which is exactly a fragment of a peak reported as a cluster.  This
+        # is the observable max_fragmentation_rate bounds.  Stored always,
+        # printed with the final stats.
+        n_unsupported = sum(int(np.count_nonzero(d < 9.49)) for d in self.peak_deviance)
+        self.unsupported_atoms_per_image = n_unsupported / max(B, 1)
+        if self.show_steps:
+            print(
+                f"  > Unsupported atoms: {n_unsupported} "
+                f"({self.unsupported_atoms_per_image:.2f}/image).  Not the "
+                f"m0 = {self.false_alarms_per_image:g}/image false-alarm "
+                "count: noise admissions carry their ~z^2 of support and "
+                "pass this test; failing it means redundancy -- a peak "
+                "reported as a cluster of atoms none of which the data "
+                "support alone."
+            )
+
         # Bank-edge report, both ends.  An atom pinned at the ceiling is a
         # width the bank could not represent (max_sigma too small -- and the
         # solver then tiles the reflection with several atoms, which the
@@ -2261,7 +2348,12 @@ class MatrixFreeSparseRBFPeakFinder:
         redundant atom collapses instead of improving.)
 
         Runs one full solve of ``images_batch`` per ladder rung, so this is
-        an offline, per-instrument calibration, not a per-run step.  Returns
+        an offline *validation* tool, not a pipeline step: the pipeline meets
+        the requested rate without solving, by mapping it onto the protected
+        brightness quantile of the moment census (_frag_protected_quantile).
+        Use this when the analytic mapping itself is in question --
+        e.g. commissioning a new instrument -- to confirm the measured
+        unsupported-atom curve against the residual ladder.  Returns
         ``(fid_residual, rows)`` with ``rows`` of ``(residual, num_sigmas,
         unsupported_atoms_per_image)`` for the report; pass the returned
         value back as ``fid_residual=`` (it is not stored globally).
@@ -2270,12 +2362,12 @@ class MatrixFreeSparseRBFPeakFinder:
         rows = []
         for res in residual_ladder:
             finder = cls(num_sigmas=None, fid_residual=float(res), **finder_kwargs)
-            peaks = finder.find_peaks_batch(images_batch)
-            dev, _ = finder.compute_peak_metrics(
-                images_batch, finder._last_bg_map, peaks
+            finder.find_peaks_batch(images_batch)
+            # find_peaks_batch measures the unsupported-atom rate as part of
+            # its final statistics; reuse it rather than re-deriving.
+            rows.append(
+                (float(res), finder.num_sigmas, finder.unsupported_atoms_per_image)
             )
-            n_unsup = sum(int(np.count_nonzero(d < 9.49)) for d in dev)
-            rows.append((float(res), finder.num_sigmas, n_unsup / len(images_batch)))
         met = [r for r in rows if r[2] <= max_fragmentation_rate]
         # Cheapest bank that meets the rate; smaller residual breaks ties.
         # If no rung meets it, take the best rate observed -- the report rows

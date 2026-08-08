@@ -2118,3 +2118,41 @@ def test_fid_residual_is_a_calibratable_input():
     dense = MatrixFreeSparseRBFPeakFinder(fid_residual=40.0, **kwargs)
     assert lean.num_sigmas <= factory.num_sigmas <= dense.num_sigmas
     assert lean.num_sigmas < dense.num_sigmas
+
+
+def test_fragmentation_rate_maps_to_protected_quantile():
+    """The requested unsupported-atom rate is met without solving: it picks
+    which quantile of the moment census the bank protects (peaks above it may
+    fragment, ~2 unsupported atoms each), so the mapping is arithmetic."""
+    import numpy as np
+    from scipy.special import erf
+
+    from subhkl.search.matrix_free import _frag_protected_quantile, _moment_census
+
+    assert _frag_protected_quantile(1.0, 4.0) == 87.5
+    assert _frag_protected_quantile(1.0, 50.0) == 99.0
+    # Allowing more fragmentation than the census can express floors at the
+    # median; asking for none protects the brightest censused peak outright.
+    assert _frag_protected_quantile(8.0, 4.0) == 50.0
+    assert _frag_protected_quantile(0.0, 4.0) == 100.0
+
+    # The counting census tiles disjoint windows so one peak lands in ~one
+    # window; the overlapping amplitude scan sees the same peak several times.
+    def pixel_integrated(shape, r0, c0, sigma, amp):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        s2 = sigma * np.sqrt(2.0)
+        er = erf((rr - r0 + 0.5) / s2) - erf((rr - r0 - 0.5) / s2)
+        ec = erf((cc - c0 + 0.5) / s2) - erf((cc - c0 - 0.5) / s2)
+        return amp * (np.pi / 2.0) * sigma**2 * er * ec
+
+    rng = np.random.default_rng(9)
+    frame = np.full((256, 256), 0.6)
+    frame += pixel_integrated(frame.shape, 70, 70, 4.0, 250.0)
+    frame += pixel_integrated(frame.shape, 180, 170, 4.0, 150.0)
+    image = rng.poisson(frame).astype(float)
+    bg_map = np.full_like(image, 0.6)
+
+    counting = _moment_census(image[None], bg_map[None], 0.6, disjoint=True)
+    scanning = _moment_census(image[None], bg_map[None], 0.6)
+    assert 1 <= counting.size <= 6
+    assert scanning.size > counting.size
