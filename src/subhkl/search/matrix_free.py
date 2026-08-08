@@ -604,7 +604,7 @@ class MatrixFreeSparseRBFPeakFinder:
         fid_residual: float | None = None,
         max_fragmentation_rate: float = 1.0,
         profile_file: str | None = "auto",
-        shape_ratio: float = 1.0,
+        shape_ratio: float = 1.2,
         shape_orientations: int = 4,
         **kwargs,
     ):

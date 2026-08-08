@@ -158,10 +158,11 @@ def finder(
         float,
         typer.Option(
             help="Axis ratio of elliptical shape variants added per scale, "
-            "area-preserving.  1.0 (default) keeps the isotropic basis; the "
-            "measured anisotropy of CG4D/MANDI reflections is ~1.2."
+            "area-preserving.  The default 1.2 is the measured anisotropy of "
+            "CG4D/MANDI reflections; 1.0 restores the isotropic basis (and "
+            "cuts the bank convolution cost 5x)."
         ),
-    ] = 1.0,
+    ] = 1.2,
     sparse_rbf_shape_orientations: Annotated[
         int,
         typer.Option(

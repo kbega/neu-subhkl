@@ -2165,18 +2165,28 @@ def test_fragmentation_rate_maps_to_protected_quantile():
     assert scanning.size > counting.size
 
 
-def test_learned_basis_default_is_exactly_the_gaussian_bank():
-    """The default is profile_file='auto': construction starts on the Gaussian
-    bank (and its separable fast path) and only the first data batch can swap
-    in a measured trunk.  Before any data, auto and 'gaussian' are identical."""
+def test_default_is_the_learned_family_and_legacy_is_one_flag_away():
+    """The default now carries the measured peak family: profile 'auto' (trunk
+    swapped in at first batch) and the anisotropy variants from construction.
+    The threshold multiplicity is Gram-corrected, so the calibrated z stays at
+    the same-scale isotropic bank's level.  profile_file='gaussian' with
+    shape_ratio=1.0 restores the historical Gaussian path exactly, separable
+    fast path included."""
     import numpy as np
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     f = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=6)
-    assert f.use_separable
-    assert np.asarray(f.K_weights).shape[0] == 6
-    assert getattr(f, "_nk_multiplicity_scale", 1.0) == 1.0
+    assert np.asarray(f.K_weights).shape[0] == 30  # 6 scales x 5 shapes
+    assert not f.use_separable
+    assert 0.15 < f._nk_multiplicity_scale < 0.35
+
+    legacy = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5, max_sigma=6.5, num_sigmas=6, profile_file="gaussian", shape_ratio=1.0
+    )
+    assert legacy.use_separable
+    assert np.asarray(legacy.K_weights).shape[0] == 6
+    assert getattr(legacy, "_nk_multiplicity_scale", 1.0) == 1.0
 
 
 def test_learned_basis_keeps_the_flux_scale_family(tmp_path):
