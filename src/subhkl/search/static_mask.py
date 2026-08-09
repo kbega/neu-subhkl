@@ -50,13 +50,13 @@ def estimate_static_mask(
     *,
     smooth_sigma: float = 2.0,
     grad_nmads: float = 8.0,
-    texture_factor: float = 0.25,
+    texture_factor: float = 0.15,
     wide_sigma: float = 10.0,
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
     clear_disks: list | None = None,
-    clear_nsigmas: float = 3.0,
+    clear_nsigmas: float = 3.5,
 ) -> np.ndarray:
     """Valid-pixel mask (1 = usable) for one bank from its frame stack.
 
@@ -148,7 +148,22 @@ def estimate_static_mask(
     # subtraction digs around anything bright -- a ~wide_sigma-to-2*wide_sigma
     # ring, which on the forward banks turned every leak into a ~20 px
     # exclusion zone around a genuine reflection.
-    texture = band > texture_factor * ambient
+    #
+    # The threshold is the *larger* of the effect-size criterion
+    # (texture_factor x ambient) and a significance floor on the band's own
+    # noise.  The boundary criterion always had its MAD test; the texture
+    # criterion did not, so on a photon-sparse panel an aggressive
+    # texture_factor would start masking Poisson speckle.  With the floor,
+    # sensitivity can be turned up for real structure without the quiet
+    # panels dissolving into noise masking.  4 MADs is ~2.7 sigma of the
+    # band's own noise: measured on photon-sparse fixtures (rate ~1-2,
+    # few frames) it sits at 0.19-0.26x ambient -- where the old fixed
+    # threshold was -- while real detector panels, with more frames and
+    # area behind the order statistic, have MADs far below any sensible
+    # texture_factor, so there the factor alone governs.
+    band_mad = np.median(np.abs(band - np.median(band))) + 1e-9
+    texture_threshold = max(texture_factor * ambient, 4.0 * band_mad)
+    texture = band > texture_threshold
 
     # Steps also announce themselves as band-pass gradients; MADs alone are
     # a pure significance test whose floor on a flat panel is noise, so the
@@ -193,7 +208,7 @@ def estimate_static_mask(
                 # Smoothing spreads the peak over s_eff and attenuates its
                 # amplitude by the area ratio; both in normalised rate units.
                 amp_rel = (amp / max(scale, 1e-6)) * (sig**2 / s_eff_sq)
-                floor = texture_factor * ambient
+                floor = texture_threshold
                 if amp_rel > floor:
                     r_tail = np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / floor))
                 else:
@@ -329,11 +344,11 @@ def build_mask_file(
     peaks: list[str | Path] | None = None,
     peak_deviance_min: float = 25.0,
     peak_residual_max: float = 2.0,
-    peak_clear_nsigmas: float = 3.0,
+    peak_clear_nsigmas: float = 3.5,
     min_frames: int = 5,
     smooth_sigma: float = 2.0,
     grad_nmads: float = 8.0,
-    texture_factor: float = 0.25,
+    texture_factor: float = 0.15,
     wide_sigma: float = 10.0,
     dilate_px: int = 8,
     static_quantile: float = 25.0,

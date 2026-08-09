@@ -975,10 +975,11 @@ def static_mask(
     peak_clear_nsigmas: Annotated[
         float,
         typer.Option(
-            help="Cleared footprint radius around an exonerated peak, in "
-            "units of its fitted width."
+            help="Minimum protected radius around an exonerated peak, in "
+            "units of its fitted width; brightness extends it further (to "
+            "where the peak's own tail falls below the texture threshold)."
         ),
-    ] = 3.0,
+    ] = 3.5,
     min_frames: Annotated[
         int,
         typer.Option(
@@ -1007,7 +1008,7 @@ def static_mask(
             "band-pass (the background model follows it, and real peaks "
             "live there); the plume texture and illumination steps remain."
         ),
-    ] = 0.25,
+    ] = 0.15,
     wide_sigma: Annotated[
         float,
         typer.Option(
