@@ -403,6 +403,43 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
     assert m2[36:44, 26:34].mean() < 0.5
 
 
+def test_no_annulus_around_a_quasi_static_certified_peak():
+    """The clearing must not manufacture the artifact it protects against.
+
+    A certified peak that barely moves between frames (a Laue zone rotating
+    about its own axis) clears an overlapping evidence disk in every frame,
+    leaving a no-evidence crater in the static map.  Averaging that crater's
+    zeros into the wide background dug a positive band-pass rim just outside
+    it -- above any texture threshold -- and the rim came back as a masked
+    annulus around the very peak the exoneration had certified.  The wide
+    smooth is now evidence-weighted (cleared pixels carry no weight, not the
+    value zero), and the clearing radius knows the peak's brightness, so
+    neither the crater nor the tail beyond a blind n-sigma disk writes
+    texture into the map.  Nothing near the peak may be masked, at any
+    radius."""
+    rng = np.random.default_rng(67)
+    size, sigma_pk, height = 160, 2.0, 200.0
+    wobble = [
+        (0, 0), (1, -1), (-1, 1), (2, 0), (-2, 2), (0, -2),
+        (1, 1), (-1, -2), (2, -2), (0, 1), (-2, 0), (1, 2),
+    ]  # fmt: skip
+    frames, disks = [], []
+    for dr, dc in wobble:
+        rate = np.full((size, size), 5.0)
+        rate += pixel_integrated_gaussian(
+            rate.shape, 64.0 + dr, 64.0 + dc, sigma_pk, height
+        )
+        frames.append(rng.poisson(rate).astype(np.float32))
+        disks.append([(64.0 + dr, 64.0 + dc, sigma_pk, height)])
+    valid = estimate_static_mask(np.stack(frames), clear_disks=disks)
+
+    rr, cc = np.mgrid[0:size, 0:size]
+    radius = np.hypot(rr - 64.0, cc - 64.0)
+    # No annulus at any radius: core, skirt and far field all stay valid.
+    assert valid[radius < 40].mean() > 0.995
+    assert valid.mean() > 0.98
+
+
 def test_peaks_must_pair_with_inputs(tmp_path):
     with h5py.File(tmp_path / "a.h5", "w") as f:
         f["images"] = np.zeros((2, 16, 16), dtype=np.float32)

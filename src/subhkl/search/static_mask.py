@@ -103,6 +103,89 @@ def estimate_static_mask(
     # l1-mbl forward banks as an exclusion ring around every true peak.
     stack = np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates])
 
+    import warnings as _warnings
+
+    def _reduce(radii: list | None) -> tuple[np.ndarray, np.ndarray]:
+        """(static map, evidence validity) with per-disk evidence cleared."""
+        work = stack
+        if radii is not None:
+            work = stack.copy()
+            for fi, disks in enumerate(clear_disks):
+                for (r0, c0, _sig, _amp), rad in zip(disks, radii[fi]):
+                    work[fi][(rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2] = np.nan
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", category=RuntimeWarning)
+            sm = np.nanpercentile(work, static_quantile, axis=0, method="lower")
+        # A pixel with too little surviving evidence proves nothing static.
+        n_eff = np.sum(~np.isnan(work), axis=0)
+        valid = (n_eff >= 2) & np.isfinite(sm)
+        return np.where(valid, sm, 0.0), valid
+
+    def _threshold(
+        sm: np.ndarray, valid: np.ndarray
+    ) -> tuple[float, np.ndarray, float]:
+        """(ambient, band-pass map, texture threshold) for a static map.
+
+        The criterion lives on a *band-pass* of the static map: structure at
+        scales between the atom footprint (smooth_sigma) and the background
+        window (wide_sigma).  What the mask must mark is structure that
+        defeats the background model -- and only that.  A wide static halo,
+        however elevated or statically steep its shoulders, is followed by
+        the windowed background estimate and is where real Bragg peaks live;
+        masking it (as an absolute-gradient or absolute-level criterion does)
+        removed genuine reflections from the centre of the l1-mbl forward
+        banks.  The halo vanishes from the band-pass; what remains is exactly
+        the peak-confusable statics: the illumination step (band-pass swing
+        ~0.4x ambient), the plume's texture (~0.3x at its false-detection
+        sites, against ~0.13x under real forward-bank peaks).
+
+        The wide smooth is a *normalised convolution*: cleared pixels carry
+        zero weight, not zero value.  A quasi-static certified peak clears
+        an overlapping disk in every frame, so the static map has a
+        no-evidence crater there; averaging the crater's zeros into the
+        wide background dug that background down around it, and the
+        band-pass acquired a positive rim just outside the crater -- up to
+        the crater's share of the wide kernel times ambient, comfortably
+        above any texture threshold.  The rim was then masked: a thin
+        annulus around every certified bright peak, manufactured by the
+        clearing itself.  With the evidence-weighted average the background
+        estimate outside the crater uses only real evidence, and inside it
+        the band is pinned to zero -- no evidence, no criteria.
+
+        The threshold is the *larger* of the effect-size criterion
+        (texture_factor x ambient) and a significance floor on the band's own
+        noise.  The boundary criterion always had its MAD test; the texture
+        criterion did not, so on a photon-sparse panel an aggressive
+        texture_factor would start masking Poisson speckle.  4 MADs is ~2.7
+        sigma of the band's own noise: measured on photon-sparse fixtures
+        (rate ~1-2, few frames) it sits at 0.19-0.26x ambient -- where the
+        old fixed threshold was -- while real detector panels, with more
+        frames and area behind the order statistic, have MADs far below any
+        sensible texture_factor, so there the factor alone governs.
+        """
+        vals = sm[valid] if valid.any() else sm.ravel()
+        ambient = max(float(np.median(vals)), 1e-3)
+        weight = valid.astype(np.float32)
+        num = ndimage.gaussian_filter(sm * weight, wide_sigma)
+        den = ndimage.gaussian_filter(weight, wide_sigma)
+        wide = np.where(den > 1e-3, num / np.maximum(den, 1e-3), 0.0)
+        band = np.where(valid, sm - wide, 0.0)
+        bvals = band[valid] if valid.any() else band.ravel()
+        band_mad = np.median(np.abs(bvals - np.median(bvals))) + 1e-9
+        return ambient, band, max(texture_factor * ambient, 4.0 * band_mad)
+
+    def _tail_radius(sig: float, amp: float, scale: float, thr: float) -> float:
+        """Radius where the peak's smoothed profile falls below ``thr``.
+
+        Smoothing spreads the peak over s_eff and attenuates its amplitude
+        by the area ratio; both in normalised rate units.
+        """
+        s_eff_sq = sig**2 + smooth_sigma**2
+        amp_rel = (amp / max(scale, 1e-6)) * (sig**2 / s_eff_sq)
+        if amp_rel > thr:
+            return float(np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / thr)))
+        return 0.0
+
     # Exonerated peaks leave the evidence pool: ``clear_disks`` carries, per
     # frame, (row, col, sigma, amplitude) of detections whose fit metrics
     # certify them as genuine (see build_mask_file).  Removing the footprint
@@ -111,58 +194,53 @@ def estimate_static_mask(
     # declared static however many frames it persists through, which is
     # exactly what happens when a manually oriented crystal repeats its
     # Laue zones.
+    #
+    # The clearing radius must know the peak's brightness, like the final
+    # protection below: a fixed n-sigma disk leaves a bright peak's tail
+    # above the texture threshold in every frame, and a quasi-static peak
+    # (a Laue zone that barely moves under rotation about its own axis)
+    # then writes an annulus of "static" texture into the map that the
+    # protection had to claw back -- imperfectly, because the aggregate is
+    # broadened by the few-pixel wobble beyond the fitted model.  But the
+    # amplitude-aware radius needs the texture threshold, which is measured
+    # *from* the cleared map -- so the reduction runs twice: a blind pass
+    # sets the threshold, the aware pass removes the tails at their source.
+    # A 2*smooth_sigma margin on the tail crossing absorbs the wobble
+    # broadening the fitted sigma does not know about.
     rr = cc = None
+    radii = None
     if clear_disks is not None:
         rr, cc = np.mgrid[0 : stack.shape[1], 0 : stack.shape[2]]
-        for fi, disks in enumerate(clear_disks):
-            for r0, c0, sig, _amp in disks:
-                rad = clear_nsigmas * sig + 2.0 * smooth_sigma
-                stack[fi][(rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2] = np.nan
+        radii = [
+            [clear_nsigmas * sig + 2.0 * smooth_sigma for _r, _c, sig, _a in disks]
+            for disks in clear_disks
+        ]
+        smooth, valid = _reduce(radii)
+        _, _, thr0 = _threshold(smooth, valid)
+        aware = [
+            [
+                max(
+                    blind,
+                    _tail_radius(sig, amp, float(scales[fi].squeeze()), thr0)
+                    + 2.0 * smooth_sigma,
+                )
+                for (_r, _c, sig, amp), blind in zip(disks, radii[fi])
+            ]
+            for fi, disks in enumerate(clear_disks)
+        ]
+        grew = any(a > b + 0.5 for fa, fb in zip(aware, radii) for a, b in zip(fa, fb))
+        radii = aware
+        if grew:
+            smooth, valid = _reduce(radii)
+    else:
+        smooth, valid = _reduce(None)
 
-    import warnings as _warnings
-
-    with _warnings.catch_warnings():
-        _warnings.simplefilter("ignore", category=RuntimeWarning)
-        smooth = np.nanpercentile(stack, static_quantile, axis=0, method="lower")
-    # A pixel with too little surviving evidence proves nothing static.
-    n_eff = np.sum(~np.isnan(stack), axis=0)
-    smooth = np.where((n_eff >= 2) & np.isfinite(smooth), smooth, 0.0)
-
-    ambient = max(float(np.median(smooth)), 1e-3)
-
-    # The criterion lives on a *band-pass* of the static map: structure at
-    # scales between the atom footprint (smooth_sigma) and the background
-    # window (wide_sigma).  What the mask must mark is structure that
-    # defeats the background model -- and only that.  A wide static halo,
-    # however elevated or statically steep its shoulders, is followed by
-    # the windowed background estimate and is where real Bragg peaks live;
-    # masking it (as an absolute-gradient or absolute-level criterion does)
-    # removed genuine reflections from the centre of the l1-mbl forward
-    # banks.  The halo vanishes from the band-pass; what remains is exactly
-    # the peak-confusable statics: the illumination step (band-pass swing
-    # ~0.4x ambient), the plume's texture (~0.3x at its false-detection
-    # sites, against ~0.13x under real forward-bank peaks).
-    band = smooth - ndimage.gaussian_filter(smooth, wide_sigma)
+    ambient, band, texture_threshold = _threshold(smooth, valid)
     # Positive lobes only.  False peaks are *positive* unmodelled structure;
     # |band| would additionally mask the negative moat that the wide
     # subtraction digs around anything bright -- a ~wide_sigma-to-2*wide_sigma
     # ring, which on the forward banks turned every leak into a ~20 px
     # exclusion zone around a genuine reflection.
-    #
-    # The threshold is the *larger* of the effect-size criterion
-    # (texture_factor x ambient) and a significance floor on the band's own
-    # noise.  The boundary criterion always had its MAD test; the texture
-    # criterion did not, so on a photon-sparse panel an aggressive
-    # texture_factor would start masking Poisson speckle.  With the floor,
-    # sensitivity can be turned up for real structure without the quiet
-    # panels dissolving into noise masking.  4 MADs is ~2.7 sigma of the
-    # band's own noise: measured on photon-sparse fixtures (rate ~1-2,
-    # few frames) it sits at 0.19-0.26x ambient -- where the old fixed
-    # threshold was -- while real detector panels, with more frames and
-    # area behind the order statistic, have MADs far below any sensible
-    # texture_factor, so there the factor alone governs.
-    band_mad = np.median(np.abs(band - np.median(band))) + 1e-9
-    texture_threshold = max(texture_factor * ambient, 4.0 * band_mad)
     texture = band > texture_threshold
 
     # Steps also announce themselves as band-pass gradients; MADs alone are
@@ -187,33 +265,22 @@ def estimate_static_mask(
     if dilate_px > 0:
         bad = ndimage.binary_dilation(bad, iterations=int(dilate_px))
 
-    # Exoneration must also *protect the final mask*, and with a radius that
-    # knows the peak's brightness.  Clearing the evidence alone left rings:
-    # the 3-sigma clearance is amplitude-blind, so a bright peak's tail
-    # stays above the texture threshold beyond it and the annulus in
-    # between was masked -- and the dilation then grew that annulus back
-    # inward over the cleared core.  The protected radius is where the
-    # peak's own smoothed profile falls below the texture threshold
-    # (floored at the evidence clearance), plus the dilation the bad set
-    # just received, and it is subtracted *after* dilation so nothing
-    # grows back in.  A certified reflection's footprint is then never
-    # masked, however bright.
+    # Exoneration must also *protect the final mask*.  The evidence clearing
+    # above removes the tails at their source, but a peak certified in only
+    # some frames still leaks through the others' quantile, and the pass-1
+    # threshold the clearing radii were computed against can sit slightly
+    # above the final one.  The protected radius is the cleared radius plus
+    # the dilation the bad set just received, recomputed against the final
+    # threshold, and it is subtracted *after* dilation so nothing grows
+    # back in.  A certified reflection's footprint is then never masked,
+    # however bright.
     if clear_disks is not None:
-        sig_sq = smooth_sigma**2
         protected = np.zeros_like(bad)
         for fi, disks in enumerate(clear_disks):
             scale = float(scales[fi].squeeze())
-            for r0, c0, sig, amp in disks:
-                s_eff_sq = sig**2 + sig_sq
-                # Smoothing spreads the peak over s_eff and attenuates its
-                # amplitude by the area ratio; both in normalised rate units.
-                amp_rel = (amp / max(scale, 1e-6)) * (sig**2 / s_eff_sq)
-                floor = texture_threshold
-                if amp_rel > floor:
-                    r_tail = np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / floor))
-                else:
-                    r_tail = 0.0
-                rad = max(clear_nsigmas * sig, r_tail) + dilate_px
+            for (r0, c0, sig, amp), cleared in zip(disks, radii[fi]):
+                r_tail = _tail_radius(sig, amp, scale, texture_threshold)
+                rad = max(cleared, r_tail + 2.0 * smooth_sigma) + dilate_px
                 protected |= (rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2
         bad &= ~protected
 
