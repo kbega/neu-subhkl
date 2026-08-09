@@ -56,6 +56,7 @@ def estimate_static_mask(
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
     clear_disks: list | None = None,
+    clear_nsigmas: float = 3.0,
 ) -> np.ndarray:
     """Valid-pixel mask (1 = usable) for one bank from its frame stack.
 
@@ -103,16 +104,19 @@ def estimate_static_mask(
     stack = np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates])
 
     # Exonerated peaks leave the evidence pool: ``clear_disks`` carries, per
-    # frame, the footprints of detections whose fit metrics certify them as
-    # genuine (see build_mask_file).  Removing the footprint from *this
-    # frame's* evidence -- rather than subtracting a model, which would
-    # leave mismatch dipoles -- means a real reflection cannot be declared
-    # static however many frames it persists through, which is exactly what
-    # happens when a manually oriented crystal repeats its Laue zones.
+    # frame, (row, col, sigma, amplitude) of detections whose fit metrics
+    # certify them as genuine (see build_mask_file).  Removing the footprint
+    # from *this frame's* evidence -- rather than subtracting a model, which
+    # would leave mismatch dipoles -- means a real reflection cannot be
+    # declared static however many frames it persists through, which is
+    # exactly what happens when a manually oriented crystal repeats its
+    # Laue zones.
+    rr = cc = None
     if clear_disks is not None:
         rr, cc = np.mgrid[0 : stack.shape[1], 0 : stack.shape[2]]
         for fi, disks in enumerate(clear_disks):
-            for r0, c0, rad in disks:
+            for r0, c0, sig, _amp in disks:
+                rad = clear_nsigmas * sig + 2.0 * smooth_sigma
                 stack[fi][(rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2] = np.nan
 
     import warnings as _warnings
@@ -167,6 +171,37 @@ def estimate_static_mask(
     bad = boundary | texture
     if dilate_px > 0:
         bad = ndimage.binary_dilation(bad, iterations=int(dilate_px))
+
+    # Exoneration must also *protect the final mask*, and with a radius that
+    # knows the peak's brightness.  Clearing the evidence alone left rings:
+    # the 3-sigma clearance is amplitude-blind, so a bright peak's tail
+    # stays above the texture threshold beyond it and the annulus in
+    # between was masked -- and the dilation then grew that annulus back
+    # inward over the cleared core.  The protected radius is where the
+    # peak's own smoothed profile falls below the texture threshold
+    # (floored at the evidence clearance), plus the dilation the bad set
+    # just received, and it is subtracted *after* dilation so nothing
+    # grows back in.  A certified reflection's footprint is then never
+    # masked, however bright.
+    if clear_disks is not None:
+        sig_sq = smooth_sigma**2
+        protected = np.zeros_like(bad)
+        for fi, disks in enumerate(clear_disks):
+            scale = float(scales[fi].squeeze())
+            for r0, c0, sig, amp in disks:
+                s_eff_sq = sig**2 + sig_sq
+                # Smoothing spreads the peak over s_eff and attenuates its
+                # amplitude by the area ratio; both in normalised rate units.
+                amp_rel = (amp / max(scale, 1e-6)) * (sig**2 / s_eff_sq)
+                floor = texture_factor * ambient
+                if amp_rel > floor:
+                    r_tail = np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / floor))
+                else:
+                    r_tail = 0.0
+                rad = max(clear_nsigmas * sig, r_tail) + dilate_px
+                protected |= (rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2
+        bad &= ~protected
+
     return (~bad).astype(np.uint8)
 
 
@@ -260,28 +295,30 @@ def _confident_peaks_by_frame(
     peaks_path: str | Path,
     deviance_min: float,
     residual_max: float,
-    clear_nsigmas: float,
-    margin: float,
-) -> dict[int, list[tuple[float, float, float]]]:
-    """Per image index: (row, col, clear radius) of metric-certified peaks.
+) -> dict[int, list[tuple[float, float, float, float]]]:
+    """Per image index: (row, col, sigma, amplitude) of certified peaks.
 
     The certificate is the finder's own fit statistics: enough evidence
     (per-peak deviance well above the chi^2_4 admission level) and a shape
     the atom family explains (residual deviance per DoF near one).  An
-    artifact fails one or both and earns no exoneration.
+    artifact fails one or both and earns no exoneration.  The geometry of
+    the cleared/protected region is the estimator's business -- it knows
+    the ambient rate a peak's tail must be compared against.
     """
-    out: dict[int, list[tuple[float, float, float]]] = {}
+    out: dict[int, list[tuple[float, float, float, float]]] = {}
     with h5py.File(peaks_path, "r") as f:
         idx = np.asarray(f["peaks/image_index"][()]).astype(int)
         r = np.asarray(f["peaks/pixel_r"][()], dtype=float)
         c = np.asarray(f["peaks/pixel_c"][()], dtype=float)
         sigma = np.asarray(f["peaks/sigma"][()], dtype=float)
+        flux = np.asarray(f["peaks/intensity"][()], dtype=float)
         dev = np.asarray(f["peaks/deviance"][()], dtype=float)
         res = np.asarray(f["peaks/residual_deviance"][()], dtype=float)
     confident = (dev > deviance_min) & (res < residual_max)
     for i in np.nonzero(confident)[0]:
-        rad = clear_nsigmas * max(float(sigma[i]), 1.0) + margin
-        out.setdefault(int(idx[i]), []).append((float(r[i]), float(c[i]), rad))
+        s_i = max(float(sigma[i]), 1.0)
+        amp = max(float(flux[i]), 0.0) / (2.0 * np.pi * s_i**2)
+        out.setdefault(int(idx[i]), []).append((float(r[i]), float(c[i]), s_i, amp))
     return out
 
 
@@ -334,8 +371,6 @@ def build_mask_file(
                 peaks_path,
                 peak_deviance_min,
                 peak_residual_max,
-                peak_clear_nsigmas,
-                margin=2.0 * smooth_sigma,
             )
 
     banks = sorted(by_bank)
@@ -357,6 +392,7 @@ def build_mask_file(
                 estimate_static_mask(
                     frames,
                     clear_disks=clear_disks,
+                    clear_nsigmas=peak_clear_nsigmas,
                     smooth_sigma=smooth_sigma,
                     grad_nmads=grad_nmads,
                     texture_factor=texture_factor,

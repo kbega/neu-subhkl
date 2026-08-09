@@ -334,12 +334,15 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
     poor shape -- earns no exoneration and its structure stays masked."""
     rng = np.random.default_rng(53)
     size, step_col = 128, 80
+    sigma_pk = 2.0
+    peak = pixel_integrated_gaussian((size, size), 40.0, 30.0, sigma_pk, 800.0)
+    height = float(peak.max())
     frames = []
     for _ in range(10):
         rate = np.full((size, size), 2.2)
         rate[:, step_col:] = 0.6
         # The same bright reflection in EVERY frame: static by any statistic.
-        rate += pixel_integrated_gaussian(rate.shape, 40.0, 30.0, 2.5, 150.0)
+        rate += peak
         frames.append(rng.poisson(rate).astype(np.float32))
 
     with h5py.File(tmp_path / "scan.h5", "w") as f:
@@ -354,7 +357,8 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
             f["peaks/image_index"] = np.arange(n)
             f["peaks/pixel_r"] = np.full(n, 40.0)
             f["peaks/pixel_c"] = np.full(n, 30.0)
-            f["peaks/sigma"] = np.full(n, 2.5)
+            f["peaks/sigma"] = np.full(n, sigma_pk)
+            f["peaks/intensity"] = np.full(n, height * 2 * np.pi * sigma_pk**2)
             f["peaks/deviance"] = np.full(n, deviance)
             f["peaks/residual_deviance"] = np.full(n, residual)
 
@@ -376,6 +380,15 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
     )
     m1 = load_mask_for_banks(tmp_path / "m1.h5", [4], (size, size))[0]
     assert m1[36:44, 26:34].mean() > 0.9
+    # No ring either: the amplitude-aware protection covers the bright tail
+    # AND survives the dilation of the bad set, so the whole footprint --
+    # centre, skirt and margin -- stays findable.  The evidence clearance
+    # alone left a masked annulus here (the tail exceeds the texture
+    # threshold beyond 3 sigma for a peak this bright, and dilation grew it
+    # back over the cleared core).
+    rr_t, cc_t = np.mgrid[0:size, 0:size]
+    footprint = np.hypot(rr_t - 40.0, cc_t - 30.0) <= 14.0
+    assert m1[footprint].mean() > 0.98
     assert m1[:, 74:80].mean() < 0.2
 
     # Poor metrics -- an artifact's -- rescue nothing.
