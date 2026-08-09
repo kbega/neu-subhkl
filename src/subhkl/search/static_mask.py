@@ -55,6 +55,7 @@ def estimate_static_mask(
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
+    clear_disks: list | None = None,
 ) -> np.ndarray:
     """Valid-pixel mask (1 = usable) for one bank from its frame stack.
 
@@ -99,12 +100,29 @@ def estimate_static_mask(
     # static map -- and a 400-count peak leaking ten percent still dwarfs
     # any threshold stated in units of a ~2-count ambient.  Measured on
     # l1-mbl forward banks as an exclusion ring around every true peak.
-    smooth = np.percentile(
-        np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates]),
-        static_quantile,
-        axis=0,
-        method="lower",
-    )
+    stack = np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates])
+
+    # Exonerated peaks leave the evidence pool: ``clear_disks`` carries, per
+    # frame, the footprints of detections whose fit metrics certify them as
+    # genuine (see build_mask_file).  Removing the footprint from *this
+    # frame's* evidence -- rather than subtracting a model, which would
+    # leave mismatch dipoles -- means a real reflection cannot be declared
+    # static however many frames it persists through, which is exactly what
+    # happens when a manually oriented crystal repeats its Laue zones.
+    if clear_disks is not None:
+        rr, cc = np.mgrid[0 : stack.shape[1], 0 : stack.shape[2]]
+        for fi, disks in enumerate(clear_disks):
+            for r0, c0, rad in disks:
+                stack[fi][(rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2] = np.nan
+
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", category=RuntimeWarning)
+        smooth = np.nanpercentile(stack, static_quantile, axis=0, method="lower")
+    # A pixel with too little surviving evidence proves nothing static.
+    n_eff = np.sum(~np.isnan(stack), axis=0)
+    smooth = np.where((n_eff >= 2) & np.isfinite(smooth), smooth, 0.0)
 
     ambient = max(float(np.median(smooth)), 1e-3)
 
@@ -167,10 +185,11 @@ def _read_frames_by_bank(
     The dropped counts are returned so the caller can say so.
     """
     by_bank: dict[int, list[np.ndarray]] = {}
+    provenance: dict[int, list[tuple[int, int]]] = {}
     dropped: Counter = Counter()
     hashes: set = set()
     signatures: dict[int, list[tuple]] = {}
-    for path in paths:
+    for file_index, path in enumerate(paths):
         with h5py.File(path, "r") as f:
             images = f["images"]
             bank_ids = np.asarray(f["bank_ids"][()]).astype(int)
@@ -204,7 +223,8 @@ def _read_frames_by_bank(
                 hashes.add(digest)
                 bank_sigs.append((ang, sig))
                 by_bank.setdefault(int(bank), []).append(frame)
-    return by_bank, dict(dropped)
+                provenance.setdefault(int(bank), []).append((file_index, i))
+    return by_bank, dict(dropped), provenance
 
 
 def _scene_signature(frame: np.ndarray, block: int = 8) -> tuple:
@@ -236,10 +256,43 @@ def _same_scene(sig_a: tuple, sig_b: tuple) -> bool:
     return float(z.max()) < 6.0
 
 
+def _confident_peaks_by_frame(
+    peaks_path: str | Path,
+    deviance_min: float,
+    residual_max: float,
+    clear_nsigmas: float,
+    margin: float,
+) -> dict[int, list[tuple[float, float, float]]]:
+    """Per image index: (row, col, clear radius) of metric-certified peaks.
+
+    The certificate is the finder's own fit statistics: enough evidence
+    (per-peak deviance well above the chi^2_4 admission level) and a shape
+    the atom family explains (residual deviance per DoF near one).  An
+    artifact fails one or both and earns no exoneration.
+    """
+    out: dict[int, list[tuple[float, float, float]]] = {}
+    with h5py.File(peaks_path, "r") as f:
+        idx = np.asarray(f["peaks/image_index"][()]).astype(int)
+        r = np.asarray(f["peaks/pixel_r"][()], dtype=float)
+        c = np.asarray(f["peaks/pixel_c"][()], dtype=float)
+        sigma = np.asarray(f["peaks/sigma"][()], dtype=float)
+        dev = np.asarray(f["peaks/deviance"][()], dtype=float)
+        res = np.asarray(f["peaks/residual_deviance"][()], dtype=float)
+    confident = (dev > deviance_min) & (res < residual_max)
+    for i in np.nonzero(confident)[0]:
+        rad = clear_nsigmas * max(float(sigma[i]), 1.0) + margin
+        out.setdefault(int(idx[i]), []).append((float(r[i]), float(c[i]), rad))
+    return out
+
+
 def build_mask_file(
     inputs: list[str | Path],
     output: str | Path,
     *,
+    peaks: list[str | Path] | None = None,
+    peak_deviance_min: float = 25.0,
+    peak_residual_max: float = 2.0,
+    peak_clear_nsigmas: float = 3.0,
     min_frames: int = 5,
     smooth_sigma: float = 2.0,
     grad_nmads: float = 8.0,
@@ -252,13 +305,38 @@ def build_mask_file(
     """Estimate one mask per physical bank across every input file.
 
     Inputs are reduced/merged stacks (``images`` + ``bank_ids``); they may
-    come from different samples.  A bank with fewer than ``min_frames``
-    frames gets a fully valid mask -- stated in the summary rather than
-    silently guessed from statistics too thin to tell a peak from a shadow.
+    come from different samples.  The cleanest input is a control experiment
+    without a sample, where everything is static and nothing needs rescuing.
+    When only sample scans exist, ``peaks`` (finder outputs from an unmasked
+    run, paired with ``inputs`` by order) exonerates detections whose fit
+    metrics certify them as genuine: their footprints leave the static
+    evidence per frame, so a reflection cannot be declared static however
+    many frames it persists through -- which quasi-static Laue zones from a
+    manually oriented crystal otherwise are.  A bank with fewer than
+    ``min_frames`` frames gets a fully valid mask -- stated in the summary
+    rather than silently guessed from statistics too thin to tell a peak
+    from a shadow.
     """
-    by_bank, duplicates = _read_frames_by_bank([Path(p) for p in inputs])
+    if peaks is not None and len(peaks) != len(inputs):
+        raise ValueError(
+            f"--peaks must pair with the inputs by order: got {len(peaks)} "
+            f"peaks file(s) for {len(inputs)} input(s)"
+        )
+    by_bank, duplicates, provenance = _read_frames_by_bank([Path(p) for p in inputs])
     if not by_bank:
         raise ValueError("no frames found in the inputs")
+
+    confident: dict[int, dict[int, list]] = {}
+    n_exonerated = 0
+    if peaks is not None:
+        for file_index, peaks_path in enumerate(peaks):
+            confident[file_index] = _confident_peaks_by_frame(
+                peaks_path,
+                peak_deviance_min,
+                peak_residual_max,
+                peak_clear_nsigmas,
+                margin=2.0 * smooth_sigma,
+            )
 
     banks = sorted(by_bank)
     masks, thin = [], []
@@ -268,9 +346,17 @@ def build_mask_file(
             masks.append(np.ones(frames.shape[1:], dtype=np.uint8))
             thin.append(bank)
         else:
+            clear_disks = None
+            if confident:
+                clear_disks = []
+                for file_index, image_index in provenance[bank]:
+                    disks = confident.get(file_index, {}).get(image_index, [])
+                    n_exonerated += len(disks)
+                    clear_disks.append(disks)
             masks.append(
                 estimate_static_mask(
                     frames,
+                    clear_disks=clear_disks,
                     smooth_sigma=smooth_sigma,
                     grad_nmads=grad_nmads,
                     texture_factor=texture_factor,
@@ -301,6 +387,7 @@ def build_mask_file(
         "banks": banks,
         "n_frames": {b: len(by_bank[b]) for b in banks},
         "thin_banks": thin,
+        "n_exonerated": n_exonerated,
         "duplicates_dropped": duplicates,
         "masked_fraction": float(masked_frac),
         "output": str(output),

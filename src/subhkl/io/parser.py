@@ -934,6 +934,40 @@ def static_mask(
             "keeps what never moves."
         ),
     ],
+    peaks: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--peaks",
+            help="Finder outputs from an unmasked run, one per input file in "
+            "the same order.  Optional: unnecessary when the inputs are a "
+            "control experiment without a sample.  Detections whose fit "
+            "metrics certify them as genuine (see --peak-deviance-min / "
+            "--peak-residual-max) are exonerated: their footprints leave "
+            "the static evidence, so a reflection cannot be declared "
+            "static however many frames it persists through.",
+        ),
+    ] = None,
+    peak_deviance_min: Annotated[
+        float,
+        typer.Option(
+            help="Exoneration needs per-peak deviance above this (evidence "
+            "well beyond the chi^2_4 admission level of 9.49)."
+        ),
+    ] = 25.0,
+    peak_residual_max: Annotated[
+        float,
+        typer.Option(
+            help="Exoneration needs residual deviance per DoF below this "
+            "(a shape the atom family explains; artifacts fail it)."
+        ),
+    ] = 2.0,
+    peak_clear_nsigmas: Annotated[
+        float,
+        typer.Option(
+            help="Cleared footprint radius around an exonerated peak, in "
+            "units of its fitted width."
+        ),
+    ] = 3.0,
     min_frames: Annotated[
         int,
         typer.Option(
@@ -1010,6 +1044,10 @@ def static_mask(
     run_static_mask(
         output_filename=output_filename,
         input_filenames=list(input_filenames),
+        peaks_filenames=list(peaks) if peaks else None,
+        peak_deviance_min=peak_deviance_min,
+        peak_residual_max=peak_residual_max,
+        peak_clear_nsigmas=peak_clear_nsigmas,
         min_frames=min_frames,
         smooth_sigma=smooth_sigma,
         grad_nmads=grad_nmads,

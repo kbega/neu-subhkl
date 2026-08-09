@@ -325,3 +325,74 @@ def test_no_exclusion_ring_around_a_static_hot_spot():
     # Core masked (it is static structure), annulus untouched.
     assert valid[radius < 4].mean() < 0.2
     assert valid[(radius > 16) & (radius < 28)].mean() > 0.95
+
+
+def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
+    """The user-facing contract of the peaks input: a quasi-static genuine
+    reflection (manually repeated Laue orientations) is rescued by its fit
+    metrics, while a detection on the illumination step -- poor evidence,
+    poor shape -- earns no exoneration and its structure stays masked."""
+    rng = np.random.default_rng(53)
+    size, step_col = 128, 80
+    frames = []
+    for _ in range(10):
+        rate = np.full((size, size), 2.2)
+        rate[:, step_col:] = 0.6
+        # The same bright reflection in EVERY frame: static by any statistic.
+        rate += pixel_integrated_gaussian(rate.shape, 40.0, 30.0, 2.5, 150.0)
+        frames.append(rng.poisson(rate).astype(np.float32))
+
+    with h5py.File(tmp_path / "scan.h5", "w") as f:
+        f["images"] = np.stack(frames)
+        f["bank_ids"] = np.full(10, 4)
+        # Distinct nominal angles so the duplicate guard sees a moving scan.
+        f["goniometer/angles"] = np.c_[np.arange(10.0), np.zeros(10)]
+
+    def write_peaks(path, deviance, residual):
+        with h5py.File(path, "w") as f:
+            n = 10
+            f["peaks/image_index"] = np.arange(n)
+            f["peaks/pixel_r"] = np.full(n, 40.0)
+            f["peaks/pixel_c"] = np.full(n, 30.0)
+            f["peaks/sigma"] = np.full(n, 2.5)
+            f["peaks/deviance"] = np.full(n, deviance)
+            f["peaks/residual_deviance"] = np.full(n, residual)
+
+    # Without exoneration the persistent reflection is (correctly, by the
+    # statistics alone) static -- and masked.  This is the hazard.
+    from subhkl.search.static_mask import build_mask_file, load_mask_for_banks
+
+    build_mask_file([tmp_path / "scan.h5"], tmp_path / "m0.h5", dilate_px=4)
+    m0 = load_mask_for_banks(tmp_path / "m0.h5", [4], (size, size))[0]
+    assert m0[36:44, 26:34].mean() < 0.5
+
+    # Confident metrics rescue it; the step stays masked.
+    write_peaks(tmp_path / "peaks.h5", deviance=120.0, residual=1.1)
+    build_mask_file(
+        [tmp_path / "scan.h5"],
+        tmp_path / "m1.h5",
+        peaks=[tmp_path / "peaks.h5"],
+        dilate_px=4,
+    )
+    m1 = load_mask_for_banks(tmp_path / "m1.h5", [4], (size, size))[0]
+    assert m1[36:44, 26:34].mean() > 0.9
+    assert m1[:, 74:80].mean() < 0.2
+
+    # Poor metrics -- an artifact's -- rescue nothing.
+    write_peaks(tmp_path / "bad.h5", deviance=6.0, residual=3.5)
+    build_mask_file(
+        [tmp_path / "scan.h5"],
+        tmp_path / "m2.h5",
+        peaks=[tmp_path / "bad.h5"],
+        dilate_px=4,
+    )
+    m2 = load_mask_for_banks(tmp_path / "m2.h5", [4], (size, size))[0]
+    assert m2[36:44, 26:34].mean() < 0.5
+
+
+def test_peaks_must_pair_with_inputs(tmp_path):
+    with h5py.File(tmp_path / "a.h5", "w") as f:
+        f["images"] = np.zeros((2, 16, 16), dtype=np.float32)
+        f["bank_ids"] = np.array([1, 1])
+    with pytest.raises(ValueError, match="pair with the inputs"):
+        build_mask_file([tmp_path / "a.h5"], tmp_path / "m.h5", peaks=[])

@@ -1801,6 +1801,10 @@ def run_integrator_visualize(
 def run_static_mask(
     output_filename: str,
     input_filenames: list[str],
+    peaks_filenames: list[str] | None = None,
+    peak_deviance_min: float = 25.0,
+    peak_residual_max: float = 2.0,
+    peak_clear_nsigmas: float = 3.0,
     min_frames: int = 5,
     smooth_sigma: float = 2.0,
     grad_nmads: float = 8.0,
@@ -1822,6 +1826,10 @@ def run_static_mask(
     summary = build_mask_file(
         input_filenames,
         output_filename,
+        peaks=peaks_filenames,
+        peak_deviance_min=peak_deviance_min,
+        peak_residual_max=peak_residual_max,
+        peak_clear_nsigmas=peak_clear_nsigmas,
         min_frames=min_frames,
         smooth_sigma=smooth_sigma,
         grad_nmads=grad_nmads,
@@ -1839,6 +1847,11 @@ def run_static_mask(
         print(
             f"Banks with fewer than {min_frames} distinct frames stay fully "
             "valid: " + ", ".join(str(b) for b in summary["thin_banks"])
+        )
+    if summary.get("n_exonerated"):
+        print(
+            f"Exonerated {summary['n_exonerated']} metric-certified peak "
+            "footprint(s) from the static evidence."
         )
     if summary["duplicates_dropped"]:
         n = sum(summary["duplicates_dropped"].values())
