@@ -129,7 +129,7 @@ def finder(
             "lowering it demands more evidence everywhere at once. gamma "
             "reshapes the threshold across scales at constant budget."
         ),
-    ] = 1.0,
+    ] = 0.1,
     sparse_rbf_max_fragmentation_rate: Annotated[
         float,
         typer.Option(
