@@ -391,6 +391,26 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
     assert m1[footprint].mean() > 0.98
     assert m1[:, 74:80].mean() < 0.2
 
+    # A faint peak's metrics also rescue it: deviance 20 clears the chi^2_4
+    # admission level (9.49) even though it would have failed the old bar of
+    # 25.  Measured on l1-mbl: 340 detections sat at deviance 20-23 with
+    # clean shape -- bright enough to mask, too faint for a deviance-25
+    # certificate, so they were masked with no route to exoneration.
+    write_peaks(tmp_path / "faint.h5", deviance=20.0, residual=1.1)
+    build_mask_file(
+        [tmp_path / "scan.h5"],
+        tmp_path / "m3.h5",
+        peaks=[tmp_path / "faint.h5"],
+        dilate_px=4,
+    )
+    m3 = load_mask_for_banks(tmp_path / "m3.h5", [4], (size, size))[0]
+    assert m3[36:44, 26:34].mean() > 0.9
+    assert m3[:, 74:80].mean() < 0.2
+    with h5py.File(tmp_path / "m3.h5", "r") as f:
+        assert f.attrs["peak_deviance_min"] == pytest.approx(9.488)
+        assert f.attrs["n_exonerated"] == 10
+        assert list(f.attrs["peaks"]) == [str(tmp_path / "faint.h5")]
+
     # Poor metrics -- an artifact's -- rescue nothing.
     write_peaks(tmp_path / "bad.h5", deviance=6.0, residual=3.5)
     build_mask_file(

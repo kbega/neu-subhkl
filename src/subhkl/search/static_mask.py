@@ -373,6 +373,21 @@ def _same_scene(sig_a: tuple, sig_b: tuple) -> bool:
     return float(z.max()) < 6.0
 
 
+# chi^2_4 at 95%: the admission level for a four-parameter atom.  The
+# exoneration bar sits here, not above it: the finder's reported peaks
+# already passed a *calibrated* panel-wide false-alarm control (E[FP] per
+# bank), so a higher deviance bar re-litigates evidence the calibration
+# settled -- and manufactures a gap.  Masking a quasi-static peak takes
+# only ~texture_factor x ambient in the smoothed p25 (~15-20 recorded
+# counts), while a deviance-25 certificate takes ~3x that; measured on
+# l1-mbl, 340 detections fell in between -- every one with residual
+# deviance per DoF < 2 (median 1.11), deviance 20-23, median flux 133 --
+# faint genuine reflections masked with no route to exoneration.  84% sat
+# in compact blobs the size of their own dilated footprint, not on any
+# extended static structure.
+CHI2_4_P95 = 9.488
+
+
 def _confident_peaks_by_frame(
     peaks_path: str | Path,
     deviance_min: float,
@@ -380,9 +395,10 @@ def _confident_peaks_by_frame(
 ) -> dict[int, list[tuple[float, float, float, float]]]:
     """Per image index: (row, col, sigma, amplitude) of certified peaks.
 
-    The certificate is the finder's own fit statistics: enough evidence
-    (per-peak deviance well above the chi^2_4 admission level) and a shape
-    the atom family explains (residual deviance per DoF near one).  An
+    The certificate is the finder's own fit statistics: evidence at least
+    at the chi^2_4 admission level (the finder's calibrated false-alarm
+    control already governs above it -- see CHI2_4_P95) and a shape the
+    atom family explains (residual deviance per DoF near one).  An
     artifact fails one or both and earns no exoneration.  The geometry of
     the cleared/protected region is the estimator's business -- it knows
     the ambient rate a peak's tail must be compared against.
@@ -409,7 +425,7 @@ def build_mask_file(
     output: str | Path,
     *,
     peaks: list[str | Path] | None = None,
-    peak_deviance_min: float = 25.0,
+    peak_deviance_min: float = CHI2_4_P95,
     peak_residual_max: float = 2.0,
     peak_clear_nsigmas: float = 3.5,
     min_frames: int = 5,
@@ -513,6 +529,14 @@ def build_mask_file(
         f.attrs["dilate_px"] = dilate_px
         f.attrs["static_quantile"] = static_quantile
         f.attrs["grad_min_frac"] = grad_min_frac
+        # The exoneration provenance: without it, a mask file cannot answer
+        # "were peaks passed, and at what bar?" -- the first question asked
+        # when a peak turns up masked.
+        f.attrs["peaks"] = [str(p) for p in peaks] if peaks else []
+        f.attrs["peak_deviance_min"] = peak_deviance_min
+        f.attrs["peak_residual_max"] = peak_residual_max
+        f.attrs["peak_clear_nsigmas"] = peak_clear_nsigmas
+        f.attrs["n_exonerated"] = n_exonerated
 
     masked_frac = 1.0 - stack.mean()
     return {

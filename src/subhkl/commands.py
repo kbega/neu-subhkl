@@ -1802,7 +1802,7 @@ def run_static_mask(
     output_filename: str,
     input_filenames: list[str],
     peaks_filenames: list[str] | None = None,
-    peak_deviance_min: float = 25.0,
+    peak_deviance_min: float = 9.488,
     peak_residual_max: float = 2.0,
     peak_clear_nsigmas: float = 3.5,
     min_frames: int = 5,

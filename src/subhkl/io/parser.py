@@ -961,10 +961,14 @@ def static_mask(
     peak_deviance_min: Annotated[
         float,
         typer.Option(
-            help="Exoneration needs per-peak deviance above this (evidence "
-            "well beyond the chi^2_4 admission level of 9.49)."
+            help="Exoneration needs per-peak deviance above this.  The "
+            "default is the chi^2_4 admission level (9.49): the finder's "
+            "calibrated false-alarm control already governs evidence above "
+            "it, and a higher bar leaves faint genuine peaks -- bright "
+            "enough to mask, too faint to certify -- with no route to "
+            "exoneration."
         ),
-    ] = 25.0,
+    ] = 9.488,
     peak_residual_max: Annotated[
         float,
         typer.Option(
