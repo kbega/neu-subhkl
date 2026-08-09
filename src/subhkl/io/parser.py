@@ -23,6 +23,7 @@ from subhkl.commands import (
     run_finder_visualize,
     run_integrator_visualize,
     run_static_mask,
+    run_mask_visualize,
 )
 
 
@@ -1056,6 +1057,36 @@ def static_mask(
         dilate_px=dilate_px,
         static_quantile=static_quantile,
         grad_min_frac=grad_min_frac,
+    )
+
+
+@app.command()
+def mask_visualize(
+    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
+    mask_filename: Annotated[
+        str, typer.Argument(help="Static mask HDF5 (from `static-mask`)")
+    ],
+    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 600,
+    max_workers: Optional[int] = None,
+    show_progress: bool = True,
+):
+    """
+    Draw the static mask over the frames it applies to.
+
+    The same unrolled-detector rendering as finder-visualize, with masked
+    pixels burnt to the top of the intensity scale so they read as solid
+    regions against the data.  One `<label>-mask.png` per run.
+    """
+    run_mask_visualize(
+        images_filename=images_filename,
+        mask_filename=mask_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        max_workers=max_workers,
+        show_progress=show_progress,
     )
 
 

@@ -1862,3 +1862,26 @@ def run_static_mask(
             "signal into the mask."
         )
     return summary
+
+
+def run_mask_visualize(
+    images_filename: str,
+    mask_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 600,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Draw the static mask over the frames it applies to (`<label>-mask.png`)."""
+    written = replay.replay_mask_plots(
+        images_filename=images_filename,
+        mask_filename=mask_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written

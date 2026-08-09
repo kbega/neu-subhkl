@@ -316,3 +316,106 @@ def _attempt(call, out_name, written):
         traceback.print_exc()
     else:
         tqdm.write(f"Saved: {written[-1]}")
+
+
+def replay_mask_plots(
+    images_filename: str,
+    mask_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 600,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+) -> list[str]:
+    """Draw the static mask over the frames it applies to, one plot per run.
+
+    The same unrolled-detector rendering as the finder and integrator
+    replays, with the masked pixels burnt to the top of each run's intensity
+    scale -- on the standard grayscale they read as solid dark regions
+    against the data, which shows at a glance what the solver will treat as
+    missing and everything else in its true context.  Written as
+    ``<label>-mask.png`` next to the mask file (or into ``--output-dir``).
+    """
+    from subhkl.search.static_mask import load_mask_for_banks
+
+    if instrument is None:
+        with h5py.File(images_filename, "r") as f:
+            recorded = f.attrs.get("instrument")
+        if isinstance(recorded, bytes):
+            recorded = recorded.decode("utf-8")
+        if not recorded:
+            raise ValueError(
+                "The image file does not record its instrument; pass --instrument."
+            )
+        instrument = recorded
+
+    images = Peaks(images_filename, instrument)
+    if not images.image.ims:
+        raise ValueError(f"{images_filename} holds no images to draw on.")
+
+    img_keys = sorted(images.image.ims)
+    shape = next(iter(images.image.ims.values())).shape
+    banks = [images.image.bank_mapping.get(k, k) for k in img_keys]
+    valid = load_mask_for_banks(mask_filename, banks, shape)
+
+    if output_dir is None:
+        output_dir = os.path.dirname(mask_filename)
+
+    no_peaks = PlotPeaks(
+        image_index=np.zeros(0, dtype=int),
+        peak_rows=np.zeros(0),
+        peak_cols=np.zeros(0),
+    )
+
+    runs = {}
+    for img_key in img_keys:
+        runs.setdefault(images.get_run_id(img_key), []).append(img_key)
+
+    tasks = []
+    for run_id, run_keys in runs.items():
+        label = images.get_image_label(run_keys[0])
+        out_name = os.path.join(output_dir, f"{label}-mask.png")
+        burnt = {}
+        top = max(float(np.max(images.image.ims[key])) for key in run_keys)
+        for key in run_keys:
+            frame = np.asarray(images.image.ims[key], dtype=np.float32)
+            v = valid[img_keys.index(key)]
+            burnt[key] = np.where(v < 1.0, max(top, 1.0), frame)
+        tasks.append(
+            (
+                out_name,
+                no_peaks,
+                burnt,
+                {key: images.get_detector_by_img(key) for key in run_keys},
+                instrument,
+                dpi,
+                detector_assembly.DEFAULT_N_SIGMA,
+            )
+        )
+
+    if max_workers is None:
+        max_workers = os.cpu_count()
+    max_workers = max(1, min(max_workers, len(tasks)))
+
+    written = []
+    if max_workers == 1:
+        for task in tasks:
+            _attempt(partial(_render, task), task[0], written)
+    else:
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
+            futures = {executor.submit(_render, task): task[0] for task in tasks}
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Rendering mask plots",
+                disable=not show_progress,
+            ):
+                _attempt(future.result, futures[future], written)
+
+    if not written:
+        raise RuntimeError(
+            f"None of the {len(tasks)} plot(s) could be drawn; see the errors above."
+        )
+
+    return sorted(written)
