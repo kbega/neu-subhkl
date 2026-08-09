@@ -186,8 +186,12 @@ def _select(peaks: PlotPeaks, mask) -> PlotPeaks:
 
 
 def _render(args):
-    """Draw one run's plot.  Runs in a worker process, so it takes one tuple."""
-    out_name, peaks, images, detectors, instrument, dpi, n_sigma = args
+    """Draw one run's plot.  Runs in a worker process, so it takes one tuple.
+
+    Seven elements for the peak replays; an optional eighth carries a binary
+    overlay (the static mask) drawn as its own translucent colour layer."""
+    out_name, peaks, images, detectors, instrument, dpi, n_sigma, *rest = args
+    overlay = rest[0] if rest else None
 
     import matplotlib.pyplot as plt
 
@@ -204,6 +208,7 @@ def _render(args):
         instrument=instrument,
         dpi=dpi,
         n_sigma=n_sigma,
+        overlay=overlay,
     )
     return out_name
 
@@ -330,11 +335,12 @@ def replay_mask_plots(
     """Draw the static mask over the frames it applies to, one plot per run.
 
     The same unrolled-detector rendering as the finder and integrator
-    replays, with the masked pixels burnt to the top of each run's intensity
-    scale -- on the standard grayscale they read as solid dark regions
-    against the data, which shows at a glance what the solver will treat as
-    missing and everything else in its true context.  Written as
-    ``<label>-mask.png`` next to the mask file (or into ``--output-dir``).
+    replays, with the mask drawn as its own translucent cyan overlay on the
+    data -- an annotation layer, deliberately distinct from both Bragg peaks
+    and background density (burning masked pixels into the intensity scale
+    made them read as saturated peaks and shifted the shared colour scale).
+    Written as ``<label>-mask.png`` next to the mask file (or into
+    ``--output-dir``).
     """
     from subhkl.search.static_mask import load_mask_for_banks
 
@@ -375,21 +381,17 @@ def replay_mask_plots(
     for run_id, run_keys in runs.items():
         label = images.get_image_label(run_keys[0])
         out_name = os.path.join(output_dir, f"{label}-mask.png")
-        burnt = {}
-        top = max(float(np.max(images.image.ims[key])) for key in run_keys)
-        for key in run_keys:
-            frame = np.asarray(images.image.ims[key], dtype=np.float32)
-            v = valid[img_keys.index(key)]
-            burnt[key] = np.where(v < 1.0, max(top, 1.0), frame)
+        overlay = {key: 1.0 - valid[img_keys.index(key)] for key in run_keys}
         tasks.append(
             (
                 out_name,
                 no_peaks,
-                burnt,
+                {key: images.image.ims[key] for key in run_keys},
                 {key: images.get_detector_by_img(key) for key in run_keys},
                 instrument,
                 dpi,
                 detector_assembly.DEFAULT_N_SIGMA,
+                overlay,
             )
         )
 

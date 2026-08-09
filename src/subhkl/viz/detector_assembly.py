@@ -75,6 +75,10 @@ def plot_unrolled_detector(
     instrument=None,
     dpi=600,
     n_sigma=DEFAULT_N_SIGMA,
+    overlay=None,
+    overlay_color="cyan",
+    overlay_alpha=0.45,
+    overlay_label="Static mask",
 ):
     fig, ax = plt.subplots(figsize=(16, 6))
 
@@ -203,6 +207,18 @@ def plot_unrolled_detector(
         )
         if mesh_handle is None:
             mesh_handle = mesh
+
+        # An optional binary overlay (e.g. the static mask) drawn as its own
+        # translucent colour layer, so it reads as an annotation on top of
+        # the data rather than as bright counts: burning masked pixels into
+        # the intensity scale made them indistinguishable from saturated
+        # Bragg peaks and shifted the shared LogNorm for everything else.
+        if overlay is not None and img_key in overlay:
+            ov = np.asarray(overlay[img_key], dtype=float)
+            ov_cmap = colors.ListedColormap(
+                [(0, 0, 0, 0), colors.to_rgba(overlay_color, overlay_alpha)]
+            )
+            ax.pcolormesh(roty, Y, ov, shading="auto", cmap=ov_cmap, vmin=0.0, vmax=1.0)
 
     # 2. Plot Finder Peaks
     if finder_peaks is not None:
@@ -502,6 +518,15 @@ def plot_unrolled_detector(
         cbar.set_label("Intensity (counts)")
 
     handles, labels = ax.get_legend_handles_labels()
+    if overlay is not None:
+        from matplotlib.patches import Patch
+
+        handles.append(
+            Patch(
+                color=colors.to_rgba(overlay_color, overlay_alpha), label=overlay_label
+            )
+        )
+        labels.append(overlay_label)
     if handles:
         by_label = dict(zip(labels, handles))
         ax.legend(
