@@ -968,6 +968,25 @@ def static_mask(
             "rest on the structure are covered."
         ),
     ] = 8,
+    static_quantile: Annotated[
+        float,
+        typer.Option(
+            help="Per-pixel quantile across frames that defines the static "
+            "map.  Low (default p25) so a dense diffraction pattern cannot "
+            "leak into it: a static feature is in every frame and survives "
+            "any quantile, a reflection would have to sit still through "
+            "more than (100 - q)%% of the scan."
+        ),
+    ] = 25.0,
+    grad_min_frac: Annotated[
+        float,
+        typer.Option(
+            help="Effect-size floor for the boundary criterion, as gradient "
+            "per pixel in units of the ambient rate.  Significance (MADs) "
+            "alone masks soft genuine variation on flat panels; a real "
+            "illumination edge runs percents of ambient per pixel."
+        ),
+    ] = 0.02,
 ):
     """Build a static-structure mask from frame stacks of one instrument.
 
@@ -986,6 +1005,8 @@ def static_mask(
         grad_nmads=grad_nmads,
         glow_factor=glow_factor,
         dilate_px=dilate_px,
+        static_quantile=static_quantile,
+        grad_min_frac=grad_min_frac,
     )
 
 

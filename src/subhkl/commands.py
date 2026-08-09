@@ -1806,6 +1806,8 @@ def run_static_mask(
     grad_nmads: float = 8.0,
     glow_factor: float = 2.0,
     dilate_px: int = 8,
+    static_quantile: float = 25.0,
+    grad_min_frac: float = 0.02,
 ):
     """Build a static-structure mask from reduced/merged frame stacks.
 
@@ -1824,6 +1826,8 @@ def run_static_mask(
         grad_nmads=grad_nmads,
         glow_factor=glow_factor,
         dilate_px=dilate_px,
+        static_quantile=static_quantile,
+        grad_min_frac=grad_min_frac,
     )
     print(
         f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "

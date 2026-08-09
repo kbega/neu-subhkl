@@ -177,3 +177,69 @@ def test_fully_valid_mask_is_the_unmasked_path():
     plain = np.asarray(finder.find_peaks_batch(stack)[0])
     ones = np.asarray(finder.find_peaks_batch(stack, valid=np.ones_like(stack))[0])
     np.testing.assert_array_equal(plain, ones)
+
+
+def test_mask_is_invariant_to_exposure_time():
+    """The same static feature at 5x the counts must give the same mask:
+    frames are normalised to unit mean rate, and both criteria are ratios."""
+    short = synthetic_scan(peaks=False, seed=4)
+    long_ = np.stack(
+        [
+            np.random.default_rng(40 + k)
+            .poisson(5.0 * (2.2 - 1.6 * (np.arange(128) >= 80)))
+            .astype(np.float32)[None, :]
+            .repeat(128, axis=0)
+            for k in range(12)
+        ]
+    )
+    # Rebuild the long exposure properly: same rate pattern as synthetic_scan,
+    # scaled 5x, fresh Poisson draws.
+    rng = np.random.default_rng(21)
+    rate = np.full((128, 128), 2.2)
+    rate[:, 80:] = 0.6
+    long_ = np.stack([rng.poisson(5.0 * rate).astype(np.float32) for _ in range(12)])
+
+    a = estimate_static_mask(short, dilate_px=4)
+    b = estimate_static_mask(long_, dilate_px=4)
+    # Same masked geometry.  The masked set is a ~20-column strip, so a
+    # couple of columns of edge wiggle between independent noise draws
+    # costs ~10-15% of Jaccard overlap; 0.75 asserts same-geometry while
+    # tolerating that wiggle.
+    both, either = ((a == 0) & (b == 0)).sum(), ((a == 0) | (b == 0)).sum()
+    assert both / either > 0.75
+
+    # And mixing the two exposures in one stack does not change the answer.
+    mixed = estimate_static_mask(np.concatenate([short, long_]), dilate_px=4)
+    both, either = ((mixed == 0) & (a == 0)).sum(), ((mixed == 0) | (a == 0)).sum()
+    assert both / either > 0.75
+
+
+def test_dense_diffraction_does_not_leak_into_the_static_map():
+    """A reflection ring that keeps some peak near the same pixels in half
+    the frames polluted a median-based map and masked genuine Bragg peaks
+    (measured on l1-mbl forward banks).  The low-quantile map is clean."""
+    rng = np.random.default_rng(17)
+    size = 128
+    frames = []
+    for k in range(12):
+        rate = np.full((size, size), 1.0)
+        rate[:, 90:] = 0.3  # keep a real static edge in the frame
+        # Dense pattern: bright peaks on a ring, positions jittering a few
+        # pixels frame to frame.  Each position is lit in 2 of 12 frames --
+        # the physical rate for a reflection in a rotation scan -- so the
+        # ring as a whole is always occupied somewhere while no pixel is.
+        for j in range(10):
+            if (k + j) % 6:
+                continue
+            angle = 2 * np.pi * j / 10
+            r0 = 60 + 25 * np.sin(angle) + rng.integers(-2, 3)
+            c0 = 45 + 25 * np.cos(angle) + rng.integers(-2, 3)
+            rate += pixel_integrated_gaussian(rate.shape, r0, c0, 2.0, 60.0)
+        frames.append(rng.poisson(rate).astype(np.float32))
+    valid = estimate_static_mask(np.stack(frames), dilate_px=4)
+
+    # The static edge is masked; the ring region is not.
+    assert valid[:, 86:94].mean() < 0.2
+    rr, cc = np.mgrid[0:size, 0:size]
+    ring = np.abs(np.hypot(rr - 60.0, cc - 45.0) - 25.0) < 6
+    assert valid[ring].mean() > 0.9

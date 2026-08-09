@@ -2,8 +2,8 @@
 
 Beam-stop shadows, illumination boundaries and instrument-body glow are fixed
 in the detector frame, while a Bragg reflection survives at most a frame or
-two of sample rotation.  The per-bank *median* across enough frames therefore
-contains the artifacts and none of the crystal -- the frames do not even have
+two of sample rotation.  A per-bank low quantile across enough frames
+(exposure-normalised) therefore contains the artifacts and none of the crystal -- the frames do not even have
 to come from the same sample, only from the same instrument configuration,
 which makes the mask an instrument calibration product rather than a
 per-dataset one.
@@ -21,7 +21,7 @@ runs while every Bragg peak moved):
   to any peak-level recurrence veto, caught only by a pixel mask.
 
 The mask marks the union of a gradient criterion (boundaries) and a level
-criterion (glow) on the smoothed median, dilated so that atoms merely
+criterion (glow) on the smoothed static map, dilated so that atoms merely
 touching the structure are covered.
 
 The file format is a reduced single-frame stack: ``images`` [n_banks, H, W]
@@ -46,30 +46,67 @@ def estimate_static_mask(
     grad_nmads: float = 8.0,
     glow_factor: float = 2.0,
     dilate_px: int = 8,
+    static_quantile: float = 25.0,
+    grad_min_frac: float = 0.02,
 ) -> np.ndarray:
     """Valid-pixel mask (1 = usable) for one bank from its frame stack.
 
-    ``grad_nmads`` is the boundary criterion: pixels where the smoothed
-    median's gradient magnitude exceeds this many MADs of the panel-wide
-    gradient are structure, not statistics (the l1-mbl illumination edge
-    measures ~8 MADs of margin even at threshold 8).  ``glow_factor`` is the
-    level criterion, relative to the panel's median rate.  ``dilate_px``
-    should cover an atom footprint (~2 * max_sigma) so that an atom whose
-    tail rests on the structure is masked along with it.
+    Two robustness properties are load-bearing:
+
+    * Frames are normalised to unit mean rate before stacking, so the same
+      static feature at a different exposure (or beam current) produces the
+      same mask, and frames of mixed exposures may be pooled.  Both criteria
+      below are then ratios on a relative rate map rather than counts.
+    * The static map is a *low quantile* across frames (default p25), not
+      the median.  A dense diffraction pattern puts some reflection near a
+      given pixel in half the frames, which pollutes a median built from a
+      handful of runs -- measured on l1-mbl forward banks, where the median
+      map's gradients masked genuine Bragg peaks.  A static feature is
+      present in *every* frame, so it survives any quantile; a reflection
+      would have to sit still through >75% of the scan to leak in.
+
+    ``grad_nmads`` is the boundary criterion: pixels where the static map's
+    gradient magnitude exceeds this many MADs of the panel-wide gradient are
+    structure, not statistics (the l1-mbl illumination edge measures ~8 MADs
+    of margin even at threshold 8).  ``glow_factor`` is the level criterion,
+    relative to the panel's ambient rate.  ``dilate_px`` should cover an atom
+    footprint (~2 * max_sigma) so that an atom whose tail rests on the
+    structure is masked along with it.
     """
     frames = np.asarray(frames, dtype=np.float32)
     if frames.ndim != 3 or frames.shape[0] < 2:
         raise ValueError("need a [n_frames, H, W] stack with at least 2 frames")
 
-    static = np.median(frames, axis=0)
-    smooth = ndimage.gaussian_filter(static, smooth_sigma)
+    scales = frames.mean(axis=(1, 2), keepdims=True)
+    rates = frames / np.maximum(scales, 1e-6)
+    # Smooth each frame *before* the quantile: at counting rates near one
+    # photon per pixel a low quantile of raw integers is zero on both sides
+    # of any structure, and the structure vanishes with it.  Smoothing first
+    # turns each frame into a local rate estimate, whose low quantile keeps
+    # what every frame shows.
+    smooth = np.percentile(
+        np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates]),
+        static_quantile,
+        axis=0,
+    )
 
     gy, gx = np.gradient(smooth)
     grad = np.hypot(gy, gx)
-    grad_mad = np.median(np.abs(grad - np.median(grad))) + 1e-9
-    boundary = np.abs(grad - np.median(grad)) > grad_nmads * grad_mad
-
     ambient = max(float(np.median(smooth)), 1e-3)
+
+    # Two conditions, one statistical and one physical.  MADs alone are a
+    # pure significance test: on a genuinely flat forward-scattering panel
+    # the gradient MAD is the noise floor, and soft real variation (diffuse
+    # scattering, halo skirts) clears any number of MADs -- measured on
+    # l1-mbl forward banks, where significance alone masked 12-17% of the
+    # panel and with it genuine Bragg peaks.  The floor demands an actual
+    # step: the l1-mbl illumination boundary runs ~3% of ambient per pixel,
+    # halo gradients well under 1%.
+    grad_mad = np.median(np.abs(grad - np.median(grad))) + 1e-9
+    boundary = (np.abs(grad - np.median(grad)) > grad_nmads * grad_mad) & (
+        grad > grad_min_frac * ambient
+    )
+
     glow = smooth > glow_factor * ambient
 
     bad = boundary | glow
@@ -105,6 +142,8 @@ def build_mask_file(
     grad_nmads: float = 8.0,
     glow_factor: float = 2.0,
     dilate_px: int = 8,
+    static_quantile: float = 25.0,
+    grad_min_frac: float = 0.02,
 ) -> dict:
     """Estimate one mask per physical bank across every input file.
 
@@ -132,6 +171,8 @@ def build_mask_file(
                     grad_nmads=grad_nmads,
                     glow_factor=glow_factor,
                     dilate_px=dilate_px,
+                    static_quantile=static_quantile,
+                    grad_min_frac=grad_min_frac,
                 )
             )
 
@@ -146,6 +187,8 @@ def build_mask_file(
         f.attrs["grad_nmads"] = grad_nmads
         f.attrs["glow_factor"] = glow_factor
         f.attrs["dilate_px"] = dilate_px
+        f.attrs["static_quantile"] = static_quantile
+        f.attrs["grad_min_frac"] = grad_min_frac
 
     masked_frac = 1.0 - stack.mean()
     return {

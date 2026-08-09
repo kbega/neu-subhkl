@@ -102,7 +102,7 @@ def _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width):
     return 0.5 * (lo + hi)
 
 
-def _moment_census(images, bg_map, bg_hi, counting=False):
+def _moment_census(images, bg_map, bg_hi, counting=False, valid=None):
     """Moment amplitudes ``A = F / (2 pi sigma^2)`` of every window that
     carries enough flux to measure, as an array (possibly empty).
 
@@ -116,12 +116,26 @@ def _moment_census(images, bg_map, bg_hi, counting=False):
     excess = np.asarray(images, dtype=np.float64) - np.asarray(bg_map, dtype=np.float64)
     if excess.ndim == 2:
         excess = excess[None, ...]
+    if valid is not None:
+        valid = np.asarray(valid)
+        if valid.ndim == 2:
+            valid = valid[None, ...]
     amps = []
-    for frame in excess:
+    for fi, frame in enumerate(excess):
         H, W = frame.shape
         step = max(8, int(H // 64))
         for r0 in range(step, H - step, step):
             for c0 in range(step, W - step, step):
+                # A window touching a masked pixel is not a measurement: the
+                # mask marks structure the census must not mistake for peaks.
+                if (
+                    valid is not None
+                    and valid[
+                        fi, r0 - step : r0 + step + 1, c0 - step : c0 + step + 1
+                    ].min()
+                    < 1.0
+                ):
+                    continue
                 win = frame[r0 - step : r0 + step + 1, c0 - step : c0 + step + 1]
                 flux = float(win.sum())
                 # The floor must clear the Poisson noise of the window sum,
@@ -159,7 +173,7 @@ def _moment_census(images, bg_map, bg_hi, counting=False):
 
 
 def _measure_radial_profile(
-    images, bg_map, bg_hi, max_sigma, min_windows=8, u_max=4.0, du=0.1
+    images, bg_map, bg_hi, max_sigma, min_windows=8, u_max=4.0, du=0.1, valid=None
 ):
     """The peak family's radial profile, measured from the frames themselves.
 
@@ -184,12 +198,16 @@ def _measure_radial_profile(
     excess = np.asarray(images, dtype=np.float64) - np.asarray(bg_map, dtype=np.float64)
     if excess.ndim == 2:
         excess = excess[None, ...]
+    if valid is not None:
+        valid = np.asarray(valid)
+        if valid.ndim == 2:
+            valid = valid[None, ...]
     edges = np.arange(0.0, u_max + du, du)
     centres = 0.5 * (edges[1:] + edges[:-1])
     acc = np.zeros(centres.size)
     wgt = np.zeros(centres.size)
     n_used = 0
-    for frame in excess:
+    for fi, frame in enumerate(excess):
         H, W = frame.shape
         # The window must hold a max_sigma peak out to ~2.5 sigma, or its
         # second moment is so truncated that every measured width -- and with
@@ -200,6 +218,16 @@ def _measure_radial_profile(
         yy, xx = np.mgrid[-step : step + 1, -step : step + 1].astype(float)
         for r0 in range(step, H - step, step):
             for c0 in range(step, W - step, step):
+                # See _moment_census: masked structure must not become the
+                # measured peak profile.
+                if (
+                    valid is not None
+                    and valid[
+                        fi, r0 - step : r0 + step + 1, c0 - step : c0 + step + 1
+                    ].min()
+                    < 1.0
+                ):
+                    continue
                 win = frame[r0 - step : r0 + step + 1, c0 - step : c0 + step + 1]
                 flux = float(win.sum())
                 area = win.size
@@ -271,7 +299,7 @@ def _measure_radial_profile(
     return centres[ok], f[ok]
 
 
-def _moment_peak_amplitude(images, bg_map, bg_hi, quantile=90.0):
+def _moment_peak_amplitude(images, bg_map, bg_hi, quantile=90.0, valid=None):
     """Bright-peak amplitude from window moments, not from a top-quantile count.
 
     ``A = F / (2 pi sigma^2)``, with the flux and the second moment taken over
@@ -289,7 +317,7 @@ def _moment_peak_amplitude(images, bg_map, bg_hi, quantile=90.0):
     Returns ``None`` when nothing carries enough flux to measure, leaving the
     caller on its declared default.
     """
-    amps = _moment_census(images, bg_map, bg_hi)
+    amps = _moment_census(images, bg_map, bg_hi, valid=valid)
     if not amps.size:
         return None
     return float(np.percentile(amps, quantile))
@@ -2271,8 +2299,14 @@ class MatrixFreeSparseRBFPeakFinder:
         # The bank is already built, so this cannot resize it, but it names
         # the fix.
         if self.num_sigmas >= 2:
-            bg_hi = float(np.percentile(bg_map, 90.0))
-            amp_hi = max(float(np.percentile(images_batch, 99.99)) - bg_hi, 1.0)
+            # Every preprocessing estimate is taken over valid pixels only:
+            # the mask marks structure, and structure in the background
+            # quantile, the amplitude proxy, the census or the measured
+            # profile would size the bank (or bend the atom) to fit exactly
+            # what the mask exists to exclude.
+            vsel = slice(None) if valid is None else valid >= 1.0
+            bg_hi = float(np.percentile(bg_map[vsel], 90.0))
+            amp_hi = max(float(np.percentile(images_batch[vsel], 99.99)) - bg_hi, 1.0)
             # The moment amplitude may stand in for the top-quantile count: its
             # inputs are aggregates over a footprint, so it is safe to let into
             # the resize, which is what amp_hi itself is excluded from.
@@ -2287,7 +2321,7 @@ class MatrixFreeSparseRBFPeakFinder:
             # place, stated rather than silent.
             if self.profile_file == "auto" and self._measured_trunk is None:
                 measured_trunk = _measure_radial_profile(
-                    images_batch, bg_map, bg_hi, self.max_sigma
+                    images_batch, bg_map, bg_hi, self.max_sigma, valid=valid
                 )
                 if measured_trunk is not None:
                     self._measured_trunk = measured_trunk
@@ -2317,7 +2351,9 @@ class MatrixFreeSparseRBFPeakFinder:
                 # disjoint-window census -- no solve involved (see
                 # _frag_protected_quantile).
                 if self.max_fragmentation_rate > 0:
-                    census = _moment_census(images_batch, bg_map, bg_hi, counting=True)
+                    census = _moment_census(
+                        images_batch, bg_map, bg_hi, counting=True, valid=valid
+                    )
                     if census.size:
                         q = _frag_protected_quantile(
                             self.max_fragmentation_rate, census.size / B
@@ -2326,7 +2362,9 @@ class MatrixFreeSparseRBFPeakFinder:
                     else:
                         measured = None
                 else:
-                    measured = _moment_peak_amplitude(images_batch, bg_map, bg_hi)
+                    measured = _moment_peak_amplitude(
+                        images_batch, bg_map, bg_hi, valid=valid
+                    )
                 if measured is not None:
                     amp_for_resize = measured
                     self.expected_peak_amplitude = measured
