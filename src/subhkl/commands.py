@@ -1804,7 +1804,8 @@ def run_static_mask(
     min_frames: int = 5,
     smooth_sigma: float = 2.0,
     grad_nmads: float = 8.0,
-    glow_factor: float = 2.0,
+    texture_factor: float = 0.25,
+    wide_sigma: float = 10.0,
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
@@ -1824,7 +1825,8 @@ def run_static_mask(
         min_frames=min_frames,
         smooth_sigma=smooth_sigma,
         grad_nmads=grad_nmads,
-        glow_factor=glow_factor,
+        texture_factor=texture_factor,
+        wide_sigma=wide_sigma,
         dilate_px=dilate_px,
         static_quantile=static_quantile,
         grad_min_frac=grad_min_frac,
@@ -1835,7 +1837,15 @@ def run_static_mask(
     )
     if summary["thin_banks"]:
         print(
-            f"Banks with fewer than {min_frames} frames stay fully valid: "
-            + ", ".join(str(b) for b in summary["thin_banks"])
+            f"Banks with fewer than {min_frames} distinct frames stay fully "
+            "valid: " + ", ".join(str(b) for b in summary["thin_banks"])
+        )
+    if summary["duplicates_dropped"]:
+        n = sum(summary["duplicates_dropped"].values())
+        print(
+            f"WARNING: dropped {n} duplicate frame(s) (same goniometer "
+            "orientation or identical content).  The estimator needs the "
+            "sample to move between frames; repeats would promote true "
+            "signal into the mask."
         )
     return summary

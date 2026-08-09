@@ -20,9 +20,13 @@ runs while every Bragg peak moved):
   spurious detections whose positions jitter from run to run -- invisible
   to any peak-level recurrence veto, caught only by a pixel mask.
 
-The mask marks the union of a gradient criterion (boundaries) and a level
-criterion (glow) on the smoothed static map, dilated so that atoms merely
-touching the structure are covered.
+The mask marks static structure on a *band-pass* of the static map --
+scales between the atom footprint and the background window -- because that
+is precisely the structure the background model cannot follow and the finder
+mistakes for peaks.  A wide smooth halo passes: the background follows it,
+and the genuine reflections sitting on it must stay findable.  Steps are
+caught by the band-pass gradient, textured glow by the band-pass level, and
+the union is dilated so atoms merely touching structure are covered.
 
 The file format is a reduced single-frame stack: ``images`` [n_banks, H, W]
 (uint8, 1 = valid, 0 = masked) with ``bank_ids`` alongside, so every tool
@@ -32,6 +36,8 @@ onto its input by physical bank rather than by position in the file.
 
 from __future__ import annotations
 
+import hashlib
+from collections import Counter
 from pathlib import Path
 
 import h5py
@@ -44,7 +50,8 @@ def estimate_static_mask(
     *,
     smooth_sigma: float = 2.0,
     grad_nmads: float = 8.0,
-    glow_factor: float = 2.0,
+    texture_factor: float = 0.25,
+    wide_sigma: float = 10.0,
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
@@ -68,8 +75,10 @@ def estimate_static_mask(
     ``grad_nmads`` is the boundary criterion: pixels where the static map's
     gradient magnitude exceeds this many MADs of the panel-wide gradient are
     structure, not statistics (the l1-mbl illumination edge measures ~8 MADs
-    of margin even at threshold 8).  ``glow_factor`` is the level criterion,
-    relative to the panel's ambient rate.  ``dilate_px`` should cover an atom
+    of margin even at threshold 8).  ``texture_factor`` is the band-pass level
+    criterion, relative to the panel's ambient rate; ``wide_sigma`` sets the
+    long end of the band and should sit at the background window's scale
+    (the finder's is max(15, 5 * max_sigma) px wide).  ``dilate_px`` should cover an atom
     footprint (~2 * max_sigma) so that an atom whose tail rests on the
     structure is masked along with it.
     """
@@ -84,39 +93,83 @@ def estimate_static_mask(
     # of any structure, and the structure vanishes with it.  Smoothing first
     # turns each frame into a local rate estimate, whose low quantile keeps
     # what every frame shows.
+    # method="lower": a true order statistic.  The default interpolated
+    # percentile blends adjacent order statistics, so a bright reflection
+    # present in only some frames leaks a *fraction* of itself into the
+    # static map -- and a 400-count peak leaking ten percent still dwarfs
+    # any threshold stated in units of a ~2-count ambient.  Measured on
+    # l1-mbl forward banks as an exclusion ring around every true peak.
     smooth = np.percentile(
         np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates]),
         static_quantile,
         axis=0,
+        method="lower",
     )
 
-    gy, gx = np.gradient(smooth)
-    grad = np.hypot(gy, gx)
     ambient = max(float(np.median(smooth)), 1e-3)
 
-    # Two conditions, one statistical and one physical.  MADs alone are a
-    # pure significance test: on a genuinely flat forward-scattering panel
-    # the gradient MAD is the noise floor, and soft real variation (diffuse
-    # scattering, halo skirts) clears any number of MADs -- measured on
-    # l1-mbl forward banks, where significance alone masked 12-17% of the
-    # panel and with it genuine Bragg peaks.  The floor demands an actual
-    # step: the l1-mbl illumination boundary runs ~3% of ambient per pixel,
-    # halo gradients well under 1%.
+    # The criterion lives on a *band-pass* of the static map: structure at
+    # scales between the atom footprint (smooth_sigma) and the background
+    # window (wide_sigma).  What the mask must mark is structure that
+    # defeats the background model -- and only that.  A wide static halo,
+    # however elevated or statically steep its shoulders, is followed by
+    # the windowed background estimate and is where real Bragg peaks live;
+    # masking it (as an absolute-gradient or absolute-level criterion does)
+    # removed genuine reflections from the centre of the l1-mbl forward
+    # banks.  The halo vanishes from the band-pass; what remains is exactly
+    # the peak-confusable statics: the illumination step (band-pass swing
+    # ~0.4x ambient), the plume's texture (~0.3x at its false-detection
+    # sites, against ~0.13x under real forward-bank peaks).
+    band = smooth - ndimage.gaussian_filter(smooth, wide_sigma)
+    # Positive lobes only.  False peaks are *positive* unmodelled structure;
+    # |band| would additionally mask the negative moat that the wide
+    # subtraction digs around anything bright -- a ~wide_sigma-to-2*wide_sigma
+    # ring, which on the forward banks turned every leak into a ~20 px
+    # exclusion zone around a genuine reflection.
+    texture = band > texture_factor * ambient
+
+    # Steps also announce themselves as band-pass gradients; MADs alone are
+    # a pure significance test whose floor on a flat panel is noise, so the
+    # physical floor (gradient per pixel as a fraction of ambient) guards
+    # it: the l1-mbl illumination boundary runs ~3% of ambient per pixel.
+    gy, gx = np.gradient(band)
+    grad = np.hypot(gy, gx)
     grad_mad = np.median(np.abs(grad - np.median(grad))) + 1e-9
-    boundary = (np.abs(grad - np.median(grad)) > grad_nmads * grad_mad) & (
-        grad > grad_min_frac * ambient
+    # Restricted to the positive side of the band: false atoms form on
+    # positive residual structure.  The negative moat that the wide
+    # subtraction digs around anything bright has gradients too, and
+    # without this restriction they masked a ring around every static
+    # spot.
+    boundary = (
+        (np.abs(grad - np.median(grad)) > grad_nmads * grad_mad)
+        & (grad > grad_min_frac * ambient)
+        & (band > 0.0)
     )
 
-    glow = smooth > glow_factor * ambient
-
-    bad = boundary | glow
+    bad = boundary | texture
     if dilate_px > 0:
         bad = ndimage.binary_dilation(bad, iterations=int(dilate_px))
     return (~bad).astype(np.uint8)
 
 
-def _read_frames_by_bank(paths: list[Path]) -> dict[int, list[np.ndarray]]:
+def _read_frames_by_bank(
+    paths: list[Path],
+) -> tuple[dict[int, list[np.ndarray]], dict[int, int]]:
+    """Frames grouped by physical bank, one per distinct orientation.
+
+    The estimator's entire premise is that the sample moves between frames.
+    Feed it the same goniometer orientation twice -- the same file listed
+    again, or a re-exposure at identical angles -- and the true signal is
+    static by construction, so it would be promoted into the mask.  Frames
+    are therefore deduplicated per bank: by goniometer angles when the file
+    carries them (which also catches re-exposures with fresh counting
+    noise), by content hash otherwise (which catches literal duplicates).
+    The dropped counts are returned so the caller can say so.
+    """
     by_bank: dict[int, list[np.ndarray]] = {}
+    dropped: Counter = Counter()
+    hashes: set = set()
+    signatures: dict[int, list[tuple]] = {}
     for path in paths:
         with h5py.File(path, "r") as f:
             images = f["images"]
@@ -126,11 +179,61 @@ def _read_frames_by_bank(paths: list[Path]) -> dict[int, list[np.ndarray]]:
                     f"{path}: bank_ids ({len(bank_ids)}) does not match "
                     f"images ({images.shape[0]})"
                 )
+            angles = None
+            if (
+                "goniometer/angles" in f
+                and f["goniometer/angles"].shape[0] == images.shape[0]
+            ):
+                angles = np.asarray(f["goniometer/angles"][()], dtype=float)
             for i, bank in enumerate(bank_ids):
-                by_bank.setdefault(int(bank), []).append(
-                    np.asarray(images[i], dtype=np.float32)
-                )
-    return by_bank
+                frame = np.asarray(images[i], dtype=np.float32)
+                digest = (int(bank), hashlib.sha1(frame.tobytes()).hexdigest())
+                if digest in hashes:
+                    dropped[int(bank)] += 1
+                    continue
+                ang = None if angles is None else tuple(np.round(angles[i], 4))
+                sig = _scene_signature(frame)
+                bank_sigs = signatures.setdefault(int(bank), [])
+                if any(
+                    (ang is None or prev_ang is None or ang == prev_ang)
+                    and _same_scene(sig, prev_sig)
+                    for prev_ang, prev_sig in bank_sigs
+                ):
+                    dropped[int(bank)] += 1
+                    continue
+                hashes.add(digest)
+                bank_sigs.append((ang, sig))
+                by_bank.setdefault(int(bank), []).append(frame)
+    return by_bank, dict(dropped)
+
+
+def _scene_signature(frame: np.ndarray, block: int = 8) -> tuple:
+    """Exposure-normalised block means, with the per-block noise scale."""
+    H, W = frame.shape
+    h, w = H // block, W // block
+    scale = max(float(frame.mean()), 1e-6)
+    rate = frame[: h * block, : w * block] / scale
+    blocks = rate.reshape(h, block, w, block).mean(axis=(1, 3))
+    # Poisson sd of a block mean of the *normalised* rate.
+    noise = np.sqrt(np.maximum(blocks, 1e-3) / (block * block * scale))
+    return blocks, noise
+
+
+def _same_scene(sig_a: tuple, sig_b: tuple) -> bool:
+    """Whether two frames are consistent with re-exposures of one scene.
+
+    Strict on purpose: the cost of a false "duplicate" is silently thrown
+    away data, so only agreement everywhere within counting noise counts.
+    The max of ~4k standardised block differences between true re-exposures
+    sits near 4 sigma; a moved crystal shifts bright peaks by many blocks
+    and lights up tens of sigma.
+    """
+    a, na = sig_a
+    b, nb = sig_b
+    if a.shape != b.shape:
+        return False
+    z = np.abs(a - b) / np.sqrt(na**2 + nb**2 + 1e-12)
+    return float(z.max()) < 6.0
 
 
 def build_mask_file(
@@ -140,7 +243,8 @@ def build_mask_file(
     min_frames: int = 5,
     smooth_sigma: float = 2.0,
     grad_nmads: float = 8.0,
-    glow_factor: float = 2.0,
+    texture_factor: float = 0.25,
+    wide_sigma: float = 10.0,
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
@@ -152,7 +256,7 @@ def build_mask_file(
     frames gets a fully valid mask -- stated in the summary rather than
     silently guessed from statistics too thin to tell a peak from a shadow.
     """
-    by_bank = _read_frames_by_bank([Path(p) for p in inputs])
+    by_bank, duplicates = _read_frames_by_bank([Path(p) for p in inputs])
     if not by_bank:
         raise ValueError("no frames found in the inputs")
 
@@ -169,7 +273,8 @@ def build_mask_file(
                     frames,
                     smooth_sigma=smooth_sigma,
                     grad_nmads=grad_nmads,
-                    glow_factor=glow_factor,
+                    texture_factor=texture_factor,
+                    wide_sigma=wide_sigma,
                     dilate_px=dilate_px,
                     static_quantile=static_quantile,
                     grad_min_frac=grad_min_frac,
@@ -185,7 +290,8 @@ def build_mask_file(
         f.attrs["min_frames"] = min_frames
         f.attrs["smooth_sigma"] = smooth_sigma
         f.attrs["grad_nmads"] = grad_nmads
-        f.attrs["glow_factor"] = glow_factor
+        f.attrs["texture_factor"] = texture_factor
+        f.attrs["wide_sigma"] = wide_sigma
         f.attrs["dilate_px"] = dilate_px
         f.attrs["static_quantile"] = static_quantile
         f.attrs["grad_min_frac"] = grad_min_frac
@@ -195,6 +301,7 @@ def build_mask_file(
         "banks": banks,
         "n_frames": {b: len(by_bank[b]) for b in banks},
         "thin_banks": thin,
+        "duplicates_dropped": duplicates,
         "masked_fraction": float(masked_frac),
         "output": str(output),
     }

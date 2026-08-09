@@ -953,13 +953,23 @@ def static_mask(
             "(illumination edges, beam-stop shadows)."
         ),
     ] = 8.0,
-    glow_factor: Annotated[
+    texture_factor: Annotated[
         float,
         typer.Option(
-            help="Level criterion: mask where the smoothed median exceeds "
-            "this multiple of the panel's ambient rate (static glow)."
+            help="Band-pass level criterion, in units of the ambient rate: "
+            "mask static structure at scales between the atom footprint and "
+            "the background window.  A wide smooth halo vanishes from the "
+            "band-pass (the background model follows it, and real peaks "
+            "live there); the plume texture and illumination steps remain."
         ),
-    ] = 2.0,
+    ] = 0.25,
+    wide_sigma: Annotated[
+        float,
+        typer.Option(
+            help="Long end of the band, px; set to the background window's "
+            "scale (the finder's window is max(15, 5 * max_sigma) px)."
+        ),
+    ] = 10.0,
     dilate_px: Annotated[
         int,
         typer.Option(
@@ -1003,7 +1013,8 @@ def static_mask(
         min_frames=min_frames,
         smooth_sigma=smooth_sigma,
         grad_nmads=grad_nmads,
-        glow_factor=glow_factor,
+        texture_factor=texture_factor,
+        wide_sigma=wide_sigma,
         dilate_px=dilate_px,
         static_quantile=static_quantile,
         grad_min_frac=grad_min_frac,

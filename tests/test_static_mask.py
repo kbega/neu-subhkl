@@ -69,8 +69,11 @@ def test_static_mask_needs_at_least_two_frames():
 
 
 def test_mask_file_round_trip_maps_by_physical_bank(tmp_path):
-    frames_a = synthetic_scan(n_frames=6, size=64, step_col=40, peaks=False, seed=1)
-    frames_b = synthetic_scan(n_frames=6, size=64, step_col=20, peaks=False, seed=2)
+    # Moving peaks keep the frames genuinely distinct scenes: peak-free
+    # re-draws of one static pattern are re-exposures, and the duplicate
+    # guard rightly collapses those.
+    frames_a = synthetic_scan(n_frames=6, size=64, step_col=40, seed=1)
+    frames_b = synthetic_scan(n_frames=6, size=64, step_col=20, seed=2)
 
     # Two input files, interleaved banks, on purpose out of order.
     for name, banks, stacks in (
@@ -91,11 +94,14 @@ def test_mask_file_round_trip_maps_by_physical_bank(tmp_path):
 
     # Bank 3's step is at column 20, bank 7's at column 40; the mapping must
     # place each mask with its own bank whatever the requested order, and a
-    # bank the file does not carry comes back fully valid.
+    # bank the file does not carry comes back fully valid.  On this small
+    # fixture the strip is soft (sharpness is covered by the 128 px tests),
+    # so the assertion is the mapping: each bank is masked at *its own*
+    # step's bright shoulder and clean at the other bank's.
     stack = load_mask_for_banks(out, [7, 99, 3], (64, 64))
     assert stack.shape == (3, 64, 64)
-    assert stack[0][:, 38:42].mean() < 0.2 and stack[0][:, 18:22].mean() > 0.9
-    assert stack[2][:, 18:22].mean() < 0.2 and stack[2][:, 38:42].mean() > 0.9
+    assert stack[0][:, 32:40].mean() < 0.5 and stack[0][:, 12:20].mean() > 0.9
+    assert stack[2][:, 12:20].mean() < 0.5 and stack[2][:, 32:40].mean() > 0.9
     assert stack[1].min() == 1.0
 
     with pytest.raises(ValueError):
@@ -238,8 +244,84 @@ def test_dense_diffraction_does_not_leak_into_the_static_map():
         frames.append(rng.poisson(rate).astype(np.float32))
     valid = estimate_static_mask(np.stack(frames), dilate_px=4)
 
-    # The static edge is masked; the ring region is not.
-    assert valid[:, 86:94].mean() < 0.2
+    # The static edge's bright shoulder -- where the background model
+    # overshoots and false atoms form -- is masked.  The dark side is
+    # deliberately not: false peaks are positive structure.
+    assert valid[:, 84:90].mean() < 0.2
     rr, cc = np.mgrid[0:size, 0:size]
     ring = np.abs(np.hypot(rr - 60.0, cc - 45.0) - 25.0) < 6
     assert valid[ring].mean() > 0.9
+
+
+def test_a_wide_smooth_halo_is_not_masked_and_its_peak_survives():
+    """The background model follows broad structure, so the mask must not
+    claim it: absolute-level and absolute-gradient criteria removed genuine
+    Bragg peaks from the centre of the l1-mbl forward banks."""
+    rng = np.random.default_rng(23)
+    size = 128
+    rr, cc = np.mgrid[0:size, 0:size]
+    halo = 3.0 * np.exp(-((rr - 64.0) ** 2 + (cc - 64.0) ** 2) / (2 * 40.0**2))
+    frames = []
+    for k in range(12):
+        rate = 1.0 + halo
+        rate[:, 100:] = 0.3  # a real step stays in frame for contrast
+        frames.append(rng.poisson(rate).astype(np.float32))
+    valid = estimate_static_mask(np.stack(frames), dilate_px=4)
+
+    # The halo centre -- 4x ambient, statically steep shoulders -- is valid.
+    assert valid[44:84, 44:84].mean() > 0.95
+    # The genuine step is still masked.
+    assert valid[:, 96:104].mean() < 0.2
+
+
+def test_repeated_frames_do_not_promote_signal_into_the_mask(tmp_path):
+    """The same frame (or the same goniometer orientation re-exposed) fed
+    repeatedly would make the true signal static by construction.  Repeats
+    are dropped, reported, and a bank left with too few distinct frames
+    stays fully valid."""
+    rng = np.random.default_rng(31)
+    rate = np.full((64, 64), 1.0)
+    rate += pixel_integrated_gaussian(rate.shape, 30.0, 30.0, 2.0, 200.0)
+    frame = rng.poisson(rate).astype(np.float32)
+
+    # Same content ten times over (no goniometer bookkeeping in the file).
+    with h5py.File(tmp_path / "dup.h5", "w") as f:
+        f["images"] = np.stack([frame] * 10)
+        f["bank_ids"] = np.full(10, 5)
+    summary = build_mask_file([tmp_path / "dup.h5"], tmp_path / "m1.h5", min_frames=5)
+    assert summary["duplicates_dropped"] == {5: 9}
+    assert summary["thin_banks"] == [5]
+    assert load_mask_for_banks(tmp_path / "m1.h5", [5], (64, 64)).min() == 1.0
+
+    # Re-exposures: same angles, fresh Poisson draws.  Content differs, the
+    # orientation does not, and the goniometer record is what catches it.
+    with h5py.File(tmp_path / "reexp.h5", "w") as f:
+        f["images"] = np.stack(
+            [rng.poisson(rate).astype(np.float32) for _ in range(10)]
+        )
+        f["bank_ids"] = np.full(10, 5)
+        f["goniometer/angles"] = np.tile([10.0, 0.0, 0.0], (10, 1))
+    summary = build_mask_file([tmp_path / "reexp.h5"], tmp_path / "m2.h5", min_frames=5)
+    assert summary["duplicates_dropped"] == {5: 9}
+    assert load_mask_for_banks(tmp_path / "m2.h5", [5], (64, 64)).min() == 1.0
+
+
+def test_no_exclusion_ring_around_a_static_hot_spot():
+    """A static bright spot must mask its own footprint and nothing more:
+    the |band-pass| criterion dug a ~wide-sigma moat around anything bright,
+    which on real forward banks became a ~20 px exclusion zone around every
+    leaked reflection."""
+    rng = np.random.default_rng(41)
+    size = 128
+    frames = []
+    for _ in range(12):
+        rate = np.full((size, size), 1.0)
+        rate += pixel_integrated_gaussian(rate.shape, 64.0, 64.0, 2.5, 50.0)
+        frames.append(rng.poisson(rate).astype(np.float32))
+    valid = estimate_static_mask(np.stack(frames), dilate_px=4)
+
+    rr, cc = np.mgrid[0:size, 0:size]
+    radius = np.hypot(rr - 64.0, cc - 64.0)
+    # Core masked (it is static structure), annulus untouched.
+    assert valid[radius < 4].mean() < 0.2
+    assert valid[(radius > 16) & (radius < 28)].mean() > 0.95
