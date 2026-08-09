@@ -56,6 +56,7 @@ def estimate_static_mask(
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
     clear_disks: list | None = None,
+    protect_disks: list | None = None,
     clear_nsigmas: float = 3.5,
 ) -> np.ndarray:
     """Valid-pixel mask (1 = usable) for one bank from its frame stack.
@@ -249,6 +250,20 @@ def estimate_static_mask(
     # gate at the 90th percentile, edge components sit at 4-12x with
     # extents of 200-500 px.
     #
+    # ``protect_disks`` (one flat list, not per frame) carries certificates
+    # that may *protect the final mask* but never clear evidence.  Pooled
+    # certificates arrive here: a pooled certificate acts on every frame of
+    # its bank at once, so a false one -- a ridge atom from the summed
+    # stack that slips the gate -- would clear a crater through the entire
+    # evidence pool, a hole no criterion can reach afterwards.  Bounding it
+    # to protection caps the damage at one visible disk.  Nothing is lost
+    # for the peaks protection exists to rescue: a certificate's protection
+    # radius covers precisely where its own smoothed tail exceeds the
+    # texture threshold (plus wobble margin and dilation), so its footprint
+    # never reaches the final mask whether or not the evidence underneath
+    # was cleared.  Clearing remains reserved for per-frame certificates,
+    # where a false one touches one frame of the quantile.
+    #
     # The gate and the radii need the texture threshold, which is measured
     # from the map itself -- so the reduction runs twice: an *uncleared*
     # pass sets the threshold and exposes the structure the gate inspects,
@@ -257,7 +272,8 @@ def estimate_static_mask(
     rr = cc = None
     kept = None
     radii = None
-    if clear_disks is not None:
+    kept_protect: list | None = None
+    if clear_disks is not None or protect_disks is not None:
         rr, cc = np.mgrid[0 : stack.shape[1], 0 : stack.shape[2]]
         smooth0, valid0 = _reduce(None, None)
         ambient0, band0, thr0 = _threshold(smooth0, valid0)
@@ -271,10 +287,10 @@ def estimate_static_mask(
             if sl is not None:
                 extents[i] = max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start)
         H, W = lab0.shape
-        kept, radii = [], []
-        for fi, disks in enumerate(clear_disks):
-            scale = float(scales[fi].squeeze())
-            kept_disks, kept_radii = [], []
+
+        def _gated(disks: list, scale: float) -> tuple[list, list]:
+            """The disks whose certificates survive the gate, with radii."""
+            out_disks, out_radii = [], []
             for r0, c0, sig, amp in disks:
                 rad = max(
                     clear_nsigmas * sig + 2.0 * smooth_sigma,
@@ -291,10 +307,18 @@ def estimate_static_mask(
                 )
                 if any(extents[k] > 4.0 * rad for k in comps if k > 0):
                     continue
-                kept_disks.append((r0, c0, sig, amp))
-                kept_radii.append(rad)
-            kept.append(kept_disks)
-            radii.append(kept_radii)
+                out_disks.append((r0, c0, sig, amp))
+                out_radii.append(rad)
+            return out_disks, out_radii
+
+        if clear_disks is not None:
+            kept, radii = [], []
+            for fi, disks in enumerate(clear_disks):
+                kept_disks, kept_radii = _gated(disks, float(scales[fi].squeeze()))
+                kept.append(kept_disks)
+                radii.append(kept_radii)
+        if protect_disks is not None:
+            kept_protect, _ = _gated(protect_disks, float(scales.mean()))
         smooth, valid = _reduce(kept, radii)
     else:
         smooth, valid = _reduce(None, None)
@@ -313,14 +337,24 @@ def estimate_static_mask(
     # the final threshold, and it is subtracted *after* dilation so nothing
     # grows back in.  An accepted certificate's footprint is then never
     # masked, however bright.
-    if kept is not None:
+    if kept is not None or kept_protect is not None:
         protected = np.zeros_like(bad)
-        for fi, disks in enumerate(kept):
-            scale = float(scales[fi].squeeze())
-            for (r0, c0, sig, amp), cleared in zip(disks, radii[fi]):
-                r_tail = _tail_radius(sig, amp, scale, texture_threshold)
-                rad = max(cleared, r_tail + 2.0 * smooth_sigma) + dilate_px
-                protected |= (rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2
+
+        def _protect(r0, c0, sig, amp, scale, floor):
+            r_tail = _tail_radius(sig, amp, scale, texture_threshold)
+            rad = max(floor, r_tail + 2.0 * smooth_sigma) + dilate_px
+            return (rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2
+
+        if kept is not None:
+            for fi, disks in enumerate(kept):
+                scale = float(scales[fi].squeeze())
+                for (r0, c0, sig, amp), cleared in zip(disks, radii[fi]):
+                    protected |= _protect(r0, c0, sig, amp, scale, cleared)
+        if kept_protect is not None:
+            scale = float(scales.mean())
+            for r0, c0, sig, amp in kept_protect:
+                floor = clear_nsigmas * sig + 2.0 * smooth_sigma
+                protected |= _protect(r0, c0, sig, amp, scale, floor)
         bad &= ~protected
 
     return (~bad).astype(np.uint8)
@@ -620,7 +654,9 @@ def build_mask_file(
     output from the per-bank *summed* stack, see ``build_summed_file``)
     extends the same rescue to reflections too faint for any single frame's
     certificate: their significance compounds across frames there, and a
-    certified pooled peak is exonerated in every frame of its bank.  A bank
+    certified pooled peak's footprint is protected in the final mask of its
+    bank (protection only -- a pooled certificate never clears evidence,
+    bounding the cost of a false one to a single disk).  A bank
     with fewer than ``min_frames`` frames gets a fully valid mask -- stated
     in the summary rather than silently guessed from statistics too thin to
     tell a peak from a shadow.
@@ -665,21 +701,27 @@ def build_mask_file(
             bank_pooled = [
                 # The pooled amplitude is a sum over this bank's frames; a
                 # static feature's per-frame amplitude is that divided by
-                # the frame count (exact by definition of static).
+                # the frame count (exact by definition of static).  Pooled
+                # certificates protect the final mask but never clear
+                # evidence: they act on every frame at once, so a false one
+                # would crater the whole evidence pool, while protection
+                # caps the damage at one disk -- and protection alone
+                # already guarantees a certified footprint is never masked.
                 (r0, c0, sig, amp / frames.shape[0])
                 for r0, c0, sig, amp in pooled.get(bank, [])
             ]
             n_exonerated_pooled += len(bank_pooled)
-            if confident or bank_pooled:
+            if confident:
                 clear_disks = []
                 for file_index, image_index in provenance[bank]:
                     disks = confident.get(file_index, {}).get(image_index, [])
                     n_exonerated += len(disks)
-                    clear_disks.append(disks + bank_pooled)
+                    clear_disks.append(disks)
             masks.append(
                 estimate_static_mask(
                     frames,
                     clear_disks=clear_disks,
+                    protect_disks=bank_pooled or None,
                     clear_nsigmas=peak_clear_nsigmas,
                     smooth_sigma=smooth_sigma,
                     grad_nmads=grad_nmads,
