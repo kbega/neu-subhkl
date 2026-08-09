@@ -139,7 +139,10 @@ def prepare_harvest_tasks(
                 gamma=harvest_peaks_kwargs.get("gamma", 0.0),
                 loss=harvest_peaks_kwargs.get("loss", "poisson"),
                 min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
-                max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
+                # None measures the ceiling from the first batch's own width
+                # census (matrix-free finder only; the legacy branch above
+                # keeps its fixed default).
+                max_sigma=harvest_peaks_kwargs.get("max_sigma"),
                 # Bank resolution, independent of the ceiling.  None lets the
                 # finder auto-size the bank against carpet fragmentation; an
                 # explicit count keeps the historical uniform grid.

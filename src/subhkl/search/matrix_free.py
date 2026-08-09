@@ -102,6 +102,177 @@ def _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width):
     return 0.5 * (lo + hi)
 
 
+#: Construction-time ceiling when max_sigma is measured from the data.  Only
+#: geometry for the *first* background pass depends on it; the census then
+#: replaces it, growing the analysis window and re-estimating once if the
+#: measurement lands above it.
+_PROVISIONAL_MAX_SIGMA = 5.0
+
+#: Two-aperture consistency (see the width census): a neighbour strong enough
+#: to inflate the wide aperture inflates the tight one differently, and 6%
+#: keeps every clean synthetic peak while removing the runaway tail.
+_WIDTH_TIGHT_APERTURE = 2.5
+_WIDTH_WIDE_APERTURE = 3.5
+_WIDTH_CONSISTENCY_TOL = 0.06
+
+
+def _truncated_m2_ratio(x):
+    """``m2(R)/sigma**2`` for a 2D Gaussian truncated at R, ``x = R**2/(2 sigma**2)``."""
+    if x <= 0:
+        return 0.0
+    if x > 60:
+        return 2.0
+    ex = np.exp(-x)
+    return 2.0 * (1.0 - (1.0 + x) * ex) / (1.0 - ex)
+
+
+def _sigma_from_truncated_m2(m2, aperture):
+    """Invert the truncation: the sigma whose truncated m2 matches."""
+    from scipy.optimize import brentq
+
+    if m2 <= 0 or aperture <= 0:
+        return float("nan")
+
+    def resid(sigma):
+        return sigma**2 * _truncated_m2_ratio(aperture**2 / (2 * sigma**2)) - m2
+
+    try:
+        if resid(0.05) * resid(60.0) > 0:
+            return float("nan")
+        return float(brentq(resid, 0.05, 60.0, xtol=1e-6))
+    except (ValueError, ZeroDivisionError):
+        return float("nan")
+
+
+def _width_at_aperture(frame, bg_patch_src, row, col, guess, max_half, k):
+    """Truncation-corrected sigma at an aperture of ``k`` sigma, iterated
+    with damping so it cannot oscillate.  Centroid from clipped weights
+    (stability), moments from *unclipped* values inside a circular aperture:
+    clipping rectifies background noise into a pedestal that inflates m2."""
+    height, width = frame.shape
+    sigma = guess
+    for _ in range(12):
+        aperture = min(k * sigma, max_half)
+        half = int(np.ceil(aperture)) + 1
+        r0, c0 = int(round(row)), int(round(col))
+        if not (half < r0 < height - half and half < c0 < width - half):
+            return float("nan")
+        sl = (slice(r0 - half, r0 + half + 1), slice(c0 - half, c0 + half + 1))
+        patch = frame[sl] - bg_patch_src[sl]
+        rr, cc = np.mgrid[sl].astype(float)
+        pos = np.maximum(patch, 0.0)
+        if pos.sum() <= 0:
+            return float("nan")
+        cr = (pos * rr).sum() / pos.sum()
+        cq = (pos * cc).sum() / pos.sum()
+        d2 = (rr - cr) ** 2 + (cc - cq) ** 2
+        inside = d2 <= aperture**2
+        flux = patch[inside].sum()
+        if flux <= 0:
+            return float("nan")
+        m2 = (patch[inside] * d2[inside]).sum() / flux
+        if not np.isfinite(m2) or m2 <= 0:
+            return float("nan")
+        new = _sigma_from_truncated_m2(m2, aperture)
+        if not np.isfinite(new):
+            return float("nan")
+        if abs(new - sigma) < 0.01:
+            return float(new)
+        sigma = 0.5 * (sigma + new)
+    return float(sigma)
+
+
+def _moment_width_census(images, bg_map, bg_hi, window_sigma, valid=None):
+    """Trustworthy peak widths from the frames themselves, no solve involved.
+
+    The bright-window census supplies the candidate positions (Voronoi-owned
+    centroids, flux floor already 8 sigma above window-sum noise); each is
+    then measured at two apertures with the truncated-moment inversion, and
+    kept only when the apertures agree -- the guard that stopped neighbour
+    contamination running the upper percentiles from 6.6 to 15 px on real
+    data when this estimator lived in the benchmark harness.
+    """
+    frames = np.asarray(images, dtype=np.float32)
+    if frames.ndim == 2:
+        frames = frames[None, ...]
+    bgs = np.asarray(bg_map, dtype=np.float32)
+    if bgs.ndim == 2:
+        bgs = bgs[None, ...]
+    if valid is not None:
+        valid = np.asarray(valid)
+        if valid.ndim == 2:
+            valid = valid[None, ...]
+
+    excess = frames - bgs
+    step = max(8, int(np.ceil(2.5 * float(window_sigma))))
+    widths = []
+    for fi, frame in enumerate(excess):
+        H, W = frame.shape
+        for r0 in range(step, H - step, step):
+            for c0 in range(step, W - step, step):
+                if (
+                    valid is not None
+                    and valid[
+                        fi, r0 - step : r0 + step + 1, c0 - step : c0 + step + 1
+                    ].min()
+                    < 1.0
+                ):
+                    continue
+                win = frame[r0 - step : r0 + step + 1, c0 - step : c0 + step + 1]
+                flux = float(win.sum())
+                area = float(win.size)
+                if flux < max(
+                    20.0 * bg_hi, 50.0, 8.0 * np.sqrt(area * max(bg_hi, 1e-3))
+                ):
+                    continue
+                w = np.maximum(win, 0.0)
+                tot = w.sum()
+                if tot <= 0:
+                    continue
+                rr, cc = np.mgrid[-step : step + 1, -step : step + 1]
+                dr = (w * rr).sum() / tot
+                dc = (w * cc).sum() / tot
+                if abs(dr) > step / 2 or abs(dc) > step / 2:
+                    continue
+                row, col = r0 + dr, c0 + dc
+                tight = _width_at_aperture(
+                    frames[fi], bgs[fi], row, col, 3.0, step, _WIDTH_TIGHT_APERTURE
+                )
+                wide = _width_at_aperture(
+                    frames[fi], bgs[fi], row, col, 3.0, step, _WIDTH_WIDE_APERTURE
+                )
+                if not (np.isfinite(tight) and np.isfinite(wide)) or tight <= 0:
+                    continue
+                if abs(wide - tight) / tight > _WIDTH_CONSISTENCY_TOL:
+                    continue
+                widths.append(wide)
+    return np.asarray(widths)
+
+
+def _ceiling_from_widths(widths, min_sigma):
+    """The bank ceiling a width census supports, or None when it cannot say.
+
+    A high percentile, on a ladder that matches how many peaks stand behind
+    it: p99 needs enough peaks that it is not simply the single widest
+    survivor (which is exactly what ran away on the MANDI datasets), and
+    below eight usable peaks nothing is quoted at all -- the caller then
+    falls back to its declared default, stated rather than silent.
+    """
+    n = widths.size
+    if n >= 800:
+        top = float(np.percentile(widths, 99.0))
+    elif n >= 160:
+        top = float(np.percentile(widths, 95.0))
+    elif n >= 40:
+        top = float(np.percentile(widths, 90.0))
+    elif n >= 8:
+        top = float(widths.max()) * 1.2
+    else:
+        return None
+    ceiling = float(np.ceil((top + 0.5) * 2) / 2)
+    return max(ceiling, float(min_sigma) * 1.5)
+
+
 def _moment_census(images, bg_map, bg_hi, counting=False, valid=None):
     """Moment amplitudes ``A = F / (2 pi sigma^2)`` of every window that
     carries enough flux to measure, as an array (possibly empty).
@@ -620,7 +791,7 @@ class MatrixFreeSparseRBFPeakFinder:
         alpha: float | None = None,
         gamma: float = 0.0,
         min_sigma: float = 1.0,
-        max_sigma: float = 5.0,
+        max_sigma: float | None = None,
         num_sigmas: int | None = None,
         loss: str = "poisson",
         show_steps: bool = False,
@@ -640,6 +811,15 @@ class MatrixFreeSparseRBFPeakFinder:
         multi_gpu: bool = False,
         **kwargs,
     ):
+        # None means "measure the ceiling from the first batch": the moment
+        # width census (truncated-m2 inversion, the estimator validated to
+        # ~0.01 px on synthetics) sets max_sigma from the data's own bright
+        # peaks, the same first-batch contract expected_background and the
+        # peak profile already follow.  Construction uses a provisional
+        # ceiling; geometry and bank are re-derived once the data has spoken.
+        self._auto_ceiling = max_sigma is None
+        if max_sigma is None:
+            max_sigma = _PROVISIONAL_MAX_SIGMA
         if max_sigma < min_sigma:
             raise ValueError(
                 f"max_sigma ({max_sigma}) is below min_sigma ({min_sigma}); "
@@ -2243,49 +2423,50 @@ class MatrixFreeSparseRBFPeakFinder:
             if valid.min() >= 1.0:
                 valid = None  # fully valid: keep the unmasked (and untraced) path
 
-        # Odd, as the greedy path already forces it (sparse_rbf.py).  An even
-        # window has no centre pixel: the old exact filter then returned an
-        # H+1 x W+1 map that the shape guard below silently cropped, which is a
-        # half-pixel shift of the background against the image rather than a
-        # harmless size mismatch.  max_sigma = 8 (window 40) hits this.
-        filter_size = max(15, int(self.max_sigma * 5))
-        if filter_size % 2 == 0:
-            filter_size += 1
-        bg_map = np.full_like(images_batch, 10.0)
-        try:
-            # The quantile-inversion rate map, not the median background: the
-            # median of Poisson(mu) is identically zero below mu = log 2, so
-            # on sparse frames the median map collapses to its clamp and every
-            # significance downstream is measured against a background
-            # hundreds of times too small.  See compute_rate_batch.  It also
-            # retires this branch's subsampled-median workaround
-            # (MEDIAN_MAX_SAMPLES): there is no window-sized sort left to
-            # subsample.  The legacy greedy finder keeps the median path
-            # unchanged.
-            from subhkl.search.sparse_rbf import compute_rate_batch
+        def rate_map(ceiling):
+            # Odd, as the greedy path already forces it (sparse_rbf.py).  An
+            # even window has no centre pixel: the old exact filter then
+            # returned an H+1 x W+1 map that the shape guard below silently
+            # cropped, which is a half-pixel shift of the background against
+            # the image rather than a harmless size mismatch.  max_sigma = 8
+            # (window 40) hits this.
+            filter_size = max(15, int(ceiling * 5))
+            if filter_size % 2 == 0:
+                filter_size += 1
+            result = np.full_like(images_batch, 10.0)
+            try:
+                # The quantile-inversion rate map, not the median background:
+                # the median of Poisson(mu) is identically zero below
+                # mu = log 2, so on sparse frames the median map collapses to
+                # its clamp and every significance downstream is measured
+                # against a background hundreds of times too small.  See
+                # compute_rate_batch.
+                from subhkl.search.sparse_rbf import compute_rate_batch
 
-            # Chunked for the same reason the greedy finder chunks it: a full
-            # detector scan is far too much to hold on the device at once.
-            bg_chunk = min(self.chunk_size, max(1, B // 4))
-            pieces = []
-            for start in range(0, B, bg_chunk):
-                piece = compute_rate_batch(
-                    jnp.asarray(
-                        images_batch[start : start + bg_chunk], dtype=jnp.float32
-                    ),
-                    filter_size,
-                )
-                piece.block_until_ready()
-                pieces.append(np.asarray(piece, dtype=np.float32))
-            bg_map = np.concatenate(pieces, axis=0)
-            if bg_map.shape != images_batch.shape:
-                bg_map_fixed = np.zeros_like(images_batch)
-                mh, mw = min(H, bg_map.shape[1]), min(W, bg_map.shape[2])
-                bg_map_fixed[:, :mh, :mw] = bg_map[:, :mh, :mw]
-                bg_map = bg_map_fixed
-        except ImportError:
-            pass
+                # Chunked for the same reason the greedy finder chunks it: a
+                # full detector scan is far too much to hold on the device.
+                bg_chunk = min(self.chunk_size, max(1, B // 4))
+                pieces = []
+                for start in range(0, B, bg_chunk):
+                    piece = compute_rate_batch(
+                        jnp.asarray(
+                            images_batch[start : start + bg_chunk], dtype=jnp.float32
+                        ),
+                        filter_size,
+                    )
+                    piece.block_until_ready()
+                    pieces.append(np.asarray(piece, dtype=np.float32))
+                result = np.concatenate(pieces, axis=0)
+                if result.shape != images_batch.shape:
+                    fixed = np.zeros_like(images_batch)
+                    mh, mw = min(H, result.shape[1]), min(W, result.shape[2])
+                    fixed[:, :mh, :mw] = result[:, :mh, :mw]
+                    result = fixed
+            except ImportError:
+                pass
+            return result
 
+        bg_map = rate_map(self.max_sigma)
         self._last_bg_map = bg_map
 
         # The bank was sized against expected_background and
@@ -2307,6 +2488,59 @@ class MatrixFreeSparseRBFPeakFinder:
             vsel = slice(None) if valid is None else valid >= 1.0
             bg_hi = float(np.percentile(bg_map[vsel], 90.0))
             amp_hi = max(float(np.percentile(images_batch[vsel], 99.99)) - bg_hi, 1.0)
+
+            # max_sigma=None: measure the bank ceiling from this batch's own
+            # bright peaks -- the truncated-moment width census, at two
+            # apertures with a consistency guard, feeding a percentile ladder
+            # sized to how many peaks stand behind it.  Two passes at most:
+            # the analysis window and the background filter both depend on
+            # the ceiling, so a measurement that lands above the provisional
+            # value grows the geometry and measures once more.
+            if self._auto_ceiling:
+                self._auto_ceiling = False
+                measured = None
+                widths = np.zeros(0)
+                for _ in range(2):
+                    widths = _moment_width_census(
+                        images_batch, bg_map, bg_hi, self.max_sigma, valid=valid
+                    )
+                    measured = _ceiling_from_widths(widths, self.min_sigma)
+                    if measured is None or measured <= self.max_sigma * 1.02:
+                        break
+                    self.max_sigma = float(measured)
+                    self.max_k_rad = int(3.0 * self.max_sigma)
+                    bg_map = rate_map(self.max_sigma)
+                    self._last_bg_map = bg_map
+                    bg_hi = float(np.percentile(bg_map[vsel], 90.0))
+                    amp_hi = max(
+                        float(np.percentile(images_batch[vsel], 99.99)) - bg_hi, 1.0
+                    )
+                if measured is None:
+                    warnings.warn(
+                        "max_sigma=None asked for a measured bank ceiling, but "
+                        f"only {widths.size} usable peak(s) survived the width "
+                        "census -- too few to quote a percentile.  Falling back "
+                        "to max_sigma=10; pass an explicit max_sigma to choose "
+                        "deliberately.",
+                        stacklevel=2,
+                    )
+                    measured = 10.0
+                if abs(measured - self.max_sigma) > 1e-9:
+                    self.max_sigma = float(measured)
+                    self.max_k_rad = int(3.0 * self.max_sigma)
+                if self.show_steps:
+                    print(
+                        f"  > bank ceiling measured from this batch: "
+                        f"max_sigma = {self.max_sigma:g} "
+                        f"({widths.size} peaks in the width census)"
+                    )
+                if not self._auto_bank:
+                    # An explicit num_sigmas keeps its count on the measured
+                    # range; an auto-sized bank re-derives its grid just
+                    # below, with the measured ceiling already in place.
+                    self._set_bank(
+                        np.linspace(self.min_sigma, self.max_sigma, self.num_sigmas)
+                    )
             # The moment amplitude may stand in for the top-quantile count: its
             # inputs are aggregates over a footprint, so it is safe to let into
             # the resize, which is what amp_hi itself is excluded from.

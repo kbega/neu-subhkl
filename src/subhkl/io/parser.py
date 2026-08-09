@@ -120,7 +120,17 @@ def finder(
     ] = None,
     sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
-    sparse_rbf_max_sigma: float = 10.0,
+    sparse_rbf_max_sigma: Annotated[
+        float | None,
+        typer.Option(
+            help="Bank ceiling in pixels.  The default (unset) measures it "
+            "from the first batch's own bright peaks -- a truncated-moment "
+            "width census with a two-aperture consistency guard -- and sets "
+            "the ceiling at a high percentile of the measured widths; too "
+            "few usable peaks falls back to 10 with a warning.  Set it to "
+            "pin the ceiling by hand."
+        ),
+    ] = None,
     sparse_rbf_false_alarms_per_image: Annotated[
         float,
         typer.Option(
