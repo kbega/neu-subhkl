@@ -70,6 +70,14 @@ class BaseConcatenateMerger:
         with h5py.File(output_filename, "w") as f_out:
             # Open the valid template file we found (or the first one if all are empty)
             with h5py.File(typical_file_path, "r") as f_typical:
+                # Root attributes ride along (the reduced files record e.g.
+                # instrument='CG4D' there).  Dropping them was how a merged
+                # file ended up unable to say which instrument it belongs
+                # to, so every replay command downstream needed the caller
+                # to repeat what the inputs already knew.
+                for name, value in f_typical.attrs.items():
+                    f_out.attrs[name] = value
+
                 for key in self.copy_keys:
                     if key in f_typical:
                         f_out[key] = np.array(f_typical[key])

@@ -396,3 +396,15 @@ def test_peaks_must_pair_with_inputs(tmp_path):
         f["bank_ids"] = np.array([1, 1])
     with pytest.raises(ValueError, match="pair with the inputs"):
         build_mask_file([tmp_path / "a.h5"], tmp_path / "m.h5", peaks=[])
+
+
+def test_mask_file_records_the_instrument_its_inputs_knew(tmp_path):
+    frames = synthetic_scan(n_frames=6, size=64)
+    with h5py.File(tmp_path / "scan.h5", "w") as f:
+        f["images"] = frames
+        f["bank_ids"] = np.full(6, 3)
+        f["goniometer/angles"] = np.c_[np.arange(6.0), np.zeros(6)]
+        f.attrs["instrument"] = "CG4D"
+    build_mask_file([tmp_path / "scan.h5"], tmp_path / "mask.h5")
+    with h5py.File(tmp_path / "mask.h5") as f:
+        assert f.attrs["instrument"] == "CG4D"

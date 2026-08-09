@@ -367,6 +367,16 @@ def build_mask_file(
                 )
             )
 
+    instrument = None
+    for path in inputs:
+        with h5py.File(path, "r") as f_in:
+            recorded = f_in.attrs.get("instrument")
+        if isinstance(recorded, bytes):
+            recorded = recorded.decode("utf-8")
+        if recorded:
+            instrument = recorded
+            break
+
     stack = np.stack(masks)
     with h5py.File(output, "w") as f:
         # Mostly-ones uint8 compresses ~100x, and the benchmark harness ships
@@ -374,6 +384,8 @@ def build_mask_file(
         f.create_dataset("images", data=stack, compression="gzip", compression_opts=4)
         f["bank_ids"] = np.asarray(banks, dtype=np.int64)
         f.attrs["kind"] = "static-mask"
+        if instrument:
+            f.attrs["instrument"] = instrument
         f.attrs["inputs"] = [str(p) for p in inputs]
         f.attrs["min_frames"] = min_frames
         f.attrs["smooth_sigma"] = smooth_sigma
