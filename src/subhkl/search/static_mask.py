@@ -369,7 +369,9 @@ def build_mask_file(
 
     stack = np.stack(masks)
     with h5py.File(output, "w") as f:
-        f["images"] = stack
+        # Mostly-ones uint8 compresses ~100x, and the benchmark harness ships
+        # this file in its CI artifact.
+        f.create_dataset("images", data=stack, compression="gzip", compression_opts=4)
         f["bank_ids"] = np.asarray(banks, dtype=np.int64)
         f.attrs["kind"] = "static-mask"
         f.attrs["inputs"] = [str(p) for p in inputs]
