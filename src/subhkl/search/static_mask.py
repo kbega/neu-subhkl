@@ -105,12 +105,14 @@ def estimate_static_mask(
 
     import warnings as _warnings
 
-    def _reduce(radii: list | None) -> tuple[np.ndarray, np.ndarray]:
+    def _reduce(
+        disks_by_frame: list | None, radii: list | None
+    ) -> tuple[np.ndarray, np.ndarray]:
         """(static map, evidence validity) with per-disk evidence cleared."""
         work = stack
-        if radii is not None:
+        if disks_by_frame is not None:
             work = stack.copy()
-            for fi, disks in enumerate(clear_disks):
+            for fi, disks in enumerate(disks_by_frame):
                 for (r0, c0, _sig, _amp), rad in zip(disks, radii[fi]):
                     work[fi][(rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2] = np.nan
         with _warnings.catch_warnings():
@@ -186,6 +188,33 @@ def estimate_static_mask(
             return float(np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / thr)))
         return 0.0
 
+    def _criteria(ambient: float, band: np.ndarray, thr: float) -> np.ndarray:
+        """Un-dilated bad set: band-pass level plus band-pass gradients.
+
+        Positive lobes only.  False peaks are *positive* unmodelled
+        structure; |band| would additionally mask the negative moat that the
+        wide subtraction digs around anything bright -- a ~wide_sigma-to-
+        2*wide_sigma ring, which on the forward banks turned every leak into
+        a ~20 px exclusion zone around a genuine reflection.
+
+        Steps also announce themselves as band-pass gradients; MADs alone
+        are a pure significance test whose floor on a flat panel is noise,
+        so the physical floor (gradient per pixel as a fraction of ambient)
+        guards it: the l1-mbl illumination boundary runs ~3% of ambient per
+        pixel.  The gradient criterion is restricted to the positive side
+        of the band for the same moat reason as above.
+        """
+        texture = band > thr
+        gy, gx = np.gradient(band)
+        grad = np.hypot(gy, gx)
+        grad_mad = np.median(np.abs(grad - np.median(grad))) + 1e-9
+        boundary = (
+            (np.abs(grad - np.median(grad)) > grad_nmads * grad_mad)
+            & (grad > grad_min_frac * ambient)
+            & (band > 0.0)
+        )
+        return boundary | texture
+
     # Exonerated peaks leave the evidence pool: ``clear_disks`` carries, per
     # frame, (row, col, sigma, amplitude) of detections whose fit metrics
     # certify them as genuine (see build_mask_file).  Removing the footprint
@@ -195,88 +224,98 @@ def estimate_static_mask(
     # exactly what happens when a manually oriented crystal repeats its
     # Laue zones.
     #
-    # The clearing radius must know the peak's brightness, like the final
-    # protection below: a fixed n-sigma disk leaves a bright peak's tail
-    # above the texture threshold in every frame, and a quasi-static peak
-    # (a Laue zone that barely moves under rotation about its own axis)
-    # then writes an annulus of "static" texture into the map that the
-    # protection had to claw back -- imperfectly, because the aggregate is
-    # broadened by the few-pixel wobble beyond the fitted model.  But the
-    # amplitude-aware radius needs the texture threshold, which is measured
-    # *from* the cleared map -- so the reduction runs twice: a blind pass
-    # sets the threshold, the aware pass removes the tails at their source.
-    # A 2*smooth_sigma margin on the tail crossing absorbs the wobble
-    # broadening the fitted sigma does not know about.
+    # A certificate is a statement about a *peak*, not about the structure
+    # it sits on, so it explains at most the peak's own footprint: the
+    # amplitude-aware radius where the smoothed tail falls below the texture
+    # threshold (with a 2*smooth_sigma margin for the frame-to-frame wobble
+    # the fitted sigma cannot know), never less than the n-sigma clearance.
+    # A detection whose underlying static structure extends far beyond that
+    # footprint is *refused*: its metrics may be clean -- measured on
+    # l1-mbl, detections on the illumination edges carry deviance 20+ and
+    # residual/DoF < 2, indistinguishable from faint genuine peaks -- but
+    # honouring them would punch a chain of cleared craters and protection
+    # disks along the edge and dissolve the very mask this estimator
+    # exists to build.  The gate is geometric: the un-cleared static map's
+    # connected components under the peak's core must fit within 4x the
+    # protected radius.  Components are measured after a morphological
+    # closing at the map's own correlation length (2*smooth_sigma): a
+    # noisy edge is a chain of fragments -- each innocently compact --
+    # broken at the noise scale, so closing fuses one structure back
+    # together, while real separations (adjacent Laue-arc reflections,
+    # ~20-40 px apart) stay separate.  The full dilation would be wrong
+    # here: at dilate_px=8 it bridged speckle into panel-spanning blobs
+    # and the gate refused the forward-bank arcs wholesale.  Measured on
+    # l1-mbl the split is bimodal: compact peak leaks reach ~0.8x of the
+    # gate at the 90th percentile, edge components sit at 4-12x with
+    # extents of 200-500 px.
+    #
+    # The gate and the radii need the texture threshold, which is measured
+    # from the map itself -- so the reduction runs twice: an *uncleared*
+    # pass sets the threshold and exposes the structure the gate inspects,
+    # then the accepted footprints leave the evidence and the criteria run
+    # on the cleaned map.
     rr = cc = None
+    kept = None
     radii = None
     if clear_disks is not None:
         rr, cc = np.mgrid[0 : stack.shape[1], 0 : stack.shape[2]]
-        radii = [
-            [clear_nsigmas * sig + 2.0 * smooth_sigma for _r, _c, sig, _a in disks]
-            for disks in clear_disks
-        ]
-        smooth, valid = _reduce(radii)
-        _, _, thr0 = _threshold(smooth, valid)
-        aware = [
-            [
-                max(
-                    blind,
-                    _tail_radius(sig, amp, float(scales[fi].squeeze()), thr0)
-                    + 2.0 * smooth_sigma,
+        smooth0, valid0 = _reduce(None, None)
+        ambient0, band0, thr0 = _threshold(smooth0, valid0)
+        bad0 = ndimage.binary_closing(
+            _criteria(ambient0, band0, thr0),
+            iterations=int(np.ceil(2.0 * smooth_sigma)),
+        )
+        lab0, n0 = ndimage.label(bad0)
+        extents = np.zeros(n0 + 1)
+        for i, sl in enumerate(ndimage.find_objects(lab0), start=1):
+            if sl is not None:
+                extents[i] = max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start)
+        H, W = lab0.shape
+        kept, radii = [], []
+        for fi, disks in enumerate(clear_disks):
+            scale = float(scales[fi].squeeze())
+            kept_disks, kept_radii = [], []
+            for r0, c0, sig, amp in disks:
+                rad = max(
+                    clear_nsigmas * sig + 2.0 * smooth_sigma,
+                    _tail_radius(sig, amp, scale, thr0) + 2.0 * smooth_sigma,
                 )
-                for (_r, _c, sig, amp), blind in zip(disks, radii[fi])
-            ]
-            for fi, disks in enumerate(clear_disks)
-        ]
-        grew = any(a > b + 0.5 for fa, fb in zip(aware, radii) for a, b in zip(fa, fb))
-        radii = aware
-        if grew:
-            smooth, valid = _reduce(radii)
+                core = int(np.ceil(clear_nsigmas * sig))
+                lo_r, hi_r = max(0, int(r0) - core), min(H, int(r0) + core + 1)
+                lo_c, hi_c = max(0, int(c0) - core), min(W, int(c0) + core + 1)
+                d2 = (np.arange(lo_r, hi_r)[:, None] - r0) ** 2 + (
+                    np.arange(lo_c, hi_c)[None, :] - c0
+                ) ** 2
+                comps = np.unique(
+                    lab0[lo_r:hi_r, lo_c:hi_c][d2 <= (clear_nsigmas * sig) ** 2]
+                )
+                if any(extents[k] > 4.0 * rad for k in comps if k > 0):
+                    continue
+                kept_disks.append((r0, c0, sig, amp))
+                kept_radii.append(rad)
+            kept.append(kept_disks)
+            radii.append(kept_radii)
+        smooth, valid = _reduce(kept, radii)
     else:
-        smooth, valid = _reduce(None)
+        smooth, valid = _reduce(None, None)
 
     ambient, band, texture_threshold = _threshold(smooth, valid)
-    # Positive lobes only.  False peaks are *positive* unmodelled structure;
-    # |band| would additionally mask the negative moat that the wide
-    # subtraction digs around anything bright -- a ~wide_sigma-to-2*wide_sigma
-    # ring, which on the forward banks turned every leak into a ~20 px
-    # exclusion zone around a genuine reflection.
-    texture = band > texture_threshold
-
-    # Steps also announce themselves as band-pass gradients; MADs alone are
-    # a pure significance test whose floor on a flat panel is noise, so the
-    # physical floor (gradient per pixel as a fraction of ambient) guards
-    # it: the l1-mbl illumination boundary runs ~3% of ambient per pixel.
-    gy, gx = np.gradient(band)
-    grad = np.hypot(gy, gx)
-    grad_mad = np.median(np.abs(grad - np.median(grad))) + 1e-9
-    # Restricted to the positive side of the band: false atoms form on
-    # positive residual structure.  The negative moat that the wide
-    # subtraction digs around anything bright has gradients too, and
-    # without this restriction they masked a ring around every static
-    # spot.
-    boundary = (
-        (np.abs(grad - np.median(grad)) > grad_nmads * grad_mad)
-        & (grad > grad_min_frac * ambient)
-        & (band > 0.0)
-    )
-
-    bad = boundary | texture
+    bad = _criteria(ambient, band, texture_threshold)
     if dilate_px > 0:
         bad = ndimage.binary_dilation(bad, iterations=int(dilate_px))
 
     # Exoneration must also *protect the final mask*.  The evidence clearing
     # above removes the tails at their source, but a peak certified in only
-    # some frames still leaks through the others' quantile, and the pass-1
-    # threshold the clearing radii were computed against can sit slightly
-    # above the final one.  The protected radius is the cleared radius plus
-    # the dilation the bad set just received, recomputed against the final
-    # threshold, and it is subtracted *after* dilation so nothing grows
-    # back in.  A certified reflection's footprint is then never masked,
-    # however bright.
-    if clear_disks is not None:
+    # some frames still leaks through the others' quantile, and the
+    # uncleared-pass threshold the clearing radii were computed against can
+    # sit slightly above the final one.  The protected radius is the cleared
+    # radius plus the dilation the bad set just received, recomputed against
+    # the final threshold, and it is subtracted *after* dilation so nothing
+    # grows back in.  An accepted certificate's footprint is then never
+    # masked, however bright.
+    if kept is not None:
         protected = np.zeros_like(bad)
-        for fi, disks in enumerate(clear_disks):
+        for fi, disks in enumerate(kept):
             scale = float(scales[fi].squeeze())
             for (r0, c0, sig, amp), cleared in zip(disks, radii[fi]):
                 r_tail = _tail_radius(sig, amp, scale, texture_threshold)
@@ -494,6 +533,7 @@ def _confident_pooled_peaks(
     peaks_path: str | Path,
     deviance_min: float,
     residual_max: float,
+    n_by_bank: dict[int, int],
 ) -> dict[int, list[tuple[float, float, float, float]]]:
     """Per physical bank: certified peaks of a finder run on summed frames.
 
@@ -509,9 +549,20 @@ def _confident_pooled_peaks(
     overestimate only for moving peaks, which the quantile never masks and
     which therefore cost nothing to over-protect).
 
-    The certificate is the same as per-frame; the bank comes from the
-    finder's own per-peak ``bank`` dataset, so the pooled file needs no
-    companion to interpret.
+    The evidence bar is the same as per-frame -- pooling the evidence is the
+    point -- but the *shape* bar must transfer.  Residual deviance per DoF
+    is one for a correct model regardless of counts, while its mismatch
+    component grows linearly with them: E[res/DoF] ~ 1 + eps^2 * counts.
+    Summing n frames multiplies the counts by n, so a bright genuine peak
+    whose per-frame residual is a comfortable 1.1 blows past a fixed bar of
+    2 on the pooled fit -- goodness of fit gets *stricter* with statistics,
+    and the pooled bootstrap was stripping exactly the strong reflections
+    it was meant to keep.  The bar therefore scales as
+    1 + (residual_max - 1) * n_bank, which preserves the discrimination:
+    an artifact's per-frame ~3.5 scales to ~1 + 2.5 n, far above it.
+
+    The bank comes from the finder's own per-peak ``bank`` dataset, so the
+    pooled file needs no companion to interpret.
     """
     out: dict[int, list[tuple[float, float, float, float]]] = {}
     with h5py.File(peaks_path, "r") as f:
@@ -527,7 +578,9 @@ def _confident_pooled_peaks(
         flux = np.asarray(f["peaks/intensity"][()], dtype=float)
         dev = np.asarray(f["peaks/deviance"][()], dtype=float)
         res = np.asarray(f["peaks/residual_deviance"][()], dtype=float)
-    confident = (dev > deviance_min) & (res < residual_max)
+    n_frames = np.array([n_by_bank.get(int(b), 1) for b in bank], dtype=float)
+    residual_bar = 1.0 + (residual_max - 1.0) * np.maximum(n_frames, 1.0)
+    confident = (dev > deviance_min) & (res < residual_bar)
     for i in np.nonzero(confident)[0]:
         s_i = max(float(sigma[i]), 1.0)
         amp = max(float(flux[i]), 0.0) / (2.0 * np.pi * s_i**2)
@@ -597,6 +650,7 @@ def build_mask_file(
             pooled_peaks,
             peak_deviance_min,
             peak_residual_max,
+            {b: len(fr) for b, fr in by_bank.items()},
         )
 
     banks = sorted(by_bank)

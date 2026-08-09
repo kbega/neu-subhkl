@@ -526,7 +526,11 @@ def test_pooled_peaks_rescue_a_subthreshold_static_peak(tmp_path):
     assert m0[38:43, 28:33].mean() < 0.5
 
     # The pooled certificate: one detection, bank-addressed, with the summed
-    # flux and a deviance only the pooled fit could reach.
+    # flux and a deviance only the pooled fit could reach.  Residual 8.0 is
+    # deliberate: goodness of fit gets stricter with counts (its mismatch
+    # component scales with them), so a genuine peak's per-frame ~1.1 lands
+    # well above a naive bar of 2 on the tenfold sum.  The scaled bar
+    # 1 + (residual_max - 1) * n = 11 must admit it.
     with h5py.File(tmp_path / "pooled.h5", "w") as f:
         f["bank"] = np.array([4])
         f["peaks/image_index"] = np.array([0])
@@ -535,7 +539,7 @@ def test_pooled_peaks_rescue_a_subthreshold_static_peak(tmp_path):
         f["peaks/sigma"] = np.array([sigma_pk])
         f["peaks/intensity"] = np.array([55.0 * n_frames])
         f["peaks/deviance"] = np.array([60.0])
-        f["peaks/residual_deviance"] = np.array([1.1])
+        f["peaks/residual_deviance"] = np.array([8.0])
 
     summary = build_mask_file(
         [tmp_path / "scan.h5"],
@@ -552,7 +556,9 @@ def test_pooled_peaks_rescue_a_subthreshold_static_peak(tmp_path):
         assert f.attrs["pooled_peaks"] == str(tmp_path / "pooled.h5")
         assert f.attrs["n_exonerated_pooled"] == 1
 
-    # A pooled certificate with an artifact's shape rescues nothing.
+    # A pooled certificate with an artifact's shape rescues nothing: a
+    # per-frame residual of ~3.5 scales to ~1 + 2.5 n = 26 on the sum,
+    # above the scaled bar of 11.
     with h5py.File(tmp_path / "pooled_bad.h5", "w") as f:
         f["bank"] = np.array([4])
         f["peaks/image_index"] = np.array([0])
@@ -561,7 +567,7 @@ def test_pooled_peaks_rescue_a_subthreshold_static_peak(tmp_path):
         f["peaks/sigma"] = np.array([sigma_pk])
         f["peaks/intensity"] = np.array([55.0 * n_frames])
         f["peaks/deviance"] = np.array([60.0])
-        f["peaks/residual_deviance"] = np.array([3.5])
+        f["peaks/residual_deviance"] = np.array([26.0])
     build_mask_file(
         [tmp_path / "scan.h5"],
         tmp_path / "m2.h5",
@@ -570,6 +576,58 @@ def test_pooled_peaks_rescue_a_subthreshold_static_peak(tmp_path):
     )
     m2 = load_mask_for_banks(tmp_path / "m2.h5", [4], (size, size))[0]
     assert m2[38:43, 28:33].mean() < 0.5
+
+
+def test_a_certificate_on_extended_structure_is_refused(tmp_path):
+    """Exoneration is a statement about a peak, not the structure it sits on.
+
+    Detections along the illumination edge carry clean metrics -- measured
+    on l1-mbl at deviance 20+, residual/DoF < 2, indistinguishable from
+    faint genuine peaks -- and at the admission-level bar each would clear
+    an evidence crater and punch a protection disk; a chain of them
+    dissolves the edge mask.  The gate is geometric: a certificate explains
+    at most the peak's own amplitude-aware footprint, so a detection whose
+    underlying static component extends beyond 4x the protected radius is
+    refused, while the genuine compact peak next to it keeps its rescue."""
+    rng = np.random.default_rng(61)
+    size, step_col, sigma_pk = 128, 80, 2.0
+    peak = pixel_integrated_gaussian((size, size), 40.0, 30.0, sigma_pk, 800.0)
+    frames = []
+    for _ in range(10):
+        rate = np.full((size, size), 2.2)
+        rate[:, step_col:] = 0.6
+        rate += peak
+        frames.append(rng.poisson(rate).astype(np.float32))
+    with h5py.File(tmp_path / "scan.h5", "w") as f:
+        f["images"] = np.stack(frames)
+        f["bank_ids"] = np.full(10, 4)
+        f["goniometer/angles"] = np.c_[np.arange(10.0), np.zeros(10)]
+
+    # Every frame certifies BOTH the genuine peak and a detection sitting on
+    # the illumination edge, with identical (clean) metrics.
+    with h5py.File(tmp_path / "peaks.h5", "w") as f:
+        n = 20
+        f["peaks/image_index"] = np.repeat(np.arange(10), 2)
+        f["peaks/pixel_r"] = np.tile([40.0, 64.0], 10)
+        f["peaks/pixel_c"] = np.tile([30.0, float(step_col)], 10)
+        f["peaks/sigma"] = np.full(n, sigma_pk)
+        f["peaks/intensity"] = np.full(n, 800.0 * 2 * np.pi * sigma_pk**2)
+        f["peaks/deviance"] = np.full(n, 120.0)
+        f["peaks/residual_deviance"] = np.full(n, 1.1)
+
+    build_mask_file(
+        [tmp_path / "scan.h5"],
+        tmp_path / "m.h5",
+        peaks=[tmp_path / "peaks.h5"],
+        dilate_px=4,
+    )
+    m = load_mask_for_banks(tmp_path / "m.h5", [4], (size, size))[0]
+    # The genuine peak keeps its rescue ...
+    assert m[36:44, 26:34].mean() > 0.9
+    # ... and the edge keeps its mask, including where the refused
+    # certificate would have cleared and protected it.
+    assert m[:, 76:80].mean() < 0.2
+    assert m[56:72, 76:80].mean() < 0.2
 
 
 def test_peaks_must_pair_with_inputs(tmp_path):
