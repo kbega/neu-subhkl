@@ -172,7 +172,30 @@ def prepare_harvest_tasks(
                 chunk_size=harvest_peaks_kwargs.get("chunk_size", 64),
                 multi_gpu=harvest_peaks_kwargs.get("multi_gpu", False),
             )
-        batch_coords = alg.find_peaks_batch(img_stack)
+        # A static-structure mask (see subhkl.search.static_mask) is mapped
+        # onto the input by *physical* bank, so a mask built from any scans of
+        # this instrument -- different sample included -- applies here, and a
+        # bank the mask file does not carry runs unmasked.
+        valid_stack = None
+        static_mask_file = harvest_peaks_kwargs.get("static_mask_file")
+        if static_mask_file and isinstance(alg, MatrixFreeSparseRBFPeakFinder):
+            from subhkl.search.static_mask import load_mask_for_banks
+
+            valid_stack = load_mask_for_banks(
+                static_mask_file,
+                [bank_mapping.get(k, k) for k in img_keys],
+                img_stack.shape[1:],
+            )
+        elif static_mask_file:
+            print(
+                "WARNING: --static-mask-file is only honored by the "
+                "matrix-free finder; the legacy path ignores it."
+            )
+
+        if valid_stack is not None:
+            batch_coords = alg.find_peaks_batch(img_stack, valid=valid_stack)
+        else:
+            batch_coords = alg.find_peaks_batch(img_stack)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}
         # Per-peak quality metrics, when the finder reports them (the
         # matrix-free finder does; the legacy greedy one does not).

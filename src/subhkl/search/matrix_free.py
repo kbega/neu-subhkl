@@ -1244,10 +1244,28 @@ class MatrixFreeSparseRBFPeakFinder:
         )
 
     @partial(jit, static_argnames=["self", "max_iter"])
-    def _solve_ssn_cg_global(self, y_img, bg_img, max_iter=100):
+    def _solve_ssn_cg_global(self, y_img, bg_img, valid_img=None, max_iter=100):
         H, W = y_img.shape
         y = y_img[None, None, :, :]
         bg = bg_img[None, None, :, :]
+
+        # Optional per-pixel validity (1 = usable, 0 = masked).  Masked pixels
+        # are *missing data*, which is a different thing from zero counts: a
+        # zero-count pixel is an observation ("nothing arrived") and keeps its
+        # model-mass term, while a masked pixel must contribute nothing to any
+        # term -- data, mass, curvature or skewness.  Zeroing the counts
+        # instead would both bias amplitudes down and manufacture a step edge,
+        # which is exactly the artifact class the mask exists to remove.
+        # Every per-pixel field below therefore passes through ``vw``; with no
+        # mask (valid_img is None, a distinct trace) the path is untouched.
+        V = (
+            None
+            if valid_img is None
+            else valid_img[None, None, :, :].astype(jnp.float32)
+        )
+
+        def vw(field):
+            return field if V is None else V * field
 
         # Channel count from the bank itself: with shape variants the bank
         # carries num_sigmas * n_shapes channels while ``num_sigmas`` keeps
@@ -1260,9 +1278,9 @@ class MatrixFreeSparseRBFPeakFinder:
 
         # 1. Exact Spatially Varying Variance Map & Lipschitz Bounds
         if self.loss == "gaussian":
-            W_ref = jnp.ones_like(bg)
+            W_ref = vw(jnp.ones_like(bg))
         else:
-            W_ref = 1.0 / jnp.maximum(bg, 1e-3)
+            W_ref = vw(1.0 / jnp.maximum(bg, 1e-3))
 
         H_diag = self._adjoint_op(W_ref, self.K_sq)
         H_diag_safe = jnp.maximum(H_diag, 1e-6)
@@ -1288,6 +1306,14 @@ class MatrixFreeSparseRBFPeakFinder:
         border = self.max_k_rad + max(3, self.max_k_rad)
         H_int = max(H - 2 * border, 8)
         W_int = max(W - 2 * border, 8)
+        # With a validity mask the true test count is the *unmasked* interior
+        # area, which is smaller than H_int * W_int -- so using the full
+        # interior here overstates the multiplicity and sets the threshold
+        # slightly high.  That direction is safe (fewer false alarms than
+        # budgeted, never more), and for the masks this is built for (a few
+        # percent of a panel) the bias in z is under a percent; a per-image
+        # area would make the threshold a traced quantity for a correction
+        # that small.
         alpha_vec = self.effective_alpha(H_int, W_int)
 
         # 2. L1 penalty weight, in units of the objective rather than of the
@@ -1375,16 +1401,16 @@ class MatrixFreeSparseRBFPeakFinder:
         def get_loss_grad_hess(c_curr):
             u = self._forward_op(c_curr, self.K_weights) + bg
             if self.loss == "gaussian":
-                res = u - y
-                nll = 0.5 * jnp.sum(res**2)
+                res = vw(u - y)
+                nll = 0.5 * jnp.sum(vw((u - y) ** 2))
                 grad = self._adjoint_op(res, self.K_weights)
-                W_diag = jnp.ones_like(u)
+                W_diag = vw(jnp.ones_like(u))
             else:
                 u_safe = jnp.maximum(u, 1e-6)
-                nll = jnp.sum(u_safe - y * jnp.log(u_safe))
-                res_1d = 1.0 - (y / u_safe)
+                nll = jnp.sum(vw(u_safe - y * jnp.log(u_safe)))
+                res_1d = vw(1.0 - (y / u_safe))
                 grad = self._adjoint_op(res_1d, self.K_weights)
-                W_diag = 1.0 / jnp.maximum(u_safe, 1e-3)
+                W_diag = vw(1.0 / jnp.maximum(u_safe, 1e-3))
             return nll, grad, W_diag, u
 
         # Stop on the per-coordinate KKT residual max|G_i|/lam_i, i.e. when
@@ -1512,12 +1538,12 @@ class MatrixFreeSparseRBFPeakFinder:
                 u_test = self._forward_op(c_test, self.K_weights) + bg
                 if self.loss == "gaussian":
                     d_nll = 0.5 * jnp.sum(
-                        (u_test - u_curr) * ((u_test - y) + (u_curr - y))
+                        vw((u_test - u_curr) * ((u_test - y) + (u_curr - y)))
                     )
                 else:
                     u_c = jnp.maximum(u_curr, 1e-6)
                     du = jnp.maximum(u_test, 1e-6) - u_c
-                    d_nll = jnp.sum(du - y * jnp.log1p(du / u_c))
+                    d_nll = jnp.sum(vw(du - y * jnp.log1p(du / u_c)))
                 return d_nll + jnp.sum(lam * (c_test - c))
 
             def bt_cond(bt_state):
@@ -1595,8 +1621,10 @@ class MatrixFreeSparseRBFPeakFinder:
         # recession directions have slope lam_aug > 0), and the null
         # directions of the exact weight are resolved by deactivation rather
         # than damped through a blind metric.
-        P_mask = (y >= 1.0).astype(jnp.float32)
-        a0 = self._adjoint_op(1.0 - P_mask, self.K_weights)
+        # Masked pixels leave both sides: they are neither counted (P_mask)
+        # nor charged for model mass (a0) -- see the validity note at the top.
+        P_mask = vw((y >= 1.0).astype(jnp.float32))
+        a0 = self._adjoint_op(vw(jnp.ones_like(y)) - P_mask, self.K_weights)
         lam_aug = lam + a0
 
         def apn_grad(c_curr):
@@ -1700,7 +1728,7 @@ class MatrixFreeSparseRBFPeakFinder:
         return c_l1[0]
 
     @partial(jit, static_argnames=["self", "border"])
-    def _rank_support(self, c_tensor, border=0):
+    def _rank_support(self, c_tensor, border=0, valid=None):
         """Rank the significance-gated support of one image, capacity-free.
 
         Everything here is independent of how many peaks there are -- the
@@ -1743,6 +1771,13 @@ class MatrixFreeSparseRBFPeakFinder:
         # `> 0` admits exactly the maxima whose support cleared alpha.  An
         # epsilon here would be a second, hidden significance level.
         is_max = (c_smooth == c_max) & (c_smooth > 0.0)
+
+        # No candidate is admitted from inside a masked region.  The solve
+        # already starves masked atoms of both data and mass, but an atom
+        # centred just inside the mask can still collect flux from visible
+        # tail pixels; the veto keeps the mask's boundary semantics exact.
+        if valid is not None:
+            is_max = is_max & (valid > 0.0)
 
         # Discard maxima in the replicated border before ranking, not after.
         # The edge padding is a constant strip that the finest basis fits
@@ -2155,13 +2190,30 @@ class MatrixFreeSparseRBFPeakFinder:
             eig_silence[n] = np.linalg.eigvalsh(0.5 * (h_sil + h_sil.T))
         return eig_total, eig_silence
 
-    def find_peaks_batch(self, images_batch):
+    def find_peaks_batch(self, images_batch, valid=None):
         # Detector frames arrive as integer counts.  Everything below is a
         # convolution, and cuDNN will not lower an integer convolution, so the
         # cast is required rather than cosmetic: without it the background
         # estimate fails outright on real data.
         images_batch = np.asarray(images_batch, dtype=np.float32)
         B, H, W = images_batch.shape
+
+        # Optional per-image validity stack (1 = usable, 0 = masked), e.g. a
+        # static-structure mask bank-mapped by the caller (see
+        # subhkl.search.static_mask).  It enters the solve as missing data --
+        # the counts are never modified -- and vetoes extraction inside the
+        # masked region.  The background/census estimators above the solve
+        # still see every pixel; the mask's dilation is what keeps their
+        # local statistics from leaning on the structure.
+        if valid is not None:
+            valid = np.asarray(valid, dtype=np.float32)
+            if valid.shape != images_batch.shape:
+                raise ValueError(
+                    f"valid mask shape {valid.shape} does not match the "
+                    f"image stack {images_batch.shape}"
+                )
+            if valid.min() >= 1.0:
+                valid = None  # fully valid: keep the unmasked (and untraced) path
 
         # Odd, as the greedy path already forces it (sparse_rbf.py).  An even
         # window has no centre pixel: the old exact filter then returned an
@@ -2353,6 +2405,14 @@ class MatrixFreeSparseRBFPeakFinder:
         bg_padded = jnp.pad(
             bg_map, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)), mode="edge"
         )
+        # Same edge padding as the image: a masked strip that reaches the
+        # frame edge stays masked in its replicated border, and an unmasked
+        # edge keeps today's padded-pixel behaviour.
+        valid_padded = (
+            None
+            if valid is None
+            else jnp.pad(valid, ((0, 0), (pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+        )
 
         results = []
         rejected_counts = []
@@ -2422,7 +2482,12 @@ class MatrixFreeSparseRBFPeakFinder:
                     f"  > dispatching solve chunks of {solve_chunk} images "
                     f"as {n_dev} independent per-device solves"
                 )
-        solve_batch = jax.jit(jax.vmap(self._solve_ssn_cg_global))
+        if valid is None:
+            solve_batch = jax.jit(jax.vmap(self._solve_ssn_cg_global))
+        else:
+            solve_batch = jax.jit(
+                jax.vmap(lambda im, bgi, vi: self._solve_ssn_cg_global(im, bgi, vi))
+            )
         # One dispatch thread per device, and not as an optimisation: the
         # solver is built on lax.while_loop, and XLA:GPU has no device-side
         # control flow, so each iteration copies the loop predicate back to
@@ -2442,6 +2507,11 @@ class MatrixFreeSparseRBFPeakFinder:
             if n_dev > 1:
                 imgs = device_util.pad_to_multiple(images_padded[start:stop], n_dev)
                 bgs = device_util.pad_to_multiple(bg_padded[start:stop], n_dev)
+                vlds = (
+                    None
+                    if valid_padded is None
+                    else device_util.pad_to_multiple(valid_padded[start:stop], n_dev)
+                )
                 per_device = int(imgs.shape[0]) // n_dev
                 # Enqueue every slice-and-transfer before handing the solves
                 # to the pool: the chunk arrays live on the default device,
@@ -2450,25 +2520,25 @@ class MatrixFreeSparseRBFPeakFinder:
                 pieces = []
                 for d, device in enumerate(devices):
                     piece = slice(d * per_device, (d + 1) * per_device)
-                    pieces.append(
-                        (
-                            jax.device_put(imgs[piece], device),
-                            jax.device_put(bgs[piece], device),
-                        )
-                    )
+                    args = [
+                        jax.device_put(imgs[piece], device),
+                        jax.device_put(bgs[piece], device),
+                    ]
+                    if vlds is not None:
+                        args.append(jax.device_put(vlds[piece], device))
+                    pieces.append(args)
                 parts = [
                     f.result()
-                    for f in [
-                        solve_pool.submit(solve_batch, im, bg) for im, bg in pieces
-                    ]
+                    for f in [solve_pool.submit(solve_batch, *args) for args in pieces]
                 ]
 
                 def coeff(local, _parts=parts, _per=per_device):
                     return _parts[local // _per][local % _per]
             else:
-                c_tensors = solve_batch(
-                    images_padded[start:stop], bg_padded[start:stop]
-                )
+                args = [images_padded[start:stop], bg_padded[start:stop]]
+                if valid_padded is not None:
+                    args.append(valid_padded[start:stop])
+                c_tensors = solve_batch(*args)
 
                 def coeff(local, _c=c_tensors):
                     return _c[local]
@@ -2488,7 +2558,14 @@ class MatrixFreeSparseRBFPeakFinder:
             # refinement before pulling any result, fills both device queues
             # and lets the pulls drain them in order.
             tensors = [coeff(local) for local in range(stop - start)]
-            ranked = [self._rank_support(c, border=pad_y + MARGIN) for c in tensors]
+            ranked = [
+                self._rank_support(
+                    c,
+                    border=pad_y + MARGIN,
+                    valid=None if valid_padded is None else valid_padded[start + local],
+                )
+                for local, c in enumerate(tensors)
+            ]
             states = [
                 self._extract_dispatch(
                     c, images_padded[start + local], bg_padded[start + local], r

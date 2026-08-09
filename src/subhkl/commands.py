@@ -756,6 +756,7 @@ def run_finder(
     sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",
     max_workers: int = 16,
     multi_gpu: bool = False,
+    static_mask_file: str | None = None,
 ):
     print(f"Creating peaks from {filename} for instrument {instrument}")
 
@@ -803,6 +804,7 @@ def run_finder(
                 "shape_orientations": sparse_rbf_shape_orientations,
                 "chunk_size": sparse_rbf_chunk_size,
                 "multi_gpu": multi_gpu,
+                "static_mask_file": static_mask_file,
                 "show_steps": show_steps,
                 "show_scale": "linear",
                 "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
@@ -1794,3 +1796,42 @@ def run_integrator_visualize(
     )
     print(f"Wrote {len(written)} plot(s).")
     return written
+
+
+def run_static_mask(
+    output_filename: str,
+    input_filenames: list[str],
+    min_frames: int = 5,
+    smooth_sigma: float = 2.0,
+    grad_nmads: float = 8.0,
+    glow_factor: float = 2.0,
+    dilate_px: int = 8,
+):
+    """Build a static-structure mask from reduced/merged frame stacks.
+
+    See subhkl.search.static_mask for the estimator; the output is itself a
+    reduced single-frame stack (1 = valid, 0 = masked, one frame per physical
+    bank), so any tool that reads reduced files can display it, and the
+    finder maps it onto its input by bank id (--static-mask-file).
+    """
+    from subhkl.search.static_mask import build_mask_file
+
+    summary = build_mask_file(
+        input_filenames,
+        output_filename,
+        min_frames=min_frames,
+        smooth_sigma=smooth_sigma,
+        grad_nmads=grad_nmads,
+        glow_factor=glow_factor,
+        dilate_px=dilate_px,
+    )
+    print(
+        f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "
+        f"{100 * summary['masked_fraction']:.2f}% of pixels masked."
+    )
+    if summary["thin_banks"]:
+        print(
+            f"Banks with fewer than {min_frames} frames stay fully valid: "
+            + ", ".join(str(b) for b in summary["thin_banks"])
+        )
+    return summary

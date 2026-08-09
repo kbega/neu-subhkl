@@ -22,6 +22,7 @@ from subhkl.commands import (
     run_zone_axis_search,
     run_finder_visualize,
     run_integrator_visualize,
+    run_static_mask,
 )
 
 
@@ -222,6 +223,16 @@ def finder(
             "CUDA_VISIBLE_DEVICES.",
         ),
     ] = False,
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(
+            "--static-mask-file",
+            help="Static-structure mask built by `static-mask`, mapped onto "
+            "the input by physical bank.  Masked pixels enter the solve as "
+            "missing data (the counts are never modified) and no peak is "
+            "reported from inside the mask.",
+        ),
+    ] = None,
 ):
     if not multi_gpu:
         restrict_to_first_device()
@@ -272,6 +283,7 @@ def finder(
         sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
         max_workers=max_workers,
         multi_gpu=multi_gpu,
+        static_mask_file=static_mask_file,
     )
 
 
@@ -907,6 +919,73 @@ def integrator_visualize(
         n_sigma=n_sigma,
         max_workers=max_workers,
         show_progress=show_progress,
+    )
+
+
+@app.command()
+def static_mask(
+    output_filename: Annotated[str, typer.Argument(help="Mask HDF5 to write")],
+    input_filenames: Annotated[
+        list[str],
+        typer.Argument(
+            help="Reduced/merged HDF5 stacks (images + bank_ids).  Any "
+            "number of files, any samples -- what matters is that they come "
+            "from the same instrument configuration, because the estimator "
+            "keeps what never moves."
+        ),
+    ],
+    min_frames: Annotated[
+        int,
+        typer.Option(
+            help="Banks with fewer frames than this across all inputs stay "
+            "fully valid (and are reported): statistics too thin to tell a "
+            "peak from a shadow must not silently mask either."
+        ),
+    ] = 5,
+    smooth_sigma: Annotated[
+        float, typer.Option(help="Gaussian smoothing of the per-bank median, px.")
+    ] = 2.0,
+    grad_nmads: Annotated[
+        float,
+        typer.Option(
+            help="Boundary criterion: mask where the smoothed median's "
+            "gradient exceeds this many MADs of the panel-wide gradient "
+            "(illumination edges, beam-stop shadows)."
+        ),
+    ] = 8.0,
+    glow_factor: Annotated[
+        float,
+        typer.Option(
+            help="Level criterion: mask where the smoothed median exceeds "
+            "this multiple of the panel's ambient rate (static glow)."
+        ),
+    ] = 2.0,
+    dilate_px: Annotated[
+        int,
+        typer.Option(
+            help="Dilation of the masked region, px.  Size it to an atom "
+            "footprint (~2x the finder's max sigma) so atoms whose tails "
+            "rest on the structure are covered."
+        ),
+    ] = 8,
+):
+    """Build a static-structure mask from frame stacks of one instrument.
+
+    Beam-stop shadows, illumination boundaries and instrument glow are fixed
+    in the detector frame while Bragg peaks move with the sample, so the
+    per-bank median across enough frames contains the artifacts and none of
+    the crystal.  The output is itself a reduced single-frame stack (uint8,
+    1 = valid, one frame per physical bank); feed it to the finder as
+    --static-mask-file, which maps it onto its input by bank id.
+    """
+    run_static_mask(
+        output_filename=output_filename,
+        input_filenames=list(input_filenames),
+        min_frames=min_frames,
+        smooth_sigma=smooth_sigma,
+        grad_nmads=grad_nmads,
+        glow_factor=glow_factor,
+        dilate_px=dilate_px,
     )
 
 
