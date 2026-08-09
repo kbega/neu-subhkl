@@ -23,6 +23,7 @@ from subhkl.commands import (
     run_finder_visualize,
     run_integrator_visualize,
     run_static_mask,
+    run_sum_images,
     run_mask_visualize,
 )
 
@@ -958,6 +959,18 @@ def static_mask(
             "static however many frames it persists through.",
         ),
     ] = None,
+    pooled_peaks: Annotated[
+        Optional[str],
+        typer.Option(
+            "--pooled-peaks",
+            help="Finder output from a run on the per-bank *summed* stack "
+            "(see `sum-images`).  Certified detections are exonerated in "
+            "every frame of their bank: significance compounds across "
+            "frames in the pooled fit, rescuing quasi-static reflections "
+            "too faint for any single frame's certificate -- which the "
+            "static map, pooling the same frames, would otherwise mask.",
+        ),
+    ] = None,
     peak_deviance_min: Annotated[
         float,
         typer.Option(
@@ -1061,6 +1074,7 @@ def static_mask(
         output_filename=output_filename,
         input_filenames=list(input_filenames),
         peaks_filenames=list(peaks) if peaks else None,
+        pooled_peaks_filename=pooled_peaks,
         peak_deviance_min=peak_deviance_min,
         peak_residual_max=peak_residual_max,
         peak_clear_nsigmas=peak_clear_nsigmas,
@@ -1072,6 +1086,33 @@ def static_mask(
         dilate_px=dilate_px,
         static_quantile=static_quantile,
         grad_min_frac=grad_min_frac,
+    )
+
+
+@app.command()
+def sum_images(
+    output_filename: Annotated[str, typer.Argument(help="Summed HDF5 to write")],
+    input_filenames: Annotated[
+        list[str],
+        typer.Argument(
+            help="Reduced/merged HDF5 stacks (images + bank_ids), the same "
+            "inputs `static-mask` will see."
+        ),
+    ],
+):
+    """Sum each bank's deduplicated frames into a one-frame-per-bank stack.
+
+    The companion of `static-mask`: run the finder on the summed stack and
+    pass its output back as --pooled-peaks.  Deviance is additive across
+    frames, so a quasi-static reflection sitting just below every single
+    frame's admission level -- bright enough for the static map to mask,
+    too faint for any per-frame certificate -- compounds to certification
+    in the pooled fit.  Goniometer angles in the output are placeholders;
+    the file exists for peak metrics only, never for indexing.
+    """
+    run_sum_images(
+        output_filename=output_filename,
+        input_filenames=list(input_filenames),
     )
 
 

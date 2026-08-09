@@ -373,6 +373,76 @@ def _same_scene(sig_a: tuple, sig_b: tuple) -> bool:
     return float(z.max()) < 6.0
 
 
+def _first_instrument(inputs: list) -> str | None:
+    """The instrument the first input that knows one records."""
+    for path in inputs:
+        with h5py.File(path, "r") as f_in:
+            recorded = f_in.attrs.get("instrument")
+        if isinstance(recorded, bytes):
+            recorded = recorded.decode("utf-8")
+        if recorded:
+            return recorded
+    return None
+
+
+def build_summed_file(inputs: list[str | Path], output: str | Path) -> dict:
+    """One frame per physical bank: the sum of its deduplicated frames.
+
+    The companion input to the exoneration: a finder run on this stack sees
+    the *pooled* evidence, exactly as the static-map quantile does.  Per-peak
+    deviance is additive across frames, so a quasi-static reflection sitting
+    just below any single frame's admission level compounds to certification
+    here (~n_frames-fold in deviance), and the pooled fit's width knows the
+    frame-to-frame wobble the single-frame fits cannot.  Feed the resulting
+    peaks file to ``build_mask_file`` as ``pooled_peaks``.
+
+    Frames pass through the same per-bank deduplication as the mask
+    estimator, so the pooled statistics describe exactly the evidence the
+    mask is built from.  The structural metadata a finder needs
+    (instrument/wavelength, sample, goniometer axes) is copied from the
+    first input; per-frame goniometer angles are meaningless for a sum and
+    are written as zeros, so this file is for peak *metrics* only -- never
+    index from it.
+    """
+    paths = [Path(p) for p in inputs]
+    by_bank, duplicates, _ = _read_frames_by_bank(paths)
+    if not by_bank:
+        raise ValueError("no frames found in the inputs")
+    banks = sorted(by_bank)
+    sums = np.stack([np.sum(by_bank[b], axis=0) for b in banks])
+    n_frames = [len(by_bank[b]) for b in banks]
+
+    instrument = _first_instrument(paths)
+    with h5py.File(output, "w") as f:
+        f.create_dataset("images", data=sums, compression="gzip", compression_opts=4)
+        f["bank_ids"] = np.asarray(banks, dtype=np.int64)
+        f.attrs["kind"] = "summed-frames"
+        f.attrs["inputs"] = [str(p) for p in paths]
+        f.attrs["n_frames"] = np.asarray(n_frames, dtype=np.int64)
+        if instrument:
+            f.attrs["instrument"] = instrument
+        with h5py.File(paths[0], "r") as f_in:
+            for key in (
+                "instrument/wavelength",
+                "sample",
+                "goniometer/axes",
+                "goniometer/names",
+            ):
+                if key in f_in:
+                    group, _, leaf = key.rpartition("/")
+                    dest = f.require_group(group) if group else f
+                    f_in.copy(key, dest, name=leaf)
+            if "goniometer/angles" in f_in:
+                width = f_in["goniometer/angles"].shape[1:]
+                f["goniometer/angles"] = np.zeros((len(banks), *width))
+    return {
+        "banks": banks,
+        "n_frames": dict(zip(banks, n_frames)),
+        "duplicates_dropped": duplicates,
+        "output": str(output),
+    }
+
+
 # chi^2_4 at 95%: the admission level for a four-parameter atom.  The
 # exoneration bar sits here, not above it: the finder's reported peaks
 # already passed a *calibrated* panel-wide false-alarm control (E[FP] per
@@ -420,11 +490,57 @@ def _confident_peaks_by_frame(
     return out
 
 
+def _confident_pooled_peaks(
+    peaks_path: str | Path,
+    deviance_min: float,
+    residual_max: float,
+) -> dict[int, list[tuple[float, float, float, float]]]:
+    """Per physical bank: certified peaks of a finder run on summed frames.
+
+    Per-frame certification cannot see what the mask sees: the static map
+    pools ~n frames of evidence, so a quasi-static reflection just below
+    every single frame's admission level is masked with no route to
+    exoneration.  A finder run on the per-bank *sum* (see
+    ``build_summed_file``) closes the asymmetry -- deviance is additive, so
+    the same peak compounds ~n-fold there -- and its certified detections
+    are exonerated in every frame of their bank.  The amplitude recorded
+    here is the pooled one; the caller rescales by the bank's frame count
+    to recover the per-frame amplitude (exact for a static feature, an
+    overestimate only for moving peaks, which the quantile never masks and
+    which therefore cost nothing to over-protect).
+
+    The certificate is the same as per-frame; the bank comes from the
+    finder's own per-peak ``bank`` dataset, so the pooled file needs no
+    companion to interpret.
+    """
+    out: dict[int, list[tuple[float, float, float, float]]] = {}
+    with h5py.File(peaks_path, "r") as f:
+        if "bank" not in f:
+            raise ValueError(
+                f"{peaks_path}: pooled peaks need a per-peak 'bank' dataset "
+                "(a finder output has one)"
+            )
+        bank = np.asarray(f["bank"][()]).astype(int)
+        r = np.asarray(f["peaks/pixel_r"][()], dtype=float)
+        c = np.asarray(f["peaks/pixel_c"][()], dtype=float)
+        sigma = np.asarray(f["peaks/sigma"][()], dtype=float)
+        flux = np.asarray(f["peaks/intensity"][()], dtype=float)
+        dev = np.asarray(f["peaks/deviance"][()], dtype=float)
+        res = np.asarray(f["peaks/residual_deviance"][()], dtype=float)
+    confident = (dev > deviance_min) & (res < residual_max)
+    for i in np.nonzero(confident)[0]:
+        s_i = max(float(sigma[i]), 1.0)
+        amp = max(float(flux[i]), 0.0) / (2.0 * np.pi * s_i**2)
+        out.setdefault(int(bank[i]), []).append((float(r[i]), float(c[i]), s_i, amp))
+    return out
+
+
 def build_mask_file(
     inputs: list[str | Path],
     output: str | Path,
     *,
     peaks: list[str | Path] | None = None,
+    pooled_peaks: str | Path | None = None,
     peak_deviance_min: float = CHI2_4_P95,
     peak_residual_max: float = 2.0,
     peak_clear_nsigmas: float = 3.5,
@@ -447,10 +563,14 @@ def build_mask_file(
     metrics certify them as genuine: their footprints leave the static
     evidence per frame, so a reflection cannot be declared static however
     many frames it persists through -- which quasi-static Laue zones from a
-    manually oriented crystal otherwise are.  A bank with fewer than
-    ``min_frames`` frames gets a fully valid mask -- stated in the summary
-    rather than silently guessed from statistics too thin to tell a peak
-    from a shadow.
+    manually oriented crystal otherwise are.  ``pooled_peaks`` (a finder
+    output from the per-bank *summed* stack, see ``build_summed_file``)
+    extends the same rescue to reflections too faint for any single frame's
+    certificate: their significance compounds across frames there, and a
+    certified pooled peak is exonerated in every frame of its bank.  A bank
+    with fewer than ``min_frames`` frames gets a fully valid mask -- stated
+    in the summary rather than silently guessed from statistics too thin to
+    tell a peak from a shadow.
     """
     if peaks is not None and len(peaks) != len(inputs):
         raise ValueError(
@@ -470,6 +590,14 @@ def build_mask_file(
                 peak_deviance_min,
                 peak_residual_max,
             )
+    pooled: dict[int, list] = {}
+    n_exonerated_pooled = 0
+    if pooled_peaks is not None:
+        pooled = _confident_pooled_peaks(
+            pooled_peaks,
+            peak_deviance_min,
+            peak_residual_max,
+        )
 
     banks = sorted(by_bank)
     masks, thin = [], []
@@ -480,12 +608,20 @@ def build_mask_file(
             thin.append(bank)
         else:
             clear_disks = None
-            if confident:
+            bank_pooled = [
+                # The pooled amplitude is a sum over this bank's frames; a
+                # static feature's per-frame amplitude is that divided by
+                # the frame count (exact by definition of static).
+                (r0, c0, sig, amp / frames.shape[0])
+                for r0, c0, sig, amp in pooled.get(bank, [])
+            ]
+            n_exonerated_pooled += len(bank_pooled)
+            if confident or bank_pooled:
                 clear_disks = []
                 for file_index, image_index in provenance[bank]:
                     disks = confident.get(file_index, {}).get(image_index, [])
                     n_exonerated += len(disks)
-                    clear_disks.append(disks)
+                    clear_disks.append(disks + bank_pooled)
             masks.append(
                 estimate_static_mask(
                     frames,
@@ -501,15 +637,7 @@ def build_mask_file(
                 )
             )
 
-    instrument = None
-    for path in inputs:
-        with h5py.File(path, "r") as f_in:
-            recorded = f_in.attrs.get("instrument")
-        if isinstance(recorded, bytes):
-            recorded = recorded.decode("utf-8")
-        if recorded:
-            instrument = recorded
-            break
+    instrument = _first_instrument(inputs)
 
     stack = np.stack(masks)
     with h5py.File(output, "w") as f:
@@ -533,10 +661,12 @@ def build_mask_file(
         # "were peaks passed, and at what bar?" -- the first question asked
         # when a peak turns up masked.
         f.attrs["peaks"] = [str(p) for p in peaks] if peaks else []
+        f.attrs["pooled_peaks"] = str(pooled_peaks) if pooled_peaks else ""
         f.attrs["peak_deviance_min"] = peak_deviance_min
         f.attrs["peak_residual_max"] = peak_residual_max
         f.attrs["peak_clear_nsigmas"] = peak_clear_nsigmas
         f.attrs["n_exonerated"] = n_exonerated
+        f.attrs["n_exonerated_pooled"] = n_exonerated_pooled
 
     masked_frac = 1.0 - stack.mean()
     return {
@@ -544,6 +674,7 @@ def build_mask_file(
         "n_frames": {b: len(by_bank[b]) for b in banks},
         "thin_banks": thin,
         "n_exonerated": n_exonerated,
+        "n_exonerated_pooled": n_exonerated_pooled,
         "duplicates_dropped": duplicates,
         "masked_fraction": float(masked_frac),
         "output": str(output),

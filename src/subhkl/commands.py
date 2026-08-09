@@ -1802,6 +1802,7 @@ def run_static_mask(
     output_filename: str,
     input_filenames: list[str],
     peaks_filenames: list[str] | None = None,
+    pooled_peaks_filename: str | None = None,
     peak_deviance_min: float = 9.488,
     peak_residual_max: float = 2.0,
     peak_clear_nsigmas: float = 3.5,
@@ -1827,6 +1828,7 @@ def run_static_mask(
         input_filenames,
         output_filename,
         peaks=peaks_filenames,
+        pooled_peaks=pooled_peaks_filename,
         peak_deviance_min=peak_deviance_min,
         peak_residual_max=peak_residual_max,
         peak_clear_nsigmas=peak_clear_nsigmas,
@@ -1853,6 +1855,11 @@ def run_static_mask(
             f"Exonerated {summary['n_exonerated']} metric-certified peak "
             "footprint(s) from the static evidence."
         )
+    if summary.get("n_exonerated_pooled"):
+        print(
+            f"Exonerated {summary['n_exonerated_pooled']} bank-level peak "
+            "footprint(s) certified by the pooled (summed-frame) fit."
+        )
     if summary["duplicates_dropped"]:
         n = sum(summary["duplicates_dropped"].values())
         print(
@@ -1861,6 +1868,32 @@ def run_static_mask(
             "sample to move between frames; repeats would promote true "
             "signal into the mask."
         )
+    return summary
+
+
+def run_sum_images(
+    output_filename: str,
+    input_filenames: list[str],
+):
+    """Sum each physical bank's deduplicated frames into a one-frame-per-bank
+    stack.
+
+    The companion of `static-mask`: a finder run on the summed stack sees the
+    pooled evidence exactly as the static-map quantile does, so quasi-static
+    reflections too faint for any single frame's certificate compound to
+    certification there (deviance is additive across frames).  Feed that
+    finder output back to `static-mask` as --pooled-peaks.
+    """
+    from subhkl.search.static_mask import build_summed_file
+
+    summary = build_summed_file(input_filenames, output_filename)
+    print(
+        f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "
+        f"{sum(summary['n_frames'].values())} frame(s) summed."
+    )
+    if summary["duplicates_dropped"]:
+        n = sum(summary["duplicates_dropped"].values())
+        print(f"Dropped {n} duplicate frame(s) before summing.")
     return summary
 
 

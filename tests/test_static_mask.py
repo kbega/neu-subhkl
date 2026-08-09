@@ -460,6 +460,118 @@ def test_no_annulus_around_a_quasi_static_certified_peak():
     assert valid.mean() > 0.98
 
 
+def test_summed_file_pools_each_banks_evidence(tmp_path):
+    from subhkl.search.static_mask import build_summed_file
+
+    frames_a = synthetic_scan(n_frames=4, size=64, step_col=40, seed=1)
+    frames_b = synthetic_scan(n_frames=4, size=64, step_col=20, seed=2)
+    for name, banks, stacks in (
+        ("scan1.h5", [7, 3], (frames_a[:2], frames_b[:2])),
+        ("scan2.h5", [3, 7], (frames_b[2:], frames_a[2:])),
+    ):
+        with h5py.File(tmp_path / name, "w") as f:
+            f["images"] = np.concatenate(stacks)
+            f["bank_ids"] = np.repeat(banks, 2)
+            f.attrs["instrument"] = "CG4D"
+            f["goniometer/angles"] = np.arange(8.0).reshape(4, 2)
+
+    summary = build_summed_file(
+        [tmp_path / "scan1.h5", tmp_path / "scan2.h5"], tmp_path / "summed.h5"
+    )
+    assert summary["banks"] == [3, 7]
+    assert summary["n_frames"] == {3: 4, 7: 4}
+
+    with h5py.File(tmp_path / "summed.h5", "r") as f:
+        assert list(f["bank_ids"][()]) == [3, 7]
+        # The sum is exact per bank, whatever order the files carried them in.
+        np.testing.assert_allclose(f["images"][0], frames_b.sum(axis=0))
+        np.testing.assert_allclose(f["images"][1], frames_a.sum(axis=0))
+        assert f.attrs["instrument"] == "CG4D"
+        assert list(f.attrs["n_frames"]) == [4, 4]
+        # Placeholder angles, one per bank frame: metrics only, never indexing.
+        assert f["goniometer/angles"].shape == (2, 2)
+        assert np.all(f["goniometer/angles"][()] == 0.0)
+
+
+def test_pooled_peaks_rescue_a_subthreshold_static_peak(tmp_path):
+    """The compounding contract: a quasi-static reflection too faint for any
+    single frame's certificate is masked by the pooled static map -- so its
+    exoneration must come from the same pooling.  A finder run on the summed
+    stack certifies it (deviance is additive), and its per-peak bank routes
+    the protection into every frame of that bank, with the pooled amplitude
+    rescaled to the per-frame one."""
+    rng = np.random.default_rng(59)
+    size, step_col, sigma_pk = 128, 80, 2.0
+    n_frames = 10
+    # Faint: ~55 counts of flux -- per-frame deviance ~ flux^2/(2 pi sigma^2
+    # * 4 * bg) sits well under any admission level, yet the smoothed p25
+    # holds ~0.6 counts/px against an ambient of 2.2: masked.
+    peak = pixel_integrated_gaussian(
+        (size, size), 40.0, 30.0, sigma_pk, 55.0 / (2 * np.pi * sigma_pk**2)
+    )
+    frames = []
+    for _ in range(n_frames):
+        rate = np.full((size, size), 2.2)
+        rate[:, step_col:] = 0.6
+        rate += peak
+        frames.append(rng.poisson(rate).astype(np.float32))
+    with h5py.File(tmp_path / "scan.h5", "w") as f:
+        f["images"] = np.stack(frames)
+        f["bank_ids"] = np.full(n_frames, 4)
+        f["goniometer/angles"] = np.c_[np.arange(float(n_frames)), np.zeros(n_frames)]
+
+    # Without rescue the faint static peak is masked.
+    build_mask_file([tmp_path / "scan.h5"], tmp_path / "m0.h5", dilate_px=4)
+    m0 = load_mask_for_banks(tmp_path / "m0.h5", [4], (size, size))[0]
+    assert m0[38:43, 28:33].mean() < 0.5
+
+    # The pooled certificate: one detection, bank-addressed, with the summed
+    # flux and a deviance only the pooled fit could reach.
+    with h5py.File(tmp_path / "pooled.h5", "w") as f:
+        f["bank"] = np.array([4])
+        f["peaks/image_index"] = np.array([0])
+        f["peaks/pixel_r"] = np.array([40.0])
+        f["peaks/pixel_c"] = np.array([30.0])
+        f["peaks/sigma"] = np.array([sigma_pk])
+        f["peaks/intensity"] = np.array([55.0 * n_frames])
+        f["peaks/deviance"] = np.array([60.0])
+        f["peaks/residual_deviance"] = np.array([1.1])
+
+    summary = build_mask_file(
+        [tmp_path / "scan.h5"],
+        tmp_path / "m1.h5",
+        pooled_peaks=tmp_path / "pooled.h5",
+        dilate_px=4,
+    )
+    assert summary["n_exonerated_pooled"] == 1
+    m1 = load_mask_for_banks(tmp_path / "m1.h5", [4], (size, size))[0]
+    # The peak footprint is protected; the illumination step stays masked.
+    assert m1[36:44, 26:34].mean() > 0.9
+    assert m1[:, 74:80].mean() < 0.2
+    with h5py.File(tmp_path / "m1.h5", "r") as f:
+        assert f.attrs["pooled_peaks"] == str(tmp_path / "pooled.h5")
+        assert f.attrs["n_exonerated_pooled"] == 1
+
+    # A pooled certificate with an artifact's shape rescues nothing.
+    with h5py.File(tmp_path / "pooled_bad.h5", "w") as f:
+        f["bank"] = np.array([4])
+        f["peaks/image_index"] = np.array([0])
+        f["peaks/pixel_r"] = np.array([40.0])
+        f["peaks/pixel_c"] = np.array([30.0])
+        f["peaks/sigma"] = np.array([sigma_pk])
+        f["peaks/intensity"] = np.array([55.0 * n_frames])
+        f["peaks/deviance"] = np.array([60.0])
+        f["peaks/residual_deviance"] = np.array([3.5])
+    build_mask_file(
+        [tmp_path / "scan.h5"],
+        tmp_path / "m2.h5",
+        pooled_peaks=tmp_path / "pooled_bad.h5",
+        dilate_px=4,
+    )
+    m2 = load_mask_for_banks(tmp_path / "m2.h5", [4], (size, size))[0]
+    assert m2[38:43, 28:33].mean() < 0.5
+
+
 def test_peaks_must_pair_with_inputs(tmp_path):
     with h5py.File(tmp_path / "a.h5", "w") as f:
         f["images"] = np.zeros((2, 16, 16), dtype=np.float32)
