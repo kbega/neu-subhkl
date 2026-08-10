@@ -5,6 +5,7 @@ import typer
 import h5py
 import os
 
+from subhkl.utils.devices import restrict_to_first_device
 from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
 
 from subhkl.commands import (
@@ -127,19 +128,66 @@ def finder(
             "lowering it demands more evidence everywhere at once. gamma "
             "reshapes the threshold across scales at constant budget."
         ),
+    ] = 0.1,
+    sparse_rbf_max_fragmentation_rate: Annotated[
+        float,
+        typer.Option(
+            help="Tolerable unsupported atoms per image -- the bank-sizing "
+            "analogue of --sparse-rbf-false-alarms-per-image.  An unsupported "
+            "atom is one whose leave-one-out deviance falls below the chi^2_4 "
+            "95% point: the signature of one peak reported as a cluster of "
+            "fragments.  Costs nothing extra: the rate maps onto the "
+            "brightness quantile of the measured peak census the bank "
+            "protects (peaks above it may fragment, ~2 unsupported atoms "
+            "each), so it is arithmetic on window moments, not extra solves.  "
+            "The realised rate is reported with the final statistics.  Set "
+            "to 0 (or negative) to keep the fixed p90 census quantile."
+        ),
     ] = 1.0,
-    sparse_rbf_num_sigmas: Annotated[
+    sparse_rbf_profile_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Peak profile replacing the Gaussian atom.  'auto' (default) "
+            "measures the radial profile f(u), u = r/sigma, from the first "
+            "batch's own bright peaks and rebuilds the bank; a path reads a "
+            "measured profile as JSON {u: [...], f: [...]}; 'gaussian' keeps "
+            "the analytic Gaussian."
+        ),
+    ] = "auto",
+    sparse_rbf_shape_ratio: Annotated[
+        float,
+        typer.Option(
+            help="Axis ratio of elliptical shape variants added per scale, "
+            "area-preserving.  The default 1.2 is the measured anisotropy of "
+            "CG4D/MANDI reflections; 1.0 restores the isotropic basis (and "
+            "cuts the bank convolution cost 5x)."
+        ),
+    ] = 1.2,
+    sparse_rbf_shape_orientations: Annotated[
         int,
+        typer.Option(
+            help="Number of position angles for the elliptical variants "
+            "(uniform over 180 deg)."
+        ),
+    ] = 4,
+    sparse_rbf_num_sigmas: Annotated[
+        int | None,
         typer.Option(
             help="Number of widths in the basis bank, spaced linearly from "
             "--sparse-rbf-min-sigma to --sparse-rbf-max-sigma. Controls the "
             "bank's resolution independently of its ceiling: raising max-sigma "
             "alone widens the spacing, which approximates a peak whose true "
             "width falls between two available scales with several atoms "
-            "instead of one."
+            "instead of one. The default (unset) auto-sizes an adaptive bank "
+            "just dense enough to prevent exactly that fragmentation, and an "
+            "explicit value below that density warns at startup."
         ),
-    ] = 5,
-    sparse_rbf_chunk_size: int = 512,
+    ] = None,
+    # 64, matching MatrixFreeSparseRBFPeakFinder's own default.  This said 512
+    # while the orchestrator was not forwarding it, so 512 was never what
+    # actually ran -- aligning the defaults keeps "no flag given" meaning what
+    # it always meant now that the flag is honored.
+    sparse_rbf_chunk_size: int = 64,
     sparse_rbf_loss: Annotated[
         str,
         typer.Option(
@@ -163,7 +211,19 @@ def finder(
         str, typer.Option(help="Candidate SNR thresholds alpha for auto-tuning")
     ] = "3.0,5.0,10.0,15.0,20.0,25.0,30.0",
     max_workers: int = 16,
+    multi_gpu: Annotated[
+        bool,
+        typer.Option(
+            "--multi-gpu/--no-multi-gpu",
+            help="Shard the solve across every visible GPU (the image axis "
+            "of each chunk).  Off by default so one process never claims "
+            "every device in the machine; scope visibility with "
+            "CUDA_VISIBLE_DEVICES.",
+        ),
+    ] = False,
 ):
+    if not multi_gpu:
+        restrict_to_first_device()
     # Pass everything straight into the core logic function
     run_finder(
         filename=filename,
@@ -199,6 +259,10 @@ def finder(
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
         sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
+        sparse_rbf_max_fragmentation_rate=sparse_rbf_max_fragmentation_rate,
+        sparse_rbf_profile_file=sparse_rbf_profile_file,
+        sparse_rbf_shape_ratio=sparse_rbf_shape_ratio,
+        sparse_rbf_shape_orientations=sparse_rbf_shape_orientations,
         sparse_rbf_false_alarms_per_image=sparse_rbf_false_alarms_per_image,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
@@ -206,6 +270,7 @@ def finder(
         sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
         sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
         max_workers=max_workers,
+        multi_gpu=multi_gpu,
     )
 
 
@@ -331,7 +396,19 @@ def indexer(
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
     index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
+    multi_gpu: Annotated[
+        bool,
+        typer.Option(
+            "--multi-gpu/--no-multi-gpu",
+            help="Shard the independent optimization runs across every "
+            "visible GPU.  Off by default so one process never claims every "
+            "device in the machine; scope visibility with "
+            "CUDA_VISIBLE_DEVICES.",
+        ),
+    ] = False,
 ) -> None:
+    if not multi_gpu:
+        restrict_to_first_device()
     # 1. Safely Parse Comma-Separated Strings into Python Lists
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
     gonio_axes_parsed = (
@@ -416,6 +493,7 @@ def indexer(
         batch_size=batch_size,
         num_candidates=num_candidates,
         no_index=not index if index is not None else None,
+        multi_gpu=multi_gpu,
     )
 
 

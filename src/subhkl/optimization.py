@@ -14,6 +14,7 @@ import h5py
 import scipy.linalg
 
 from subhkl.instrument.detector import scattering_vector_from_angles
+from subhkl.utils import devices as device_util
 from subhkl.core.spacegroup import get_space_group_object
 
 try:
@@ -1330,6 +1331,7 @@ class FindUB:
         detector_rot_bound_deg: float = 1.0,
         freeze_orientation: bool = False,
         no_index: bool | None = None,
+        multi_gpu: bool = False,
         **kwargs,
     ):
         if goniometer_axes is None and self.goniometer_axes is not None:
@@ -1731,16 +1733,44 @@ class FindUB:
         step_batch_jit = jax.jit(jax.vmap(step_single_run, in_axes=(0, 0)))
 
         exec_batch_size = batch_size if batch_size is not None else n_runs
-        seeds = jnp.arange(seed, seed + n_runs)
+
+        # Opted in via multi_gpu, the vmapped run axis is sharded across the
+        # visible devices.  Runs is the outer, embarrassingly parallel axis
+        # here -- the population lives *inside* each run's strategy state, so
+        # sharding it would reach into evosax internals, while sharding runs
+        # only touches the batch dimension the code already vmaps over.  Both
+        # the batch size and the run count are rounded up to a multiple of the
+        # device count; the rounding launches extra *real* runs with fresh
+        # seeds rather than padding with dummies, so it can only improve the
+        # best-of-N result it feeds.
+        devices = device_util.batch_devices(multi_gpu)
+        n_dev = len(devices)
+        n_runs_launched = n_runs
+        run_sharding = None
+        if n_dev > 1:
+            exec_batch_size = -(-exec_batch_size // n_dev) * n_dev
+            n_runs_launched = -(-n_runs // n_dev) * n_dev
+            run_sharding = device_util.batch_sharding(devices)
+            print(
+                f"Sharding {n_runs_launched} optimization runs "
+                f"(batches of {exec_batch_size}) across {n_dev} devices"
+            )
+
+        seeds = jnp.arange(seed, seed + n_runs_launched)
         all_keys = jax.vmap(jax.random.PRNGKey)(seeds)
         batch_keys_list, batch_states_list = [], []
 
-        for b_i in range(int(np.ceil(n_runs / exec_batch_size))):
+        for b_i in range(int(np.ceil(n_runs_launched / exec_batch_size))):
             start_idx, end_idx = (
                 b_i * exec_batch_size,
-                min((b_i + 1) * exec_batch_size, n_runs),
+                min((b_i + 1) * exec_batch_size, n_runs_launched),
             )
-            batch_keys_list.append(all_keys[start_idx:end_idx])
+            batch_keys = all_keys[start_idx:end_idx]
+            if run_sharding is not None:
+                # Every batch length is a multiple of n_dev (both operands
+                # were rounded up), so the shards are equal-sized.
+                batch_keys = jax.device_put(batch_keys, run_sharding)
+            batch_keys_list.append(batch_keys)
             batch_states_list.append(
                 init_batch_jit(batch_keys_list[-1], start_sol_processed)
             )

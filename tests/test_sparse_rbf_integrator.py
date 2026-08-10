@@ -318,6 +318,17 @@ def test_gaussian_loss_path_finds_peaks():
     assertion on flux was testing a quantity with no consumer, and it was the
     only thing keeping the debiasing phase alive.  What still needs covering is
     that ``loss="gaussian"`` runs and localises, which is what this asserts.
+
+    Localisation is asserted on the flux-weighted centroid of the detections
+    near each truth position, not on the single nearest detection.  The truth
+    widths here (2.0, 3.0) sat exactly on the historical uniform [1..5] bank,
+    which made a nearest-atom assertion look tight; under the auto-sized bank
+    truth widths are generically off-grid, and the gaussian path may then
+    report a bright peak as a sub-pixel pair straddling the true centre (the
+    thin-grid split on the *position* grid).  The pair's centroid stays within
+    a small fraction of a pixel while the nearest single atom jitters around
+    1 px with GPU nondeterminism, so the centroid is the stable statement of
+    the contract this test exists to keep.
     """
     import numpy as np
 
@@ -345,9 +356,14 @@ def test_gaussian_loss_path_finds_peaks():
         assert len(peaks) >= 2, f"{loss} loss found {len(peaks)} peaks, expected 2"
         for r, c, _sig, _amp in truth:
             d = np.sqrt((peaks[:, 1] - r) ** 2 + (peaks[:, 2] - c) ** 2)
-            assert d.min() < 1.0, (
+            assert d.min() < 2.0, (
                 f"{loss} loss missed the peak at ({r}, {c}); nearest was {d.min():.2f} px"
             )
+            near = peaks[d < 3.0]
+            cy = np.average(near[:, 1], weights=near[:, 0])
+            cx = np.average(near[:, 2], weights=near[:, 0])
+            err = np.sqrt((cy - r) ** 2 + (cx - c) ** 2)
+            assert err < 1.0, f"{loss} loss centroid off by {err:.2f} px at ({r}, {c})"
 
 
 def test_poisson_overlapping_string():
@@ -1176,10 +1192,16 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     def realised_efp(finder, side):
+        # The threshold vector is per *channel*; the calibration sums over
+        # *scales* (shape variants at one scale are the same statistical
+        # test, so counting each channel would overstate the multiplicity by
+        # ~n_shapes).  Evaluate the equation the way it is defined: one term
+        # per distinct scale, at that scale's threshold.
         a = np.array(finder.effective_alpha(side, side))
-        sigmas = np.array(finder.sigmas)
+        channel_sigmas = np.array(finder._channel_sigmas)
+        sigmas, first = np.unique(channel_sigmas, return_index=True)
         n_k = np.maximum((side * side) / (2 * np.pi * sigmas**2), 2.0)
-        return float((n_k * norm.sf(a)).sum())
+        return float((n_k * norm.sf(a[first])).sum())
 
     for gamma in (0.0, 0.5, 1.0, -0.5):
         finder = MatrixFreeSparseRBFPeakFinder(
@@ -1190,12 +1212,18 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
             f"gamma={gamma}: E[FP] = {efp:.4f}, not the calibrated 1.0"
         )
 
+    # The comparisons below vary threshold knobs (ref_sigma, m0, alpha) and
+    # compare effective_alpha arrays elementwise, which is only meaningful at
+    # a fixed bank.  Auto-sizing legitimately couples some of those knobs
+    # into the channel count (a stricter m0 raises z, strengthens the
+    # anti-carpet tax, and can drop a channel), and marginal counts can flip
+    # across BLAS/scipy builds, so the bank is pinned here.
     gamma = 0.5
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
-    sigmas = np.array(finder.sigmas)
-    weights = (sigmas / finder.ref_sigma) ** gamma
+    # effective_alpha is per channel, so the weight vector must be too.
+    weights = (np.array(finder._channel_sigmas) / finder.ref_sigma) ** gamma
 
     a_small = np.array(finder.effective_alpha(64, 64))
     a_large = np.array(finder.effective_alpha(4096, 4096))
@@ -1208,7 +1236,12 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
 
     # ref_sigma provably cancels: the calibration absorbs any weight rescaling.
     other_ref = MatrixFreeSparseRBFPeakFinder(
-        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, ref_sigma=3.0
+        alpha=None,
+        gamma=gamma,
+        min_sigma=1.0,
+        max_sigma=5.0,
+        ref_sigma=3.0,
+        num_sigmas=5,
     )
     assert np.allclose(
         np.array(other_ref.effective_alpha(256, 256)),
@@ -1223,6 +1256,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
         min_sigma=1.0,
         max_sigma=5.0,
         false_alarms_per_image=0.1,
+        num_sigmas=5,
     )
     assert np.all(np.array(stricter.effective_alpha(256, 256)) > a_small)
     assert np.isclose(realised_efp(stricter, 256), 0.1, rtol=1e-3)
@@ -1230,7 +1264,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     # An explicit alpha is a lower bound on significance, not a way under the
     # calibration: too small a request is raised, a strict one is honoured.
     lax_finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
     assert np.allclose(
         np.array(lax_finder.effective_alpha(130, 130)),
@@ -1239,7 +1273,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     )
 
     strict = MatrixFreeSparseRBFPeakFinder(
-        alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
     assert np.allclose(
         np.array(strict.effective_alpha(130, 130)), 20.0 * weights, rtol=1e-5
@@ -1305,8 +1339,22 @@ def test_global_solve_reaches_first_order_optimality():
         img += 300.0 * np.exp(-((yy - r0) ** 2 + (xx - c0) ** 2) / (2 * 2.0**2))
     image = rng.poisson(img).astype(np.float32)
 
+    # Pinned to the isotropic Gaussian bank: this test certifies the solver's
+    # first-order optimality on a well-conditioned canonical problem.  Shape
+    # variants put near-duplicate atoms in the dictionary (pairwise kernel
+    # correlation ~0.99), which makes the optimum nearly degenerate --
+    # coefficients slosh between near-identical atoms at almost no objective
+    # change, and the prox residual stalls ~20x above this tolerance (measured
+    # 3.7e-2).  That is dictionary conditioning, not a solver regression, and
+    # the returned solutions on that bank are validated empirically end to end.
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=None, gamma=0.5, max_sigma=5.0, num_sigmas=5, loss="poisson"
+        alpha=None,
+        gamma=0.5,
+        max_sigma=5.0,
+        num_sigmas=5,
+        loss="poisson",
+        profile_file="gaussian",
+        shape_ratio=1.0,
     )
     filter_size = max(15, int(finder.max_sigma * 5))
     bg = np.asarray(compute_bg_batch(jnp.asarray(image[None]), filter_size))[0]
@@ -1739,7 +1787,9 @@ def test_extraction_returns_full_support_beyond_any_chunk_size():
     # Refinement is exercised by the solver-level tests; here it would only
     # slide the synthetic delta atoms around and obscure the counting claim.
     finder.refine_positions = False
-    K = len(np.asarray(finder.sigmas))
+    # The coefficient tensor's channel dimension is the bank's, which with
+    # shape variants is num_sigmas * n_shapes; ``sigmas`` stays the scale grid.
+    K = int(finder.K_weights.shape[0])
     H = W = 130
     y_img = np.zeros((H, W), dtype=np.float32)
     bg_img = np.full((H, W), 1.0, dtype=np.float32)
@@ -1880,7 +1930,9 @@ def test_num_sigmas_decouples_bank_resolution_from_the_ceiling():
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
-    coarse = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0)
+    # The subject is the explicit-num_sigmas contract (uniform grid at a
+    # chosen count); the auto-sized default is covered elsewhere.
+    coarse = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0, num_sigmas=5)
     assert len(np.asarray(coarse.sigmas)) == 5
     assert np.isclose(np.diff(np.asarray(coarse.sigmas)).mean(), 1.0)
 
@@ -1913,14 +1965,25 @@ def test_degenerate_single_width_bank_collapses_instead_of_duplicating():
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
-    degenerate = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=1.5)
+    # Pinned to the isotropic Gaussian atom: this test's subject is the
+    # collapse of *identical duplicate* channels, and shape variants are
+    # distinct atoms, not duplicates.
+    degenerate = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5, max_sigma=1.5, profile_file="gaussian", shape_ratio=1.0
+    )
     assert degenerate.num_sigmas == 1
     assert np.asarray(degenerate.sigmas).tolist() == [1.5]
     assert degenerate.K_weights.shape[0] == 1
 
     # An explicitly single-scale bank is unchanged, and an inverted range is an
     # error rather than an empty bank.
-    single = MatrixFreeSparseRBFPeakFinder(min_sigma=2.0, max_sigma=2.0, num_sigmas=1)
+    single = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=2.0,
+        max_sigma=2.0,
+        num_sigmas=1,
+        profile_file="gaussian",
+        shape_ratio=1.0,
+    )
     assert single.num_sigmas == 1
     with pytest.raises(ValueError, match="below min_sigma"):
         MatrixFreeSparseRBFPeakFinder(min_sigma=4.0, max_sigma=2.0)
@@ -1993,12 +2056,16 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
     assert sized.fit_metrics["bic"] < starved.fit_metrics["bic"]
 
     # m0 plumbing: reaches the finder and tightens the threshold.
+    # Pinned bank: m0 legitimately couples into auto bank sizing (stricter
+    # budget -> higher z -> stronger anti-carpet tax -> fewer channels), and
+    # elementwise threshold comparisons need a common grid.
     strict = MatrixFreeSparseRBFPeakFinder(
         alpha=None,
         gamma=0.5,
         min_sigma=1.0,
         max_sigma=6.0,
         false_alarms_per_image=0.01,
+        num_sigmas=6,
     )
     lax_f = MatrixFreeSparseRBFPeakFinder(
         alpha=None,
@@ -2006,6 +2073,7 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
         min_sigma=1.0,
         max_sigma=6.0,
         false_alarms_per_image=10.0,
+        num_sigmas=6,
     )
     assert np.all(
         np.array(strict.effective_alpha(128, 128))
@@ -2015,4 +2083,265 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
     assert (
         'harvest_peaks_kwargs.get(\n                    "false_alarms_per_image"' in src
         or ("false_alarms_per_image" in src)
+    )
+
+
+def test_moment_peak_amplitude_tracks_the_bright_end_of_the_population():
+    """``A = F / (2 pi sigma^2)`` from window moments, at a high quantile.
+
+    Not the median: the fidelity gap driving fragmentation grows with
+    brightness, so the bank is sized to protect the brightest peaks.  The
+    tolerance here is loose on purpose -- bank size responds to this input as
+    roughly its 0.28th power, so even a 50% error is under one channel.
+    """
+    import numpy as np
+    from scipy.special import erf
+
+    from subhkl.search.matrix_free import _moment_peak_amplitude
+
+    def pixel_integrated(shape, r0, c0, sigma, amp):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        s2 = sigma * np.sqrt(2.0)
+        er = erf((rr - r0 + 0.5) / s2) - erf((rr - r0 - 0.5) / s2)
+        ec = erf((cc - c0 + 0.5) / s2) - erf((cc - c0 - 0.5) / s2)
+        return amp * (np.pi / 2.0) * sigma**2 * er * ec
+
+    rng = np.random.default_rng(4)
+    bg = 0.6
+    frame = np.full((256, 256), bg)
+    for r, c, amp in (
+        (60, 60, 200.0),
+        (60, 180, 120.0),
+        (180, 60, 60.0),
+        (180, 180, 300.0),
+    ):
+        frame += pixel_integrated(frame.shape, r, c, 4.0, amp)
+    image = rng.poisson(frame).astype(float)
+    bg_map = np.full_like(image, bg)
+
+    # The bright end of 60/120/200/300, not the median and not the maximum.
+    measured = _moment_peak_amplitude(image[None], bg_map[None], bg, quantile=90.0)
+    assert 120.0 < measured < 400.0
+    assert (
+        _moment_peak_amplitude(image[None], bg_map[None], bg, quantile=99.0) > measured
+    )
+
+
+def test_expected_peak_amplitude_defaults_to_measuring_it():
+    """None means 'derive it from the first batch', the contract
+    expected_background already has."""
+    from subhkl.search.matrix_free import _FRAG_PEAK_AMP, MatrixFreeSparseRBFPeakFinder
+
+    auto = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=5)
+    assert auto._amp_is_auto
+    # Construction still needs a number, and uses the declared nominal.
+    assert auto.expected_peak_amplitude == _FRAG_PEAK_AMP
+
+    explicit = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5, max_sigma=6.5, num_sigmas=5, expected_peak_amplitude=42.0
+    )
+    assert not explicit._amp_is_auto
+    assert explicit.expected_peak_amplitude == 42.0
+
+
+def test_fid_residual_is_a_calibratable_input():
+    """The criterion's empirical constant is an instance parameter: a larger
+    residual claims a larger real-world carpet advantage and must buy a
+    denser bank.  calibrate_fragmentation_residual fits it to a requested
+    unsupported-atom rate; here only the monotone plumbing is asserted,
+    because each calibration rung is a full solve."""
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    kwargs = dict(min_sigma=1.0, max_sigma=25.0)
+    lean = MatrixFreeSparseRBFPeakFinder(fid_residual=2.5, **kwargs)
+    factory = MatrixFreeSparseRBFPeakFinder(**kwargs)
+    dense = MatrixFreeSparseRBFPeakFinder(fid_residual=40.0, **kwargs)
+    assert lean.num_sigmas <= factory.num_sigmas <= dense.num_sigmas
+    assert lean.num_sigmas < dense.num_sigmas
+
+
+def test_fragmentation_rate_maps_to_protected_quantile():
+    """The requested unsupported-atom rate is met without solving: it picks
+    which quantile of the moment census the bank protects (peaks above it may
+    fragment, ~2 unsupported atoms each), so the mapping is arithmetic."""
+    import numpy as np
+    from scipy.special import erf
+
+    from subhkl.search.matrix_free import _frag_protected_quantile, _moment_census
+
+    assert _frag_protected_quantile(1.0, 4.0) == 87.5
+    assert _frag_protected_quantile(1.0, 50.0) == 99.0
+    # Allowing more fragmentation than the census can express floors at the
+    # median; asking for none protects the brightest censused peak outright.
+    assert _frag_protected_quantile(8.0, 4.0) == 50.0
+    assert _frag_protected_quantile(0.0, 4.0) == 100.0
+
+    # The counting census assigns each peak to the one window that owns its
+    # centroid; the amplitude scan keeps every window the peak's flux reaches.
+    def pixel_integrated(shape, r0, c0, sigma, amp):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        s2 = sigma * np.sqrt(2.0)
+        er = erf((rr - r0 + 0.5) / s2) - erf((rr - r0 - 0.5) / s2)
+        ec = erf((cc - c0 + 0.5) / s2) - erf((cc - c0 - 0.5) / s2)
+        return amp * (np.pi / 2.0) * sigma**2 * er * ec
+
+    rng = np.random.default_rng(9)
+    frame = np.full((256, 256), 0.6)
+    frame += pixel_integrated(frame.shape, 70, 70, 4.0, 250.0)
+    frame += pixel_integrated(frame.shape, 180, 170, 4.0, 150.0)
+    image = rng.poisson(frame).astype(float)
+    bg_map = np.full_like(image, 0.6)
+
+    counting = _moment_census(image[None], bg_map[None], 0.6, counting=True)
+    scanning = _moment_census(image[None], bg_map[None], 0.6)
+    assert 1 <= counting.size <= 6
+    assert scanning.size > counting.size
+
+
+def test_default_is_the_learned_family_and_legacy_is_one_flag_away():
+    """The default now carries the measured peak family: profile 'auto' (trunk
+    swapped in at first batch) and the anisotropy variants from construction.
+    The threshold multiplicity is Gram-corrected, so the calibrated z stays at
+    the same-scale isotropic bank's level.  profile_file='gaussian' with
+    shape_ratio=1.0 restores the historical Gaussian path exactly, separable
+    fast path included."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    f = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=6)
+    assert np.asarray(f.K_weights).shape[0] == 30  # 6 scales x 5 shapes
+    assert not f.use_separable
+    # The public scale grid never expands: channels are internal.
+    assert len(np.asarray(f.sigmas)) == 6
+    assert f.num_sigmas == 6
+    assert len(np.asarray(f._channel_sigmas)) == 30
+
+    legacy = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5,
+        max_sigma=6.5,
+        num_sigmas=6,
+        profile_file="gaussian",
+        shape_ratio=1.0,
+    )
+    assert legacy.use_separable
+    assert np.asarray(legacy.K_weights).shape[0] == 6
+
+
+def test_learned_basis_keeps_the_flux_scale_family(tmp_path):
+    """Every kernel must keep flux = C * sigma^2 with one C: the width-mixture
+    collapse in _read_chunk depends on it exactly."""
+    import json
+
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    u = np.linspace(0, 4, 41)
+    profile = tmp_path / "trunk.json"
+    profile.write_text(
+        json.dumps({"u": u.tolist(), "f": np.exp(-0.5 * u**2.8 / 1.4).tolist()})
+    )
+
+    f = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5,
+        max_sigma=6.5,
+        num_sigmas=6,
+        profile_file=str(profile),
+        shape_ratio=1.2,
+        shape_orientations=4,
+    )
+    kernels = np.asarray(f.K_weights)[:, 0]
+    sigmas = np.asarray(f._channel_sigmas)
+    assert kernels.shape[0] == 30  # 6 scales x (1 iso + 4 orientations)
+    flux = kernels.sum(axis=(1, 2))
+    ratio = flux / sigmas**2
+    assert np.allclose(ratio, ratio[0], rtol=0.02)
+
+
+def test_shape_variants_do_not_multiply_the_false_alarm_count(tmp_path):
+    """The calibration sum-pools N_k over channels as if independent.  Shape
+    variants at one (site, scale) are nearly the same test -- Gram K_eff ~ 1 of
+    5 at ratio 1.2 -- and counting them 5x inflates the solved threshold.
+    Measured cost of not correcting: the faint half of all detections
+    (243 -> 120 atoms on cg4d-garnet run 2038)."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    f = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5,
+        max_sigma=6.5,
+        num_sigmas=6,
+        shape_ratio=1.2,
+        shape_orientations=4,
+    )
+    # The calibrated threshold must sit at the same-scale Gaussian bank's
+    # level, not a 30-channel one's: the calibration sums over the scale
+    # grid, which deduplicates the shape variants exactly.
+    g = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=6)
+    z_shaped = float(np.asarray(f.effective_alpha(512, 512)).ravel()[0])
+    z_gauss = float(np.asarray(g.effective_alpha(512, 512)).ravel()[0])
+    assert abs(z_shaped - z_gauss) / z_gauss < 0.05
+
+
+def test_fragmentation_criterion_survives_a_shape_expanded_bank():
+    """Repeated scales made the pair criterion's 2x2 Gram singular."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _frag_bank_ratio
+
+    sigmas = np.repeat(np.linspace(1.5, 6.5, 6), 5)  # the expanded pattern
+    ratio, near = _frag_bank_ratio(sigmas, 0.0, 1.0, 1.0, 1.0, 160.0, 512, 512)
+    assert np.isfinite(ratio)
+
+
+def test_radial_profile_measurement_ranks_shapes_correctly():
+    """The in-line profile measurement must read a flat-top as flatter than a
+    Gaussian, and a Gaussian as not flat.  Absolute width is allowed a uniform
+    stretch (~6% measured, from neighbour-tail spill) because a stretch of the
+    u axis is absorbed by the sigma grid; the *shape* ordering is what the
+    solver pays atoms for."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _measure_radial_profile
+
+    def peak(shape, r0, c0, s, amp, beta):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        q = np.hypot(rr - r0, cc - c0) / s
+        return amp * np.exp(-0.5 * np.power(np.maximum(q, 1e-12), beta))
+
+    rng = np.random.default_rng(9)
+    ratios = {}
+    for beta in (2.0, 2.8):
+        frame = np.full((512, 512), 0.7)
+        for _ in range(25):
+            r, c = rng.uniform(50, 462, 2)
+            frame += peak(
+                frame.shape, r, c, rng.uniform(2.5, 5.0), rng.uniform(60, 300), beta
+            )
+        image = rng.poisson(frame).astype(float)
+        u, f = _measure_radial_profile(
+            image[None], np.full_like(image, 0.7)[None], 0.7, max_sigma=6.5
+        )
+        i = int(np.argmin(np.abs(u - 1.5)))
+        ratios[beta] = f[i] / np.exp(-0.5 * u[i] ** 2)
+    assert ratios[2.8] > ratios[2.0] + 0.1, ratios
+    assert 0.7 < ratios[2.0] < 1.15, ratios
+
+
+def test_radial_profile_measurement_refuses_a_peak_free_frame():
+    """A frame with nothing in it must return None -- the caller stays on the
+    Gaussian -- rather than a profile made of noise windows."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _measure_radial_profile
+
+    rng = np.random.default_rng(3)
+    image = rng.poisson(np.full((512, 512), 0.7)).astype(float)
+    assert (
+        _measure_radial_profile(
+            image[None], np.full_like(image, 0.7)[None], 0.7, max_sigma=6.5
+        )
+        is None
     )

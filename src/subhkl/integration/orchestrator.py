@@ -140,16 +140,37 @@ def prepare_harvest_tasks(
                 loss=harvest_peaks_kwargs.get("loss", "poisson"),
                 min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
                 max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
-                # Bank resolution, independent of the ceiling: without it
-                # max_sigma sets both, so a wider range can only be bought by
-                # coarsening the spacing.
-                num_sigmas=harvest_peaks_kwargs.get("num_sigmas", 5),
+                # Bank resolution, independent of the ceiling.  None lets the
+                # finder auto-size the bank against carpet fragmentation; an
+                # explicit count keeps the historical uniform grid.
+                num_sigmas=harvest_peaks_kwargs.get("num_sigmas"),
+                # Tolerable unsupported atoms per image.  Mapped onto the
+                # brightness quantile the auto bank protects, via the moment
+                # census of each batch -- arithmetic, no extra solves; see
+                # _frag_protected_quantile.  Non-positive keeps the fixed
+                # p90 census quantile.
+                max_fragmentation_rate=harvest_peaks_kwargs.get(
+                    "max_fragmentation_rate", 1.0
+                ),
                 # The m0 of the false-alarm calibration: expected false peaks
                 # per image.  The one knob that sets the detection budget.
                 false_alarms_per_image=harvest_peaks_kwargs.get(
                     "false_alarms_per_image", 1.0
                 ),
                 show_steps=harvest_peaks_kwargs.get("show_steps", False),
+                # These four were not forwarded at first, and the omission was
+                # invisible from the CLI: the constructor's **kwargs swallows
+                # nothing, the class defaults are sensible, and every unit test
+                # builds the class directly.  The visible symptoms were that
+                # --sparse-rbf-profile-file gaussian (the documented opt-out
+                # of the learned family) did nothing, and that a suite tuned
+                # to --sparse-rbf-chunk-size 64 was actually running at
+                # whatever the class default happened to be.
+                profile_file=harvest_peaks_kwargs.get("profile_file", "auto"),
+                shape_ratio=harvest_peaks_kwargs.get("shape_ratio", 1.2),
+                shape_orientations=harvest_peaks_kwargs.get("shape_orientations", 4),
+                chunk_size=harvest_peaks_kwargs.get("chunk_size", 64),
+                multi_gpu=harvest_peaks_kwargs.get("multi_gpu", False),
             )
         batch_coords = alg.find_peaks_batch(img_stack)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}
