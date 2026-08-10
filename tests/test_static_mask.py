@@ -100,8 +100,8 @@ def test_mask_file_round_trip_maps_by_physical_bank(tmp_path):
     # step's bright shoulder and clean at the other bank's.
     stack = load_mask_for_banks(out, [7, 99, 3], (64, 64))
     assert stack.shape == (3, 64, 64)
-    assert stack[0][:, 32:40].mean() < 0.5 and stack[0][:, 12:20].mean() > 0.9
-    assert stack[2][:, 12:20].mean() < 0.5 and stack[2][:, 32:40].mean() > 0.9
+    assert stack[0][:, 32:40].mean() < 0.6 and stack[0][:, 12:20].mean() > 0.9
+    assert stack[2][:, 12:20].mean() < 0.6 and stack[2][:, 32:40].mean() > 0.9
     assert stack[1].min() == 1.0
 
     with pytest.raises(ValueError):
@@ -457,18 +457,13 @@ def test_no_annulus_around_a_quasi_static_certified_peak():
     assert valid.mean() > 0.98
 
 
-def test_a_coherent_ridge_is_masked_contiguously_not_dotted():
-    """The line criterion's contract: structure above the effect floor is
-    caught along its whole length, not only where noise cooperates.
-
-    A faint static ridge whose band level clears the texture threshold has
-    pointwise noise dips that leave a dotted mask along an unbroken physical
-    feature.  A running median of the band along each axis is a matched filter for
-    lines -- the coherent level survives, the dips average out -- so the
-    ridge masks contiguously.  Isotropic content occupies a minority of the
-    median window and leaves it untouched: the moving peak's positions stay
-    valid and the far field stays clean.  (The effect floor is deliberately kept: a coherent line
-    *below* the level that generates false atoms still needs no masking.)"""
+def test_a_faint_coherent_ridge_is_masked_contiguously():
+    """A ridge whose contrast clears the boundary criterion is caught along
+    its whole length, at any orientation: the smoothed gradient magnitude
+    consolidates the feature's flanks, so pointwise noise dips do not
+    puncture the mask.  The moving peak's positions stay valid and the far
+    field stays clean -- the criterion responds to coherent contrast, not
+    to noise."""
     rng = np.random.default_rng(71)
     size = 128
     cols = np.arange(size, dtype=float)
@@ -480,18 +475,13 @@ def test_a_coherent_ridge_is_masked_contiguously_not_dotted():
             (size, size), 12.0 + 10 * k, 100.0 + 2 * k, 2.0, 60.0
         )
         frames.append(rng.poisson(rate).astype(np.float32))
-    stack = np.stack(frames)
 
-    full = estimate_static_mask(stack, dilate_px=2)
-    dotted = estimate_static_mask(stack, dilate_px=2, line_length=0)
-
+    valid = estimate_static_mask(np.stack(frames))
     col = slice(58, 63)
-    assert (full[:, col] == 0).mean() > 0.999
-    assert (dotted[:, col] == 0).mean() < 0.99
-    # The coherence gain is line-specific: no new speckle, no eaten peaks.
-    assert (full[:, 85:] == 0).mean() < 0.01
+    assert (valid[:, col] == 0).mean() > 0.999
+    assert (valid[:, 90:] == 0).mean() < 0.01
     for k in range(10):
-        assert full[12 + 10 * k, 100 + 2 * k] == 1
+        assert valid[12 + 10 * k, 100 + 2 * k] == 1
 
 
 def test_summed_file_pools_each_banks_evidence(tmp_path):

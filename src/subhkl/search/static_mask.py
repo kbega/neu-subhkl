@@ -55,7 +55,6 @@ def estimate_static_mask(
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
-    line_length: int = 25,
     protect_disks: list | None = None,
     protect_nsigmas: float = 3.5,
 ) -> np.ndarray:
@@ -81,10 +80,7 @@ def estimate_static_mask(
     of margin even at threshold 8).  ``texture_factor`` is the band-pass level
     criterion, relative to the panel's ambient rate; ``wide_sigma`` sets the
     long end of the band and should sit at the background window's scale
-    (the finder's is max(15, 5 * max_sigma) px wide).  ``line_length`` is the
-    window (px) of the line criterion, a running median along each axis
-    that catches ridges and step lobes contiguously; features shorter than
-    about half the window are ignored by it, and 0 disables it.  ``dilate_px`` should cover an atom
+    (the finder's is max(15, 5 * max_sigma) px wide).  ``dilate_px`` should cover an atom
     footprint (~2 * max_sigma) so that an atom whose tail rests on the
     structure is masked along with it.
     """
@@ -143,55 +139,45 @@ def estimate_static_mask(
             return float(np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / thr)))
         return 0.0
 
-    # Un-dilated bad set: band-pass level plus band-pass gradients.
+    # Un-dilated bad set: two criteria on the band-pass, one per way a
+    # static feature can defeat the background model.
     #
-    # Positive lobes only.  False peaks are *positive* unmodelled
-    # structure; |band| would additionally mask the negative moat that the
-    # wide subtraction digs around anything bright -- a ~wide_sigma-to-
-    # 2*wide_sigma ring, which on the forward banks turned every leak into
-    # a ~20 px exclusion zone around a genuine reflection.
+    # *Level* (texture): elevated positive band, the diffuse-glow signature.
+    # Positive lobes only -- false atoms are positive unmodelled structure,
+    # and |band| would additionally mask the negative moat the wide
+    # subtraction digs around anything bright.
     #
-    # Steps also announce themselves as band-pass gradients; MADs alone
-    # are a pure significance test whose floor on a flat panel is noise,
-    # so the physical floor (gradient per pixel as a fraction of ambient)
-    # guards it: the l1-mbl illumination boundary runs ~3% of ambient per
-    # pixel.  The gradient criterion is restricted to the positive side
-    # of the band for the same moat reason as above.
+    # *Contrast* (boundary): the smoothed gradient magnitude of the band,
+    # then a MAD significance test -- edge filter first, significance
+    # second.  Smoothing the magnitude (not the band) consolidates the
+    # flanks of any sharp feature at any orientation: an unbroken ridge or
+    # step whose pointwise gradients dip in and out of significance with
+    # the noise masks contiguously, because its neighbours along the
+    # feature vote into every pixel's smoothed value.  This replaces both
+    # the old pointwise-gradient rule and an axis-aligned line filter --
+    # one orientation-free criterion instead of two special-cased ones.
+    # The smoothed-magnitude noise floor is far below the pointwise one,
+    # so the MADs are taken on the smoothed map itself; the physical floor
+    # (gradient per pixel as a fraction of ambient) still guards flat
+    # panels, where a pure significance test would mask soft genuine
+    # variation (the l1-mbl illumination boundary runs ~3% of ambient per
+    # pixel).  The band > 0 restriction stays: the negative moat the wide
+    # subtraction digs around anything bright has a deep outer slope whose
+    # smoothed gradient is highly significant, and without the restriction
+    # it masked a ring around every bright spot at ~2x wide_sigma --
+    # beyond any protection disk.  False atoms are positive structure;
+    # nothing below zero band needs masking.
     texture = band > texture_threshold
     gy, gx = np.gradient(band)
-    grad = np.hypot(gy, gx)
-    grad_mad = np.median(np.abs(grad - np.median(grad))) + 1e-9
+    edge = ndimage.gaussian_filter(np.hypot(gy, gx), smooth_sigma)
+    edge_med = np.median(edge)
+    edge_mad = np.median(np.abs(edge - edge_med)) + 1e-9
     boundary = (
-        (np.abs(grad - np.median(grad)) > grad_nmads * grad_mad)
-        & (grad > grad_min_frac * ambient)
+        (edge - edge_med > grad_nmads * edge_mad)
+        & (edge > grad_min_frac * ambient)
         & (band > 0.0)
     )
     bad = boundary | texture
-
-    # A continuous ridge or step is coherent along its own length, while
-    # the pointwise criteria above see it only where noise cooperates -- a
-    # dotted mask along an unbroken physical feature.  The running *median*
-    # of the band along each axis is a matched filter for lines: a
-    # coherent feature keeps its level exactly (the noise dips average
-    # out, so it clears the threshold contiguously), while anything
-    # occupying a minority of the window -- noise, and every isotropic
-    # blob, peaks included -- leaves the median untouched.  A mean filter
-    # would not do: it dilutes a bright blob only ~3x while smearing it
-    # along both axes, growing masked crosses through every bright spot.
-    # The MAD floor of the median map drops with the window, so faint
-    # lines clear it; the effect-size floor stays at texture_factor x
-    # ambient, because structure below the level that generates false
-    # atoms needs no masking however coherent it is.  Steps are caught via
-    # the positive band-pass lobe along their bright side.  Measured on
-    # l1-mbl: the added coverage lands almost entirely on the known
-    # structure banks (the bank-41 illumination structure and the
-    # beam-stop banks).
-    if line_length > 1:
-        size = int(line_length) | 1
-        for shape in ((size, 1), (1, size)):
-            line_band = ndimage.median_filter(band, size=shape)
-            line_mad = np.median(np.abs(line_band - np.median(line_band))) + 1e-9
-            bad |= line_band > max(texture_factor * ambient, 4.0 * line_mad)
 
     # Certificates exist to protect peaks -- nothing else.  The mask may be
     # as liberal as it likes about admitting static structure, because the
@@ -547,7 +533,6 @@ def build_mask_file(
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
-    line_length: int = 25,
 ) -> dict:
     """Estimate one mask per physical bank across every input file.
 
@@ -630,7 +615,6 @@ def build_mask_file(
                     dilate_px=dilate_px,
                     static_quantile=static_quantile,
                     grad_min_frac=grad_min_frac,
-                    line_length=line_length,
                 )
             )
 
@@ -654,7 +638,6 @@ def build_mask_file(
         f.attrs["dilate_px"] = dilate_px
         f.attrs["static_quantile"] = static_quantile
         f.attrs["grad_min_frac"] = grad_min_frac
-        f.attrs["line_length"] = line_length
         # The exoneration provenance: without it, a mask file cannot answer
         # "were peaks passed, and at what bar?" -- the first question asked
         # when a peak turns up masked.
