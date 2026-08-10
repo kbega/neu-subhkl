@@ -424,19 +424,16 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
 
 
 def test_no_annulus_around_a_quasi_static_certified_peak():
-    """The clearing must not manufacture the artifact it protects against.
+    """Exoneration must not manufacture the artifact it protects against.
 
     A certified peak that barely moves between frames (a Laue zone rotating
-    about its own axis) clears an overlapping evidence disk in every frame,
-    leaving a no-evidence crater in the static map.  Averaging that crater's
-    zeros into the wide background dug a positive band-pass rim just outside
-    it -- above any texture threshold -- and the rim came back as a masked
-    annulus around the very peak the exoneration had certified.  The wide
-    smooth is now evidence-weighted (cleared pixels carry no weight, not the
-    value zero), and the clearing radius knows the peak's brightness, so
-    neither the crater nor the tail beyond a blind n-sigma disk writes
-    texture into the map.  Nothing near the peak may be masked, at any
-    radius."""
+    about its own axis) writes its whole footprint into the static map.  An
+    earlier design cleared the certified evidence out of the frame stack,
+    and the clearing itself manufactured a masked annulus around the peak
+    (the no-evidence crater dug a positive band-pass rim just outside
+    itself).  Certificates now only protect, with an amplitude-aware radius
+    covering wherever the peak's own smoothed tail exceeds the texture
+    threshold -- so nothing near the peak may be masked, at any radius."""
     rng = np.random.default_rng(67)
     size, sigma_pk, height = 160, 2.0, 200.0
     wobble = [
@@ -450,8 +447,8 @@ def test_no_annulus_around_a_quasi_static_certified_peak():
             rate.shape, 64.0 + dr, 64.0 + dc, sigma_pk, height
         )
         frames.append(rng.poisson(rate).astype(np.float32))
-        disks.append([(64.0 + dr, 64.0 + dc, sigma_pk, height)])
-    valid = estimate_static_mask(np.stack(frames), clear_disks=disks)
+        disks.append((64.0 + dr, 64.0 + dc, sigma_pk, height))
+    valid = estimate_static_mask(np.stack(frames), protect_disks=disks)
 
     rr, cc = np.mgrid[0:size, 0:size]
     radius = np.hypot(rr - 64.0, cc - 64.0)

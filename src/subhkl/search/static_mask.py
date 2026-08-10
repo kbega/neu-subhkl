@@ -55,9 +55,8 @@ def estimate_static_mask(
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
-    clear_disks: list | None = None,
     protect_disks: list | None = None,
-    clear_nsigmas: float = 3.5,
+    protect_nsigmas: float = 3.5,
 ) -> np.ndarray:
     """Valid-pixel mask (1 = usable) for one bank from its frame stack.
 
@@ -103,79 +102,30 @@ def estimate_static_mask(
     # any threshold stated in units of a ~2-count ambient.  Measured on
     # l1-mbl forward banks as an exclusion ring around every true peak.
     stack = np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates])
+    sm = np.percentile(stack, static_quantile, axis=0, method="lower")
 
-    import warnings as _warnings
-
-    def _reduce(
-        disks_by_frame: list | None, radii: list | None
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """(static map, evidence validity) with per-disk evidence cleared."""
-        work = stack
-        if disks_by_frame is not None:
-            work = stack.copy()
-            for fi, disks in enumerate(disks_by_frame):
-                for (r0, c0, _sig, _amp), rad in zip(disks, radii[fi]):
-                    work[fi][(rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2] = np.nan
-        with _warnings.catch_warnings():
-            _warnings.simplefilter("ignore", category=RuntimeWarning)
-            sm = np.nanpercentile(work, static_quantile, axis=0, method="lower")
-        # A pixel with too little surviving evidence proves nothing static.
-        n_eff = np.sum(~np.isnan(work), axis=0)
-        valid = (n_eff >= 2) & np.isfinite(sm)
-        return np.where(valid, sm, 0.0), valid
-
-    def _threshold(
-        sm: np.ndarray, valid: np.ndarray
-    ) -> tuple[float, np.ndarray, float]:
-        """(ambient, band-pass map, texture threshold) for a static map.
-
-        The criterion lives on a *band-pass* of the static map: structure at
-        scales between the atom footprint (smooth_sigma) and the background
-        window (wide_sigma).  What the mask must mark is structure that
-        defeats the background model -- and only that.  A wide static halo,
-        however elevated or statically steep its shoulders, is followed by
-        the windowed background estimate and is where real Bragg peaks live;
-        masking it (as an absolute-gradient or absolute-level criterion does)
-        removed genuine reflections from the centre of the l1-mbl forward
-        banks.  The halo vanishes from the band-pass; what remains is exactly
-        the peak-confusable statics: the illumination step (band-pass swing
-        ~0.4x ambient), the plume's texture (~0.3x at its false-detection
-        sites, against ~0.13x under real forward-bank peaks).
-
-        The wide smooth is a *normalised convolution*: cleared pixels carry
-        zero weight, not zero value.  A quasi-static certified peak clears
-        an overlapping disk in every frame, so the static map has a
-        no-evidence crater there; averaging the crater's zeros into the
-        wide background dug that background down around it, and the
-        band-pass acquired a positive rim just outside the crater -- up to
-        the crater's share of the wide kernel times ambient, comfortably
-        above any texture threshold.  The rim was then masked: a thin
-        annulus around every certified bright peak, manufactured by the
-        clearing itself.  With the evidence-weighted average the background
-        estimate outside the crater uses only real evidence, and inside it
-        the band is pinned to zero -- no evidence, no criteria.
-
-        The threshold is the *larger* of the effect-size criterion
-        (texture_factor x ambient) and a significance floor on the band's own
-        noise.  The boundary criterion always had its MAD test; the texture
-        criterion did not, so on a photon-sparse panel an aggressive
-        texture_factor would start masking Poisson speckle.  4 MADs is ~2.7
-        sigma of the band's own noise: measured on photon-sparse fixtures
-        (rate ~1-2, few frames) it sits at 0.19-0.26x ambient -- where the
-        old fixed threshold was -- while real detector panels, with more
-        frames and area behind the order statistic, have MADs far below any
-        sensible texture_factor, so there the factor alone governs.
-        """
-        vals = sm[valid] if valid.any() else sm.ravel()
-        ambient = max(float(np.median(vals)), 1e-3)
-        weight = valid.astype(np.float32)
-        num = ndimage.gaussian_filter(sm * weight, wide_sigma)
-        den = ndimage.gaussian_filter(weight, wide_sigma)
-        wide = np.where(den > 1e-3, num / np.maximum(den, 1e-3), 0.0)
-        band = np.where(valid, sm - wide, 0.0)
-        bvals = band[valid] if valid.any() else band.ravel()
-        band_mad = np.median(np.abs(bvals - np.median(bvals))) + 1e-9
-        return ambient, band, max(texture_factor * ambient, 4.0 * band_mad)
+    # The criterion lives on a *band-pass* of the static map: structure at
+    # scales between the atom footprint (smooth_sigma) and the background
+    # window (wide_sigma).  What the mask must mark is structure that
+    # defeats the background model -- and only that.  A wide static halo,
+    # however elevated or statically steep its shoulders, is followed by
+    # the windowed background estimate and is where real Bragg peaks live;
+    # masking it (as an absolute-gradient or absolute-level criterion does)
+    # removed genuine reflections from the centre of the l1-mbl forward
+    # banks.  The halo vanishes from the band-pass; what remains is exactly
+    # the peak-confusable statics: the illumination step (band-pass swing
+    # ~0.4x ambient), the plume's texture (~0.3x at its false-detection
+    # sites, against ~0.13x under real forward-bank peaks).
+    #
+    # The texture threshold is the *larger* of the effect-size criterion
+    # (texture_factor x ambient) and a significance floor on the band's own
+    # noise (4 MADs, ~2.7 sigma): without the floor, an aggressive
+    # texture_factor would start masking Poisson speckle on a photon-sparse
+    # panel.
+    ambient = max(float(np.median(sm)), 1e-3)
+    band = sm - ndimage.gaussian_filter(sm, wide_sigma)
+    band_mad = np.median(np.abs(band - np.median(band))) + 1e-9
+    texture_threshold = max(texture_factor * ambient, 4.0 * band_mad)
 
     def _tail_radius(sig: float, amp: float, scale: float, thr: float) -> float:
         """Radius where the peak's smoothed profile falls below ``thr``.
@@ -189,172 +139,101 @@ def estimate_static_mask(
             return float(np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / thr)))
         return 0.0
 
-    def _criteria(ambient: float, band: np.ndarray, thr: float) -> np.ndarray:
-        """Un-dilated bad set: band-pass level plus band-pass gradients.
-
-        Positive lobes only.  False peaks are *positive* unmodelled
-        structure; |band| would additionally mask the negative moat that the
-        wide subtraction digs around anything bright -- a ~wide_sigma-to-
-        2*wide_sigma ring, which on the forward banks turned every leak into
-        a ~20 px exclusion zone around a genuine reflection.
-
-        Steps also announce themselves as band-pass gradients; MADs alone
-        are a pure significance test whose floor on a flat panel is noise,
-        so the physical floor (gradient per pixel as a fraction of ambient)
-        guards it: the l1-mbl illumination boundary runs ~3% of ambient per
-        pixel.  The gradient criterion is restricted to the positive side
-        of the band for the same moat reason as above.
-        """
-        texture = band > thr
-        gy, gx = np.gradient(band)
-        grad = np.hypot(gy, gx)
-        grad_mad = np.median(np.abs(grad - np.median(grad))) + 1e-9
-        boundary = (
-            (np.abs(grad - np.median(grad)) > grad_nmads * grad_mad)
-            & (grad > grad_min_frac * ambient)
-            & (band > 0.0)
-        )
-        return boundary | texture
-
-    # Exonerated peaks leave the evidence pool: ``clear_disks`` carries, per
-    # frame, (row, col, sigma, amplitude) of detections whose fit metrics
-    # certify them as genuine (see build_mask_file).  Removing the footprint
-    # from *this frame's* evidence -- rather than subtracting a model, which
-    # would leave mismatch dipoles -- means a real reflection cannot be
-    # declared static however many frames it persists through, which is
-    # exactly what happens when a manually oriented crystal repeats its
-    # Laue zones.
+    # Un-dilated bad set: band-pass level plus band-pass gradients.
     #
-    # A certificate is a statement about a *peak*, not about the structure
-    # it sits on, so it explains at most the peak's own footprint: the
-    # amplitude-aware radius where the smoothed tail falls below the texture
+    # Positive lobes only.  False peaks are *positive* unmodelled
+    # structure; |band| would additionally mask the negative moat that the
+    # wide subtraction digs around anything bright -- a ~wide_sigma-to-
+    # 2*wide_sigma ring, which on the forward banks turned every leak into
+    # a ~20 px exclusion zone around a genuine reflection.
+    #
+    # Steps also announce themselves as band-pass gradients; MADs alone
+    # are a pure significance test whose floor on a flat panel is noise,
+    # so the physical floor (gradient per pixel as a fraction of ambient)
+    # guards it: the l1-mbl illumination boundary runs ~3% of ambient per
+    # pixel.  The gradient criterion is restricted to the positive side
+    # of the band for the same moat reason as above.
+    texture = band > texture_threshold
+    gy, gx = np.gradient(band)
+    grad = np.hypot(gy, gx)
+    grad_mad = np.median(np.abs(grad - np.median(grad))) + 1e-9
+    boundary = (
+        (np.abs(grad - np.median(grad)) > grad_nmads * grad_mad)
+        & (grad > grad_min_frac * ambient)
+        & (band > 0.0)
+    )
+    bad = boundary | texture
+
+    # Certificates exist to protect peaks -- nothing else.  The mask may be
+    # as liberal as it likes about admitting static structure, because the
+    # only harm masking can do is eat a genuine reflection, and that is
+    # exactly what protection covers: an accepted certificate subtracts a
+    # disk over precisely where its own smoothed tail exceeds the texture
     # threshold (with a 2*smooth_sigma margin for the frame-to-frame wobble
-    # the fitted sigma cannot know), never less than the n-sigma clearance.
-    # A detection whose underlying static structure extends far beyond that
-    # footprint is *refused*: its metrics may be clean -- measured on
-    # l1-mbl, detections on the illumination edges carry deviance 20+ and
-    # residual/DoF < 2, indistinguishable from faint genuine peaks -- but
-    # honouring them would punch a chain of cleared craters and protection
-    # disks along the edge and dissolve the very mask this estimator
-    # exists to build.  The gate is geometric: the un-cleared static map's
-    # connected components under the peak's core must fit within 4x the
-    # protected radius.  Components are measured after a morphological
-    # closing at the map's own correlation length (2*smooth_sigma): a
-    # noisy edge is a chain of fragments -- each innocently compact --
-    # broken at the noise scale, so closing fuses one structure back
-    # together, while real separations (adjacent Laue-arc reflections,
-    # ~20-40 px apart) stay separate.  The full dilation would be wrong
-    # here: at dilate_px=8 it bridged speckle into panel-spanning blobs
-    # and the gate refused the forward-bank arcs wholesale.  Measured on
-    # l1-mbl the split is bimodal: compact peak leaks reach ~0.8x of the
-    # gate at the 90th percentile, edge components sit at 4-12x with
-    # extents of 200-500 px.
+    # the fitted sigma cannot know), plus the dilation the bad set receives,
+    # so a certified footprint never reaches the final mask however bright.
+    # Certificates never touch the evidence: an earlier design also cleared
+    # the certified footprints out of the frame stack before the quantile,
+    # and every failure mode of this estimator's history -- exclusion rings,
+    # crater rims, edges dissolving under chains of false certificates --
+    # came from that clearing.  Protection is sufficient and its worst case
+    # (a false certificate) is one bounded, visible disk.
     #
-    # ``protect_disks`` (one flat list, not per frame) carries certificates
-    # that may *protect the final mask* but never clear evidence.  Pooled
-    # certificates arrive here: a pooled certificate acts on every frame of
-    # its bank at once, so a false one -- a ridge atom from the summed
-    # stack that slips the gate -- would clear a crater through the entire
-    # evidence pool, a hole no criterion can reach afterwards.  Bounding it
-    # to protection caps the damage at one visible disk.  Nothing is lost
-    # for the peaks protection exists to rescue: a certificate's protection
-    # radius covers precisely where its own smoothed tail exceeds the
-    # texture threshold (plus wobble margin and dilation), so its footprint
-    # never reaches the final mask whether or not the evidence underneath
-    # was cleared.  Clearing remains reserved for per-frame certificates,
-    # where a false one touches one frame of the quantile.
-    #
-    # The gate and the radii need the texture threshold, which is measured
-    # from the map itself -- so the reduction runs twice: an *uncleared*
-    # pass sets the threshold and exposes the structure the gate inspects,
-    # then the accepted footprints leave the evidence and the criteria run
-    # on the cleaned map.
-    rr = cc = None
-    kept = None
-    radii = None
-    kept_protect: list | None = None
-    if clear_disks is not None or protect_disks is not None:
-        rr, cc = np.mgrid[0 : stack.shape[1], 0 : stack.shape[2]]
-        smooth0, valid0 = _reduce(None, None)
-        ambient0, band0, thr0 = _threshold(smooth0, valid0)
-        bad0 = ndimage.binary_closing(
-            _criteria(ambient0, band0, thr0),
-            iterations=int(np.ceil(2.0 * smooth_sigma)),
+    # The gate: a certificate is a statement about a *peak*, not about the
+    # structure it sits on.  A detection whose underlying static component
+    # extends beyond 4x its protected radius is refused: its metrics may be
+    # clean -- measured on l1-mbl, detections on the illumination edges
+    # carry deviance 20+ and residual/DoF < 2, indistinguishable from faint
+    # genuine peaks -- but honouring them would open a chain of disks along
+    # the edge.  Components are measured after a morphological closing at
+    # the map's own correlation length (2*smooth_sigma): a noisy edge is a
+    # chain of fragments -- each innocently compact -- broken at the noise
+    # scale, so closing fuses one structure back together, while real
+    # separations (adjacent Laue-arc reflections, ~20-40 px apart) stay
+    # separate.  The full dilation would be wrong here: at dilate_px=8 it
+    # bridged speckle into panel-spanning blobs and the gate refused the
+    # forward-bank arcs wholesale.  Measured on l1-mbl the split is bimodal:
+    # compact peak leaks reach ~0.8x of the gate at the 90th percentile,
+    # edge components sit at 4-12x with extents of 200-500 px.
+    accepted: list[tuple[float, float, float, float, float]] = []
+    if protect_disks:
+        closed = ndimage.binary_closing(
+            bad, iterations=int(np.ceil(2.0 * smooth_sigma))
         )
-        lab0, n0 = ndimage.label(bad0)
-        extents = np.zeros(n0 + 1)
-        for i, sl in enumerate(ndimage.find_objects(lab0), start=1):
+        lab, n_comp = ndimage.label(closed)
+        extents = np.zeros(n_comp + 1)
+        for i, sl in enumerate(ndimage.find_objects(lab), start=1):
             if sl is not None:
                 extents[i] = max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start)
-        H, W = lab0.shape
+        H, W = lab.shape
+        scale = float(scales.mean())
+        for r0, c0, sig, amp in protect_disks:
+            rad = max(
+                protect_nsigmas * sig + 2.0 * smooth_sigma,
+                _tail_radius(sig, amp, scale, texture_threshold) + 2.0 * smooth_sigma,
+            )
+            core = int(np.ceil(protect_nsigmas * sig))
+            lo_r, hi_r = max(0, int(r0) - core), min(H, int(r0) + core + 1)
+            lo_c, hi_c = max(0, int(c0) - core), min(W, int(c0) + core + 1)
+            d2 = (np.arange(lo_r, hi_r)[:, None] - r0) ** 2 + (
+                np.arange(lo_c, hi_c)[None, :] - c0
+            ) ** 2
+            comps = np.unique(
+                lab[lo_r:hi_r, lo_c:hi_c][d2 <= (protect_nsigmas * sig) ** 2]
+            )
+            if any(extents[k] > 4.0 * rad for k in comps if k > 0):
+                continue
+            accepted.append((r0, c0, sig, amp, rad))
 
-        def _gated(disks: list, scale: float) -> tuple[list, list]:
-            """The disks whose certificates survive the gate, with radii."""
-            out_disks, out_radii = [], []
-            for r0, c0, sig, amp in disks:
-                rad = max(
-                    clear_nsigmas * sig + 2.0 * smooth_sigma,
-                    _tail_radius(sig, amp, scale, thr0) + 2.0 * smooth_sigma,
-                )
-                core = int(np.ceil(clear_nsigmas * sig))
-                lo_r, hi_r = max(0, int(r0) - core), min(H, int(r0) + core + 1)
-                lo_c, hi_c = max(0, int(c0) - core), min(W, int(c0) + core + 1)
-                d2 = (np.arange(lo_r, hi_r)[:, None] - r0) ** 2 + (
-                    np.arange(lo_c, hi_c)[None, :] - c0
-                ) ** 2
-                comps = np.unique(
-                    lab0[lo_r:hi_r, lo_c:hi_c][d2 <= (clear_nsigmas * sig) ** 2]
-                )
-                if any(extents[k] > 4.0 * rad for k in comps if k > 0):
-                    continue
-                out_disks.append((r0, c0, sig, amp))
-                out_radii.append(rad)
-            return out_disks, out_radii
-
-        if clear_disks is not None:
-            kept, radii = [], []
-            for fi, disks in enumerate(clear_disks):
-                kept_disks, kept_radii = _gated(disks, float(scales[fi].squeeze()))
-                kept.append(kept_disks)
-                radii.append(kept_radii)
-        if protect_disks is not None:
-            kept_protect, _ = _gated(protect_disks, float(scales.mean()))
-        smooth, valid = _reduce(kept, radii)
-    else:
-        smooth, valid = _reduce(None, None)
-
-    ambient, band, texture_threshold = _threshold(smooth, valid)
-    bad = _criteria(ambient, band, texture_threshold)
     if dilate_px > 0:
         bad = ndimage.binary_dilation(bad, iterations=int(dilate_px))
 
-    # Exoneration must also *protect the final mask*.  The evidence clearing
-    # above removes the tails at their source, but a peak certified in only
-    # some frames still leaks through the others' quantile, and the
-    # uncleared-pass threshold the clearing radii were computed against can
-    # sit slightly above the final one.  The protected radius is the cleared
-    # radius plus the dilation the bad set just received, recomputed against
-    # the final threshold, and it is subtracted *after* dilation so nothing
-    # grows back in.  An accepted certificate's footprint is then never
-    # masked, however bright.
-    if kept is not None or kept_protect is not None:
+    # Protection is subtracted *after* dilation so nothing grows back in.
+    if accepted:
+        rr, cc = np.mgrid[0 : bad.shape[0], 0 : bad.shape[1]]
         protected = np.zeros_like(bad)
-
-        def _protect(r0, c0, sig, amp, scale, floor):
-            r_tail = _tail_radius(sig, amp, scale, texture_threshold)
-            rad = max(floor, r_tail + 2.0 * smooth_sigma) + dilate_px
-            return (rr - r0) ** 2 + (cc - c0) ** 2 <= rad**2
-
-        if kept is not None:
-            for fi, disks in enumerate(kept):
-                scale = float(scales[fi].squeeze())
-                for (r0, c0, sig, amp), cleared in zip(disks, radii[fi]):
-                    protected |= _protect(r0, c0, sig, amp, scale, cleared)
-        if kept_protect is not None:
-            scale = float(scales.mean())
-            for r0, c0, sig, amp in kept_protect:
-                floor = clear_nsigmas * sig + 2.0 * smooth_sigma
-                protected |= _protect(r0, c0, sig, amp, scale, floor)
+        for r0, c0, _sig, _amp, rad in accepted:
+            protected |= (rr - r0) ** 2 + (cc - c0) ** 2 <= (rad + dilate_px) ** 2
         bad &= ~protected
 
     return (~bad).astype(np.uint8)
@@ -543,8 +422,8 @@ def _confident_peaks_by_frame(
     control already governs above it -- see CHI2_4_P95) and a shape the
     atom family explains (residual deviance per DoF near one).  An
     artifact fails one or both and earns no exoneration.  The geometry of
-    the cleared/protected region is the estimator's business -- it knows
-    the ambient rate a peak's tail must be compared against.
+    the protected region is the estimator's business -- it knows the
+    ambient rate a peak's tail must be compared against.
     """
     out: dict[int, list[tuple[float, float, float, float]]] = {}
     with h5py.File(peaks_path, "r") as f:
@@ -645,21 +524,21 @@ def build_mask_file(
     Inputs are reduced/merged stacks (``images`` + ``bank_ids``); they may
     come from different samples.  The cleanest input is a control experiment
     without a sample, where everything is static and nothing needs rescuing.
-    When only sample scans exist, ``peaks`` (finder outputs from an unmasked
-    run, paired with ``inputs`` by order) exonerates detections whose fit
-    metrics certify them as genuine: their footprints leave the static
-    evidence per frame, so a reflection cannot be declared static however
-    many frames it persists through -- which quasi-static Laue zones from a
-    manually oriented crystal otherwise are.  ``pooled_peaks`` (a finder
-    output from the per-bank *summed* stack, see ``build_summed_file``)
-    extends the same rescue to reflections too faint for any single frame's
-    certificate: their significance compounds across frames there, and a
-    certified pooled peak's footprint is protected in the final mask of its
-    bank (protection only -- a pooled certificate never clears evidence,
-    bounding the cost of a false one to a single disk).  A bank
-    with fewer than ``min_frames`` frames gets a fully valid mask -- stated
-    in the summary rather than silently guessed from statistics too thin to
-    tell a peak from a shadow.
+    When only sample scans exist, certificates *protect* genuine peaks --
+    and do nothing else: the mask is deliberately liberal about admitting
+    static structure, because the only harm masking can do is eat a
+    reflection, and a certified footprint is subtracted from the final mask
+    (see ``estimate_static_mask``).  ``peaks`` (finder outputs from an
+    unmasked run, paired with ``inputs`` by order) certifies detections by
+    their per-frame fit metrics; ``pooled_peaks`` (a finder output from the
+    per-bank *summed* stack, see ``build_summed_file``) extends the rescue
+    to reflections too faint for any single frame's certificate, whose
+    significance compounds across frames there.  A quasi-static reflection
+    -- Laue zones from a manually oriented crystal -- is thereby findable
+    however many frames it persists through.  A bank with fewer than
+    ``min_frames`` frames gets a fully valid mask -- stated in the summary
+    rather than silently guessed from statistics too thin to tell a peak
+    from a shadow.
     """
     if peaks is not None and len(peaks) != len(inputs):
         raise ValueError(
@@ -697,32 +576,23 @@ def build_mask_file(
             masks.append(np.ones(frames.shape[1:], dtype=np.uint8))
             thin.append(bank)
         else:
-            clear_disks = None
-            bank_pooled = [
+            protect = [
                 # The pooled amplitude is a sum over this bank's frames; a
                 # static feature's per-frame amplitude is that divided by
-                # the frame count (exact by definition of static).  Pooled
-                # certificates protect the final mask but never clear
-                # evidence: they act on every frame at once, so a false one
-                # would crater the whole evidence pool, while protection
-                # caps the damage at one disk -- and protection alone
-                # already guarantees a certified footprint is never masked.
+                # the frame count (exact by definition of static).
                 (r0, c0, sig, amp / frames.shape[0])
                 for r0, c0, sig, amp in pooled.get(bank, [])
             ]
-            n_exonerated_pooled += len(bank_pooled)
-            if confident:
-                clear_disks = []
-                for file_index, image_index in provenance[bank]:
-                    disks = confident.get(file_index, {}).get(image_index, [])
-                    n_exonerated += len(disks)
-                    clear_disks.append(disks)
+            n_exonerated_pooled += len(protect)
+            for file_index, image_index in provenance[bank]:
+                disks = confident.get(file_index, {}).get(image_index, [])
+                n_exonerated += len(disks)
+                protect.extend(disks)
             masks.append(
                 estimate_static_mask(
                     frames,
-                    clear_disks=clear_disks,
-                    protect_disks=bank_pooled or None,
-                    clear_nsigmas=peak_clear_nsigmas,
+                    protect_disks=protect or None,
+                    protect_nsigmas=peak_clear_nsigmas,
                     smooth_sigma=smooth_sigma,
                     grad_nmads=grad_nmads,
                     texture_factor=texture_factor,
