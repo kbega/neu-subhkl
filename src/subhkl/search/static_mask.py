@@ -52,6 +52,7 @@ def estimate_static_mask(
     grad_nmads: float = 8.0,
     texture_factor: float = 0.15,
     wide_sigma: float = 10.0,
+    edge_sigma: float = 25.0,
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
@@ -79,8 +80,16 @@ def estimate_static_mask(
     structure, not statistics (the l1-mbl illumination edge measures ~8 MADs
     of margin even at threshold 8).  ``texture_factor`` is the band-pass level
     criterion, relative to the panel's ambient rate; ``wide_sigma`` sets the
-    long end of the band and should sit at the background window's scale
-    (the finder's is max(15, 5 * max_sigma) px wide).  ``dilate_px`` should cover an atom
+    long end of the *level* band (the glow-texture scale); ``edge_sigma``
+    sets the long end of the *contrast* band -- the scale the finder's own
+    background model can actually follow (its window is max(15,
+    5 * max_sigma) px).  They differ because their failure modes differ: a
+    longer level band lets plateaus inflate the MAD floor and re-admits
+    dense-diffraction texture, while a shorter contrast band opens a blind
+    gap -- the l1-mbl backward-panel illumination boundaries (10-90% widths
+    ~40 px) vanished from a 10 px band yet still produced false atoms,
+    because the finder could not follow them either; their capture
+    saturates at 25.  ``dilate_px`` should cover an atom
     footprint (~2 * max_sigma) so that an atom whose tail rests on the
     structure is masked along with it.
     """
@@ -126,6 +135,11 @@ def estimate_static_mask(
     band = sm - ndimage.gaussian_filter(sm, wide_sigma)
     band_mad = np.median(np.abs(band - np.median(band))) + 1e-9
     texture_threshold = max(texture_factor * ambient, 4.0 * band_mad)
+    # The contrast criterion gets its own, longer band: sharpness is judged
+    # against what the finder's background can follow, not against the
+    # glow-texture scale.  Plateaus are harmless here -- flat regions have
+    # zero gradient -- so the longer band costs nothing.
+    band_edge = sm - ndimage.gaussian_filter(sm, edge_sigma)
 
     def _tail_radius(sig: float, amp: float, scale: float, thr: float) -> float:
         """Radius where the peak's smoothed profile falls below ``thr``.
@@ -168,14 +182,14 @@ def estimate_static_mask(
     # beyond any protection disk.  False atoms are positive structure;
     # nothing below zero band needs masking.
     texture = band > texture_threshold
-    gy, gx = np.gradient(band)
+    gy, gx = np.gradient(band_edge)
     edge = ndimage.gaussian_filter(np.hypot(gy, gx), smooth_sigma)
     edge_med = np.median(edge)
     edge_mad = np.median(np.abs(edge - edge_med)) + 1e-9
     boundary = (
         (edge - edge_med > grad_nmads * edge_mad)
         & (edge > grad_min_frac * ambient)
-        & (band > 0.0)
+        & (band_edge > 0.0)
     )
     bad = boundary | texture
 
@@ -530,6 +544,7 @@ def build_mask_file(
     grad_nmads: float = 8.0,
     texture_factor: float = 0.15,
     wide_sigma: float = 10.0,
+    edge_sigma: float = 25.0,
     dilate_px: int = 8,
     static_quantile: float = 25.0,
     grad_min_frac: float = 0.02,
@@ -612,6 +627,7 @@ def build_mask_file(
                     grad_nmads=grad_nmads,
                     texture_factor=texture_factor,
                     wide_sigma=wide_sigma,
+                    edge_sigma=edge_sigma,
                     dilate_px=dilate_px,
                     static_quantile=static_quantile,
                     grad_min_frac=grad_min_frac,
@@ -635,6 +651,7 @@ def build_mask_file(
         f.attrs["grad_nmads"] = grad_nmads
         f.attrs["texture_factor"] = texture_factor
         f.attrs["wide_sigma"] = wide_sigma
+        f.attrs["edge_sigma"] = edge_sigma
         f.attrs["dilate_px"] = dilate_px
         f.attrs["static_quantile"] = static_quantile
         f.attrs["grad_min_frac"] = grad_min_frac

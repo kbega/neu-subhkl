@@ -1029,10 +1029,21 @@ def static_mask(
     wide_sigma: Annotated[
         float,
         typer.Option(
-            help="Long end of the band, px; set to the background window's "
-            "scale (the finder's window is max(15, 5 * max_sigma) px)."
+            help="Long end of the *level* band, px (the glow-texture "
+            "scale).  Longer lets plateaus inflate the noise floor and "
+            "re-admits dense-diffraction texture."
         ),
     ] = 10.0,
+    edge_sigma: Annotated[
+        float,
+        typer.Option(
+            help="Long end of the *contrast* band, px: the scale the "
+            "finder's background model can actually follow (its window is "
+            "max(15, 5 * max_sigma) px).  Shorter opens a blind gap -- "
+            "edges too diffuse for the band yet too sharp for the finder "
+            "produced false atoms at 10; their capture saturates at 25."
+        ),
+    ] = 25.0,
     dilate_px: Annotated[
         int,
         typer.Option(
@@ -1083,6 +1094,7 @@ def static_mask(
         grad_nmads=grad_nmads,
         texture_factor=texture_factor,
         wide_sigma=wide_sigma,
+        edge_sigma=edge_sigma,
         dilate_px=dilate_px,
         static_quantile=static_quantile,
         grad_min_frac=grad_min_frac,
