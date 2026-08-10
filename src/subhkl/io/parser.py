@@ -1033,7 +1033,7 @@ def static_mask(
             "scale).  Longer lets plateaus inflate the noise floor and "
             "re-admits dense-diffraction texture."
         ),
-    ] = 10.0,
+    ] = 20.0,
     edge_sigma: Annotated[
         float,
         typer.Option(

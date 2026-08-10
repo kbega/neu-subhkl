@@ -85,8 +85,15 @@ def test_mask_file_round_trip_maps_by_physical_bank(tmp_path):
             f["bank_ids"] = np.repeat(banks, 3)
 
     out = tmp_path / "mask.h5"
+    # wide_sigma pinned to the fixture scale: a 64 px canvas cannot host the
+    # 20 px default (the wide smooth degenerates to the global mean and the
+    # plateau inflates the MAD floor) -- the subject here is bank mapping.
     summary = build_mask_file(
-        [tmp_path / "scan1.h5", tmp_path / "scan2.h5"], out, min_frames=5, dilate_px=2
+        [tmp_path / "scan1.h5", tmp_path / "scan2.h5"],
+        out,
+        min_frames=5,
+        dilate_px=2,
+        wide_sigma=10.0,
     )
     assert summary["banks"] == [3, 7]
     assert summary["n_frames"] == {3: 6, 7: 6}
@@ -366,7 +373,11 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
     # statistics alone) static -- and masked.  This is the hazard.
     from subhkl.search.static_mask import build_mask_file, load_mask_for_banks
 
-    build_mask_file([tmp_path / "scan.h5"], tmp_path / "m0.h5", dilate_px=4)
+    # wide_sigma pinned to the fixture scale (see the bank-mapping test);
+    # the subject here is the exoneration contract.
+    build_mask_file(
+        [tmp_path / "scan.h5"], tmp_path / "m0.h5", dilate_px=4, wide_sigma=10.0
+    )
     m0 = load_mask_for_banks(tmp_path / "m0.h5", [4], (size, size))[0]
     assert m0[36:44, 26:34].mean() < 0.5
 
@@ -377,6 +388,7 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
         tmp_path / "m1.h5",
         peaks=[tmp_path / "peaks.h5"],
         dilate_px=4,
+        wide_sigma=10.0,
     )
     m1 = load_mask_for_banks(tmp_path / "m1.h5", [4], (size, size))[0]
     assert m1[36:44, 26:34].mean() > 0.9
@@ -402,6 +414,7 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
         tmp_path / "m3.h5",
         peaks=[tmp_path / "faint.h5"],
         dilate_px=4,
+        wide_sigma=10.0,
     )
     m3 = load_mask_for_banks(tmp_path / "m3.h5", [4], (size, size))[0]
     assert m3[36:44, 26:34].mean() > 0.9
@@ -418,6 +431,7 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
         tmp_path / "m2.h5",
         peaks=[tmp_path / "bad.h5"],
         dilate_px=4,
+        wide_sigma=10.0,
     )
     m2 = load_mask_for_banks(tmp_path / "m2.h5", [4], (size, size))[0]
     assert m2[36:44, 26:34].mean() < 0.5
@@ -639,11 +653,13 @@ def test_a_certificate_on_extended_structure_is_refused(tmp_path):
         f["peaks/deviance"] = np.full(n, 120.0)
         f["peaks/residual_deviance"] = np.full(n, 1.1)
 
+    # wide_sigma pinned to the fixture scale; the subject here is the gate.
     build_mask_file(
         [tmp_path / "scan.h5"],
         tmp_path / "m.h5",
         peaks=[tmp_path / "peaks.h5"],
         dilate_px=4,
+        wide_sigma=10.0,
     )
     m = load_mask_for_banks(tmp_path / "m.h5", [4], (size, size))[0]
     # The genuine peak keeps its rescue ...
