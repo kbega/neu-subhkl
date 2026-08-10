@@ -227,36 +227,55 @@ def test_mask_is_invariant_to_exposure_time():
     assert both / either > 0.75
 
 
-def test_dense_diffraction_does_not_leak_into_the_static_map():
-    """A reflection ring that keeps some peak near the same pixels in half
-    the frames polluted a median-based map and masked genuine Bragg peaks
-    (measured on l1-mbl forward banks).  The low-quantile map is clean."""
+def test_dense_diffraction_is_protected_and_subset_artifacts_are_caught():
+    """The two sides of the quantile union's bargain, in one frame stack.
+
+    A reflection ring whose positions recur every few frames leaks into the
+    p75 map by the same token that makes the map see subset-frame
+    artifacts; the pipeline's answer is certificates, so the ring's
+    (certified) positions must stay valid through protection.  Meanwhile an
+    artifact present in only a third of the frames -- an illumination
+    boundary that shifts with a manually-set orientation class, invisible
+    to the low quantile by construction -- must be caught by the high one.
+    The always-static edge stays masked on its bright shoulder, and only
+    there: false peaks are positive structure."""
     rng = np.random.default_rng(17)
     size = 128
+    ring_pos = []
+    for j in range(10):
+        angle = 2 * np.pi * j / 10
+        ring_pos.append((60.0 + 25 * np.sin(angle), 38.0 + 25 * np.cos(angle)))
     frames = []
     for k in range(12):
         rate = np.full((size, size), 1.0)
-        rate[:, 90:] = 0.3  # keep a real static edge in the frame
-        # Dense pattern: bright peaks on a ring, positions jittering a few
-        # pixels frame to frame.  Each position is lit in 2 of 12 frames --
-        # the physical rate for a reflection in a rotation scan -- so the
-        # ring as a whole is always occupied somewhere while no pixel is.
-        for j in range(10):
+        rate[:, 90:] = 0.3  # always-static edge
+        if k < 4:
+            # The subset artifact: a bright strip present in 4 of 12 frames
+            # (kept clear of the ring so no protection disk overlaps it).
+            rate[2:8, :] = 3.5
+        for j, (r0, c0) in enumerate(ring_pos):
             if (k + j) % 6:
                 continue
-            angle = 2 * np.pi * j / 10
-            r0 = 60 + 25 * np.sin(angle) + rng.integers(-2, 3)
-            c0 = 45 + 25 * np.cos(angle) + rng.integers(-2, 3)
-            rate += pixel_integrated_gaussian(rate.shape, r0, c0, 2.0, 60.0)
+            rate += pixel_integrated_gaussian(
+                rate.shape,
+                r0 + rng.integers(-2, 3),
+                c0 + rng.integers(-2, 3),
+                2.0,
+                60.0,
+            )
         frames.append(rng.poisson(rate).astype(np.float32))
-    valid = estimate_static_mask(np.stack(frames), dilate_px=4)
 
-    # The static edge's bright shoulder -- where the background model
-    # overshoots and false atoms form -- is masked.  The dark side is
-    # deliberately not: false peaks are positive structure.
+    disks = [(r0, c0, 2.0, 60.0) for r0, c0 in ring_pos]
+    valid = estimate_static_mask(np.stack(frames), dilate_px=4, protect_disks=disks)
+
+    # The static edge's bright shoulder is masked; the dark side is not.
     assert valid[:, 84:90].mean() < 0.2
+    # The subset-frame strip is masked: the p75 map holds it.  (The
+    # interior; the outermost rows see border-weakened band estimates.)
+    assert valid[3:8, 20:70].mean() < 0.2
+    # The certified ring stays findable through protection.
     rr, cc = np.mgrid[0:size, 0:size]
-    ring = np.abs(np.hypot(rr - 60.0, cc - 45.0) - 25.0) < 6
+    ring = np.abs(np.hypot(rr - 60.0, cc - 38.0) - 25.0) < 6
     assert valid[ring].mean() > 0.9
 
 

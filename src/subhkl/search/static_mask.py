@@ -67,13 +67,18 @@ def estimate_static_mask(
       static feature at a different exposure (or beam current) produces the
       same mask, and frames of mixed exposures may be pooled.  Both criteria
       below are then ratios on a relative rate map rather than counts.
-    * The static map is a *low quantile* across frames (default p25), not
-      the median.  A dense diffraction pattern puts some reflection near a
-      given pixel in half the frames, which pollutes a median built from a
-      handful of runs -- measured on l1-mbl forward banks, where the median
-      map's gradients masked genuine Bragg peaks.  A static feature is
-      present in *every* frame, so it survives any quantile; a reflection
-      would have to sit still through >75% of the scan to leak in.
+    * The criteria run on a *union of quantile maps* across frames: the low
+      quantile (``static_quantile``, default p25) holds what is static in
+      nearly every frame, and p75 holds what is static in at least a
+      quarter of them -- an illumination boundary that shifts between
+      manually-set orientation classes lives only in the latter.  Each map
+      carries full multi-frame SNR (per-frame detection with an
+      across-frame vote was measured and rejected: single frames at 1-2
+      counts/px sit at their own noise floor, and recurring noise votes
+      like a subset artifact).  Reflections recurring in a minority of
+      frames leak into the high quantile by the same token; certificate
+      protection is what makes that affordable, and the measured
+      dense-bank cost is +0.5 points.
 
     ``grad_nmads`` is the boundary criterion: pixels where the static map's
     gradient magnitude exceeds this many MADs of the panel-wide gradient are
@@ -111,35 +116,6 @@ def estimate_static_mask(
     # any threshold stated in units of a ~2-count ambient.  Measured on
     # l1-mbl forward banks as an exclusion ring around every true peak.
     stack = np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates])
-    sm = np.percentile(stack, static_quantile, axis=0, method="lower")
-
-    # The criterion lives on a *band-pass* of the static map: structure at
-    # scales between the atom footprint (smooth_sigma) and the background
-    # window (wide_sigma).  What the mask must mark is structure that
-    # defeats the background model -- and only that.  A wide static halo,
-    # however elevated or statically steep its shoulders, is followed by
-    # the windowed background estimate and is where real Bragg peaks live;
-    # masking it (as an absolute-gradient or absolute-level criterion does)
-    # removed genuine reflections from the centre of the l1-mbl forward
-    # banks.  The halo vanishes from the band-pass; what remains is exactly
-    # the peak-confusable statics: the illumination step (band-pass swing
-    # ~0.4x ambient), the plume's texture (~0.3x at its false-detection
-    # sites, against ~0.13x under real forward-bank peaks).
-    #
-    # The texture threshold is the *larger* of the effect-size criterion
-    # (texture_factor x ambient) and a significance floor on the band's own
-    # noise (4 MADs, ~2.7 sigma): without the floor, an aggressive
-    # texture_factor would start masking Poisson speckle on a photon-sparse
-    # panel.
-    ambient = max(float(np.median(sm)), 1e-3)
-    band = sm - ndimage.gaussian_filter(sm, wide_sigma)
-    band_mad = np.median(np.abs(band - np.median(band))) + 1e-9
-    texture_threshold = max(texture_factor * ambient, 4.0 * band_mad)
-    # The contrast criterion gets its own, longer band: sharpness is judged
-    # against what the finder's background can follow, not against the
-    # glow-texture scale.  Plateaus are harmless here -- flat regions have
-    # zero gradient -- so the longer band costs nothing.
-    band_edge = sm - ndimage.gaussian_filter(sm, edge_sigma)
 
     def _tail_radius(sig: float, amp: float, scale: float, thr: float) -> float:
         """Radius where the peak's smoothed profile falls below ``thr``.
@@ -153,45 +129,79 @@ def estimate_static_mask(
             return float(np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / thr)))
         return 0.0
 
-    # Un-dilated bad set: two criteria on the band-pass, one per way a
-    # static feature can defeat the background model.
+    # The criteria live on a *band-pass* of a static map: structure at
+    # scales between the atom footprint (smooth_sigma) and the background
+    # window.  What the mask must mark is structure that defeats the
+    # background model -- and only that.  A wide static halo, however
+    # elevated or statically steep its shoulders, is followed by the
+    # windowed background estimate and is where real Bragg peaks live;
+    # masking it (as an absolute-gradient or absolute-level criterion does)
+    # removed genuine reflections from the centre of the l1-mbl forward
+    # banks.  The halo vanishes from the band-pass; what remains is exactly
+    # the peak-confusable statics.
     #
-    # *Level* (texture): elevated positive band, the diffuse-glow signature.
-    # Positive lobes only -- false atoms are positive unmodelled structure,
-    # and |band| would additionally mask the negative moat the wide
-    # subtraction digs around anything bright.
+    # Two criteria, one per way a static feature defeats the model:
     #
-    # *Contrast* (boundary): the smoothed gradient magnitude of the band,
-    # then a MAD significance test -- edge filter first, significance
-    # second.  Smoothing the magnitude (not the band) consolidates the
-    # flanks of any sharp feature at any orientation: an unbroken ridge or
-    # step whose pointwise gradients dip in and out of significance with
-    # the noise masks contiguously, because its neighbours along the
-    # feature vote into every pixel's smoothed value.  This replaces both
-    # the old pointwise-gradient rule and an axis-aligned line filter --
-    # one orientation-free criterion instead of two special-cased ones.
-    # The smoothed-magnitude noise floor is far below the pointwise one,
-    # so the MADs are taken on the smoothed map itself; the physical floor
-    # (gradient per pixel as a fraction of ambient) still guards flat
-    # panels, where a pure significance test would mask soft genuine
-    # variation (the l1-mbl illumination boundary runs ~3% of ambient per
-    # pixel).  The band > 0 restriction stays: the negative moat the wide
-    # subtraction digs around anything bright has a deep outer slope whose
-    # smoothed gradient is highly significant, and without the restriction
-    # it masked a ring around every bright spot at ~2x wide_sigma --
-    # beyond any protection disk.  False atoms are positive structure;
-    # nothing below zero band needs masking.
-    texture = band > texture_threshold
-    gy, gx = np.gradient(band_edge)
-    edge = ndimage.gaussian_filter(np.hypot(gy, gx), smooth_sigma)
-    edge_med = np.median(edge)
-    edge_mad = np.median(np.abs(edge - edge_med)) + 1e-9
-    boundary = (
-        (edge - edge_med > grad_nmads * edge_mad)
-        & (edge > grad_min_frac * ambient)
-        & (band_edge > 0.0)
-    )
-    bad = boundary | texture
+    # *Level* (texture): elevated positive band, the diffuse-glow
+    # signature.  Positive lobes only -- false atoms are positive
+    # unmodelled structure, and |band| would additionally mask the negative
+    # moat the wide subtraction digs around anything bright.  The threshold
+    # is the larger of the effect-size criterion (texture_factor x ambient)
+    # and a significance floor on the band's own noise (4 MADs, ~2.7
+    # sigma): without the floor, an aggressive texture_factor would start
+    # masking Poisson speckle on a photon-sparse panel.
+    #
+    # *Contrast* (boundary): the smoothed gradient magnitude of its own,
+    # longer band (edge_sigma -- sharpness is judged against what the
+    # finder's background can follow, and plateaus cost nothing there
+    # since flat regions have zero gradient), then a MAD significance
+    # test.  Smoothing the magnitude consolidates the flanks of any sharp
+    # feature at any orientation, so an unbroken ridge masks contiguously.
+    # The physical floor (gradient per pixel as a fraction of ambient)
+    # guards flat panels; the band > 0 restriction keeps the wide
+    # subtraction's negative moat -- whose outer slope is highly
+    # significant -- from ringing every bright spot.
+    def _criteria(sm: np.ndarray) -> tuple[np.ndarray, float, float]:
+        """(un-dilated bad set, ambient, texture threshold) of one map."""
+        ambient = max(float(np.median(sm)), 1e-3)
+        band = sm - ndimage.gaussian_filter(sm, wide_sigma)
+        band_mad = np.median(np.abs(band - np.median(band))) + 1e-9
+        thr = max(texture_factor * ambient, 4.0 * band_mad)
+        texture = band > thr
+        band_e = sm - ndimage.gaussian_filter(sm, edge_sigma)
+        gy, gx = np.gradient(band_e)
+        edge = ndimage.gaussian_filter(np.hypot(gy, gx), smooth_sigma)
+        edge_med = np.median(edge)
+        edge_mad = np.median(np.abs(edge - edge_med)) + 1e-9
+        boundary = (
+            (edge - edge_med > grad_nmads * edge_mad)
+            & (edge > grad_min_frac * ambient)
+            & (band_e > 0.0)
+        )
+        return boundary | texture, ambient, thr
+
+    # An artifact need not be static in *every* frame: an illumination
+    # boundary that shifts between manually-set orientation classes is
+    # present in a quarter or half of the frames and invisible to the low
+    # quantile by construction.  The criteria therefore run on a union of
+    # quantile maps -- p25 ("static in nearly all frames") and p75
+    # ("static in at least a quarter of frames") -- each at full
+    # multi-frame SNR.  Per-frame edge detection with an across-frame vote
+    # was measured and rejected: at 1-2 counts/px a single frame's edge
+    # map sits at its own noise floor, and recurring noise votes at the
+    # same rate as subset artifacts.  The high quantile was historically
+    # unusable because moving reflections leak into it; certificate
+    # protection is what makes it safe now -- and the measured dense-bank
+    # cost is +0.5 points.  The protection radius is computed against the
+    # smallest of the maps' texture thresholds (the largest radius).
+    quantiles = sorted({float(static_quantile), 75.0})
+    bad = np.zeros(stack.shape[1:], dtype=bool)
+    texture_threshold = np.inf
+    for q in quantiles:
+        sm_q = np.percentile(stack, q, axis=0, method="lower")
+        bad_q, _, thr_q = _criteria(sm_q)
+        bad |= bad_q
+        texture_threshold = min(texture_threshold, thr_q)
 
     # Certificates exist to protect peaks -- nothing else.  The mask may be
     # as liberal as it likes about admitting static structure, because the
