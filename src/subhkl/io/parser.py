@@ -1060,6 +1060,16 @@ def static_mask(
             "illumination edge runs percents of ambient per pixel."
         ),
     ] = 0.02,
+    line_length: Annotated[
+        int,
+        typer.Option(
+            help="Window (px) of the line criterion: a running median of "
+            "the band along each axis, a matched filter that catches "
+            "ridges and step lobes contiguously (a coherent line keeps its "
+            "level; noise and isotropic blobs, peaks included, leave the "
+            "median untouched).  0 disables it."
+        ),
+    ] = 25,
 ):
     """Build a static-structure mask from frame stacks of one instrument.
 
@@ -1086,6 +1096,7 @@ def static_mask(
         dilate_px=dilate_px,
         static_quantile=static_quantile,
         grad_min_frac=grad_min_frac,
+        line_length=line_length,
     )
 
 
