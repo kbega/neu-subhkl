@@ -85,6 +85,8 @@ def run_index(
     refine_goniometer: bool = False,
     refine_goniometer_axes: list[str] | None = None,
     goniometer_bound_deg: float | list[float] | np.ndarray = 5.0,
+    refine_goniometer_axis_vector: list[str] | None = None,
+    goniometer_axis_vector_bound_deg: float | list[float] | np.ndarray = 1.0,
     refine_goniometer_trans: bool = False,
     goniometer_trans_bound_meters: float | list[float] | np.ndarray = 0.005,
     refine_beam: bool = False,
@@ -419,6 +421,11 @@ def run_index(
         )
     if refine_beam:
         print(f"Refining beam tilt with {beam_bound_deg}° bounds.")
+    if refine_goniometer_axis_vector:
+        print(
+            f"Refining goniometer axis vectors for {refine_goniometer_axis_vector} "
+            f"with {goniometer_axis_vector_bound_deg} deg tilt bounds."
+        )
 
     goniometer_names = None
 
@@ -531,6 +538,19 @@ def run_index(
                         f"CRITICAL: Angle shape {angles.shape} cannot map to {num_peaks} peaks."
                     )
 
+    # A previous pass's refined axis vectors are this pass's nominal
+    # geometry, exactly as offsets and translations already bootstrap.  The
+    # nexus block above re-reads the nominal axes, so this override must
+    # come after it; unrefined bootstraps carry the nominal axes and this
+    # is a no-op.
+    if bootstrap_filename and opt.goniometer_axes is not None:
+        with h5py.File(bootstrap_filename, "r") as b_f:
+            if "goniometer/axes" in b_f:
+                boot_axes = np.asarray(b_f["goniometer/axes"][()], dtype=float)
+                if boot_axes.shape == np.asarray(opt.goniometer_axes).shape:
+                    opt.goniometer_axes = boot_axes
+                    input_data["goniometer/axes"] = boot_axes
+
     # Apply the console messages appropriately
     if refine_goniometer:
         print(
@@ -570,6 +590,8 @@ def run_index(
         lattice_bound_frac=lattice_bound_frac,
         refine_goniometer=refine_goniometer,
         refine_goniometer_axes=refine_goniometer_axes,
+        refine_goniometer_axis_vector=refine_goniometer_axis_vector,
+        goniometer_axis_vector_bound_deg=goniometer_axis_vector_bound_deg,
         goniometer_names=goniometer_names,
         refine_sample=refine_goniometer_trans,
         goniometer_trans_bound_meters=goniometer_trans_bound_meters,
@@ -633,6 +655,28 @@ def run_index(
 
         safe_write(f, "goniometer/R", opt.R)
 
+        if (
+            refine_goniometer_axis_vector
+            and getattr(opt, "goniometer_axes_refined", None) is not None
+        ):
+            # Downstream stages (metrics, predictor, integrator) read
+            # goniometer/axes from this file, so the refined vectors go
+            # there; the nominal axes and the per-motor tilt angles are
+            # kept alongside for provenance.
+            if "goniometer/axes" in f:
+                safe_write(f, "goniometer/axes_nominal", f["goniometer/axes"][()])
+            safe_write(f, "goniometer/axes", opt.goniometer_axes_refined)
+            grp_name = "goniometer/axis_tilts"
+            if grp_name in f:
+                del f[grp_name]
+            tilts = opt.goniometer_axis_tilts
+            if isinstance(tilts, dict):
+                grp = f.create_group(grp_name)
+                for k, v in tilts.items():
+                    grp[k] = v
+            elif tilts is not None:
+                f[grp_name] = tilts
+
         if opt.goniometer_offsets is not None:
             grp_name = "goniometer/offsets"
             if grp_name in f:
@@ -680,6 +724,7 @@ def run_index(
             "no_index": opt.no_index,
             "refine_lattice": refine_lattice,
             "refine_goniometer": refine_goniometer,
+            "refine_goniometer_axis_vector": refine_goniometer_axis_vector,
             "refine_goniometer_trans": refine_goniometer_trans,
             "refine_beam": refine_beam,
             "refine_detector": refine_detector,

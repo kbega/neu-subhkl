@@ -357,6 +357,30 @@ def indexer(
             help="Comma-separated bounds per axis or a single float",
         ),
     ] = "5.0",
+    refine_goniometer_axis_vector: Annotated[
+        str | None,
+        typer.Option(
+            "--refine-goniometer-axis-vector",
+            help="Comma-separated motor names whose axis *direction* is "
+            "refined (two tilt angles each about an orthonormal basis "
+            "perpendicular to the nominal axis).  A goniometer mounted at "
+            "a small angle to the detector frame tilts its axes -- an "
+            "error the angular offsets and translations can only chase "
+            "degenerately.  The refined vectors are written to "
+            "goniometer/axes (nominals kept as goniometer/axes_nominal, "
+            "tilt angles as goniometer/axis_tilts), so downstream stages "
+            "pick them up transparently, and a calibration pass "
+            "bootstraps them as its nominal geometry.",
+        ),
+    ] = None,
+    goniometer_axis_vector_bound_deg: Annotated[
+        str,
+        typer.Option(
+            "--goniometer-axis-vector-bound-deg",
+            help="Comma-separated tilt bounds (deg) per refined axis "
+            "vector, or a single float.",
+        ),
+    ] = "1.0",
     refine_goniometer_trans: Annotated[
         bool, typer.Option("--refine-goniometer-trans")
     ] = False,
@@ -451,6 +475,16 @@ def indexer(
         if goniometer_trans_bound_meters
         else [0.005]
     )
+    gonio_axis_vec_parsed = (
+        [x.strip() for x in refine_goniometer_axis_vector.split(",")]
+        if refine_goniometer_axis_vector
+        else None
+    )
+    gonio_axis_vec_bounds_parsed = (
+        [float(x.strip()) for x in goniometer_axis_vector_bound_deg.split(",")]
+        if goniometer_axis_vector_bound_deg
+        else [1.0]
+    )
     det_banks_parsed = (
         [int(x.strip()) for x in refine_detector_banks.split(",")]
         if refine_detector_banks
@@ -499,6 +533,8 @@ def indexer(
         refine_goniometer=refine_goniometer,
         refine_goniometer_axes=gonio_axes_parsed,
         goniometer_bound_deg=gonio_bounds_parsed,
+        refine_goniometer_axis_vector=gonio_axis_vec_parsed,
+        goniometer_axis_vector_bound_deg=gonio_axis_vec_bounds_parsed,
         refine_goniometer_trans=refine_goniometer_trans,
         goniometer_trans_bound_meters=gonio_trans_bounds_parsed,
         refine_beam=refine_beam,

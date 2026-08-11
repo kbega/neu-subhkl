@@ -208,6 +208,8 @@ class VectorizedObjective:
         goniometer_bound_deg=5.0,
         goniometer_refine_mask=None,
         goniometer_nominal_offsets=None,
+        goniometer_axis_vector_mask=None,
+        goniometer_axis_vector_bound_deg=1.0,
         refine_sample=False,
         goniometer_trans_bound_meters=0.005,
         sample_nominal=None,
@@ -321,12 +323,67 @@ class VectorizedObjective:
                 if goniometer_nominal_offsets is not None
                 else jnp.zeros(self.num_motors)
             )
+
+            # --- Goniometer axis-vector refinement (mount tilt) ---
+            # The direction of each rotation axis, not just the zero point
+            # about it: a goniometer mounted at a small angle to the
+            # detector frame tilts every axis, an error the angular offsets
+            # and translations can only chase degenerately.  Each selected
+            # motor gets two tilt parameters about an orthonormal basis
+            # perpendicular to its nominal direction; every physical axis
+            # of that motor tilts identically (one mount, one error).
+            self.axis_vec_mask = (
+                np.array(goniometer_axis_vector_mask, dtype=bool)
+                if goniometer_axis_vector_mask is not None
+                else np.zeros(int(self.num_motors), dtype=bool)
+            )
+            self.num_active_axis_vec = int(np.sum(self.axis_vec_mask))
+            raw_av = np.atleast_1d(
+                np.asarray(goniometer_axis_vector_bound_deg, dtype=float)
+            )
+            av_bounds = (
+                raw_av
+                if raw_av.size == int(self.num_motors)
+                else np.full(int(self.num_motors), raw_av.ravel()[0])
+            )
+            self.axis_vec_bound_rad = jnp.deg2rad(
+                jnp.array(av_bounds[self.axis_vec_mask])
+            )
+            self.axis_vec_active_motors = np.nonzero(self.axis_vec_mask)[0]
+            # Static (python-level) per-axis decision: the objective is
+            # jitted with self in the pytree, so jnp attributes are traced
+            # and cannot steer python control flow.
+            motor_map_np = np.asarray(
+                motor_map if motor_map is not None else np.arange(self.num_gonio_axes)
+            ).astype(int)
+            self._num_motors_static = (
+                int(motor_map_np.max()) + 1 if motor_map_np.size else 0
+            )
+            self.axis_vec_refined_per_axis = [
+                bool(self.axis_vec_mask[m]) for m in motor_map_np
+            ]
+            self._motor_map_list = motor_map_np.tolist()
+            dirs = np.asarray(self.gonio_axes[:, 0:3], dtype=float)
+            dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
+            ref = np.where(
+                np.abs(dirs[:, 2:3]) < 0.9,
+                np.array([[0.0, 0.0, 1.0]]),
+                np.array([[1.0, 0.0, 0.0]]),
+            )
+            e1 = np.cross(dirs, ref)
+            e1 = e1 / np.linalg.norm(e1, axis=1, keepdims=True)
+            e2 = np.cross(dirs, e1)
+            self.axis_dirs_nominal = jnp.array(dirs)
+            self.axis_e1 = jnp.array(e1)
+            self.axis_e2 = jnp.array(e2)
         else:
             self.gonio_axes = None
             self.num_gonio_axes = 0
             self.num_active_trans = 1
             self.gonio_trans_mask = np.ones(1, dtype=bool)
             self.num_motors = 0
+            self.axis_vec_mask = np.zeros(0, dtype=bool)
+            self.num_active_axis_vec = 0
 
         self.refine_gonio_trans = refine_sample
         num_trans = max(1, self.num_gonio_axes)
@@ -608,6 +665,8 @@ class VectorizedObjective:
 
         offsets_total = None
         R_cum = None
+        axis_dirs = None
+        axis_tilts = None
         sample_origin_lab = jnp.zeros((x.shape[0], 1, 3))
 
         if self.gonio_axes is not None:
@@ -629,6 +688,34 @@ class VectorizedObjective:
                 )
 
             S, M = offsets_total.shape[0], self.gonio_angles.shape[1]
+
+            # Axis-vector tilts: two bounded angles per selected motor,
+            # applied as a gnomonic perturbation of the nominal direction
+            # (d = n + tan(a) e1 + tan(b) e2, renormalised) -- exact over
+            # the bounded cap and trivially invertible for reporting.
+            axis_dirs = None
+            if self.num_active_axis_vec > 0:
+                av_norm = x[:, idx : idx + 2 * self.num_active_axis_vec].reshape(
+                    -1, self.num_active_axis_vec, 2
+                )
+                idx += 2 * self.num_active_axis_vec
+                tilts_active = _forward_map_param(
+                    av_norm, self.axis_vec_bound_rad[None, :, None]
+                )
+                axis_tilts = jnp.zeros((x.shape[0], self._num_motors_static, 2))
+                axis_tilts = axis_tilts.at[
+                    :, jnp.array(self.axis_vec_active_motors), :
+                ].set(tilts_active)
+                tilt_per_axis = axis_tilts[
+                    :, jnp.array([m for m in self._motor_map_list]), :
+                ]
+                d = (
+                    self.axis_dirs_nominal[None, :, :]
+                    + jnp.tan(tilt_per_axis[..., 0:1]) * self.axis_e1[None, :, :]
+                    + jnp.tan(tilt_per_axis[..., 1:2]) * self.axis_e2[None, :, :]
+                )
+                axis_dirs = d / jnp.linalg.norm(d, axis=-1, keepdims=True)
+
             R_list = []
             deg2rad = jnp.pi / 180.0
 
@@ -647,7 +734,13 @@ class VectorizedObjective:
                 )
 
                 theta = direction_mult * current_axis_angle * deg2rad
-                Ri = rotation_matrix_from_axis_angle_jax(direction, theta)
+                if axis_dirs is not None and self.axis_vec_refined_per_axis[i]:
+                    # Per-sample tilted axis: batch the rotation over S.
+                    Ri = jax.vmap(rotation_matrix_from_axis_angle_jax)(
+                        axis_dirs[:, i, :], theta
+                    )
+                else:
+                    Ri = rotation_matrix_from_axis_angle_jax(direction, theta)
                 R_list.append(Ri)
 
             R_cum = jnp.eye(3)[None, None, ...].repeat(S, axis=0).repeat(M, axis=1)
@@ -793,6 +886,8 @@ class VectorizedObjective:
             dyn_widths,
             dyn_heights,
             area_scale,
+            axis_dirs,
+            axis_tilts,
         )
 
     def indexer_dynamic_soft_jax(self, ub_mat, kf_ki_sample, k_sq_override=None):
@@ -925,6 +1020,8 @@ class VectorizedObjective:
             dyn_widths,
             dyn_heights,
             area_scale,
+            _,
+            _,
         ) = self._get_physical_params_jax(x_pad)
 
         R_curr = R_cum if R_cum is not None else self.static_R
@@ -1020,6 +1117,8 @@ class FindUB:
         self.goniometer_axes = None
         self.goniometer_angles = None
         self.goniometer_offsets = None
+        self.goniometer_axes_refined = None
+        self.goniometer_axis_tilts = None
         self.goniometer_names = None
         self.sample_offset = None
         self.peak_xyz = None
@@ -1318,6 +1417,8 @@ class FindUB:
         goniometer_bound_deg: float | list | np.ndarray = 5.0,
         goniometer_names: list | None = None,
         refine_goniometer_axes: list | None = None,
+        refine_goniometer_axis_vector: list | None = None,
+        goniometer_axis_vector_bound_deg: float | list | np.ndarray = 1.0,
         refine_sample: bool = False,
         goniometer_trans_bound_meters: float | list | np.ndarray = 0.005,
         refine_beam: bool = False,
@@ -1459,6 +1560,28 @@ class FindUB:
             if len(gonio_bounds_list) == len(unique_motors):
                 bounds_array = np.array(gonio_bounds_list)
 
+        # Axis-vector refinement: per-motor mask and tilt bounds, matched
+        # by the same case-insensitive name rule as the angular offsets.
+        axis_vector_mask = None
+        if refine_goniometer_axis_vector:
+            av_bounds_raw = (
+                [float(goniometer_axis_vector_bound_deg)]
+                if isinstance(goniometer_axis_vector_bound_deg, (int, float))
+                else list(goniometer_axis_vector_bound_deg)
+            )
+            axis_vector_mask = np.zeros(len(unique_motors), dtype=bool)
+            bounds_array_axis_vec = np.full(
+                len(unique_motors), av_bounds_raw[0] if av_bounds_raw else 1.0
+            )
+            for i, name in enumerate(unique_motors):
+                for req_idx, req in enumerate(refine_goniometer_axis_vector):
+                    if req.lower() in name.lower():
+                        axis_vector_mask[i] = True
+                        if len(av_bounds_raw) == len(refine_goniometer_axis_vector):
+                            bounds_array_axis_vec[i] = av_bounds_raw[req_idx]
+        else:
+            bounds_array_axis_vec = np.full(len(unique_motors), 1.0)
+
         # Map translation bounds to active axes
         if isinstance(goniometer_trans_bound_meters, (int, float)):
             gonio_trans_bounds_list = [float(goniometer_trans_bound_meters)]
@@ -1511,6 +1634,8 @@ class FindUB:
             goniometer_refine_mask=goniometer_refine_mask,
             goniometer_nominal_offsets=self.base_gonio_offset,
             goniometer_bound_deg=bounds_array,
+            goniometer_axis_vector_mask=axis_vector_mask,
+            goniometer_axis_vector_bound_deg=bounds_array_axis_vec,
             goniometer_trans_bound_meters=bounds_array_trans,
             sample_nominal=self.base_sample_offset,
             refine_beam=refine_beam,
@@ -1553,6 +1678,8 @@ class FindUB:
                 if goniometer_refine_mask is not None
                 else len(goniometer_axes)
             )
+        if axis_vector_mask is not None:
+            num_dims += 2 * int(np.sum(axis_vector_mask))
         if refine_detector:
             num_dims += objective.num_det_params
 
@@ -1576,6 +1703,8 @@ class FindUB:
                 dyn_widths,
                 dyn_heights,
                 area_scale,
+                axes_refined_batch,
+                axis_tilts_batch,
             ) = objective._get_physical_params_jax(x_batch)
             self.sample_offset = np.array(t_axes_batch[0])
             self.ki_vec = np.array(ki_vec_batch[0]).flatten()
@@ -1840,6 +1969,8 @@ class FindUB:
             dyn_widths,
             dyn_heights,
             area_scale,
+            axes_refined_batch,
+            axis_tilts_batch,
         ) = objective._get_physical_params_jax(x_batch)
 
         self.sample_offset = np.array(t_axes_batch[0])
@@ -1858,6 +1989,29 @@ class FindUB:
                 self.goniometer_offsets = raw_offsets
         if R_batch is not None:
             self.R = np.array(R_batch[0])
+
+        if axis_vector_mask is not None and axes_refined_batch is not None:
+            axes_full = np.array(objective.gonio_axes)
+            axes_full[:, 0:3] = np.array(axes_refined_batch[0])
+            self.goniometer_axes_refined = axes_full
+            tilts_deg = np.rad2deg(np.array(axis_tilts_batch[0]))
+            if goniometer_names is not None:
+                unique = []
+                for name in goniometer_names:
+                    if name not in unique:
+                        unique.append(name)
+                self.goniometer_axis_tilts = {
+                    name: tilts_deg[i].tolist() for i, name in enumerate(unique)
+                }
+            else:
+                self.goniometer_axis_tilts = tilts_deg
+            for name, (ta, tb) in (
+                self.goniometer_axis_tilts.items()
+                if isinstance(self.goniometer_axis_tilts, dict)
+                else enumerate(self.goniometer_axis_tilts)
+            ):
+                if abs(ta) > 1e-6 or abs(tb) > 1e-6:
+                    print(f"Refined axis tilt {name}: ({ta:+.4f}, {tb:+.4f}) deg")
 
         if freeze_orientation:
             rot_params = self.fixed_rot_params
