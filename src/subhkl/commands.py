@@ -891,7 +891,7 @@ def run_metrics(
     file2: str | None = None,
     instrument: str | None = None,
     d_min: float | None = None,
-    per_hkl: bool | None = None,
+    per_peak: bool | None = None,
     plot = False,
     metric = "median_ang_err",
     per_run: bool = False,
@@ -925,26 +925,6 @@ def run_metrics(
         f"METRICS: {result['median_d_err']:.5f} {result['mean_d_err']:.5f} {result['max_d_err']:.5f} "
         f"{result['median_ang_err']:.5f} {result['mean_ang_err']:.5f} {result['max_ang_err']:.5f}"
     )
-
-    if plot:
-        plot_metric(
-        file1=file1,
-        metric=metric,
-        output=f"{metric}.png",
-        )
-#    if per_hkl and hkl_table is not None:
-#        with h5py.File(file1, "a") as f:
-#
-#            if "metrics/per_hkl" in f:
-#                del f["metrics/per_hkl"]
-#
-#            f.create_dataset(
-#                "metrics/per_hkl",
-#                data=hkl_table,
-#                compression="gzip",
-#            ) 
-#
-    # Print per-run metrics if requested
     if per_run and "per_run_errors" in result:
         print("\nPER-RUN MEDIAN ANGULAR ERROR (deg) - Sorted by error:")
         for r, err, count in result["per_run_errors"]:
