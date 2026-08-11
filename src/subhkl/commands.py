@@ -9,11 +9,11 @@ from subhkl.integration import Peaks
 from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
 from subhkl.viz import replay
-from subhkl.instrument.plot_metrics import plot_metric
 from subhkl.viz import detector_assembly, replay
-from subhkl.instrument.error_analysis import analyze_errors
+from subhkl.scripts.error_analysis import analyze_errors
 from subhkl.viz import detector_assembly, replay
 from typing import List
+from subhkl.scripts.plot_metrics import plot_metric
 
 
 def apply_detector_calibration(hdf5_filename: str, instrument: str):

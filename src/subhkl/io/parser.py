@@ -587,20 +587,12 @@ def metrics(
             "--d-min", help="Optional minimum d-spacing filter for metrics calculation."
         ),
     ] = None,
-    per_hkl: Annotated[
+   per_peak: Annotated[
         bool | None,
         typer.Option(
-            "--per_hkl", help="Creat table metrics/per_hkl."
+            "--per_peak", help="Creat table metrics/per_peak."
         ),
-    ] = None,
-    plot: Annotated[
-        bool,
-        typer.Option(
-            "--plot",
-            help="Generate a PNG plot from metrics/per_hkl.",
-        ),
-    ] = False,
-
+    ] = None, 
     metric: Annotated[
         str,
         typer.Option(
