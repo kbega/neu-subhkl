@@ -633,6 +633,16 @@ def rbf_integrator(
             help="Whether to fit the mosaicity separately from sample dimensions to explain peak shape. Only use in non-spherical detector geometries."
         ),
     ] = False,
+    mosaicity_radial: Annotated[
+        bool,
+        typer.Option(
+            "--mosaicity-radial/--mosaicity-isotropic",
+            help="Model the mosaic spread as a streak along the per-peak "
+            "2-theta gradient (a mosaic block rotated within the "
+            "scattering plane stays reflective at an adjusted wavelength) "
+            "instead of an isotropic 3D blur.  Requires --fit-mosaicity.",
+        ),
+    ] = False,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.0,
@@ -658,6 +668,7 @@ def rbf_integrator(
         nominal_sigma=nominal_sigma,
         anisotropic=anisotropic,
         fit_mosaicity=fit_mosaicity,
+        mosaicity_radial=mosaicity_radial,
         rel_border_width=rel_border_width,
         show_progress=show_progress,
         create_visualizations=create_visualizations,

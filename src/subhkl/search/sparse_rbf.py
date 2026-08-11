@@ -1167,9 +1167,20 @@ def build_3d_cov(params):
     return L @ L.T
 
 
-@partial(jit, static_argnames=["patch_size", "fit_mosaicity"])
+@partial(jit, static_argnames=["patch_size", "fit_mosaicity", "mosaicity_radial"])
 def global_shape_objective(
-    params, patches, bgs, drs, dcs, P_mats, distances, R_mats, patch_size, fit_mosaicity
+    params,
+    patches,
+    bgs,
+    drs,
+    dcs,
+    P_mats,
+    distances,
+    R_mats,
+    streak_dirs,
+    patch_size,
+    fit_mosaicity,
+    mosaicity_radial=False,
 ):
     # 1. Build the crystal shape tensor
     Sigma_shape_sample = build_3d_cov(params[:6])
@@ -1180,17 +1191,33 @@ def global_shape_objective(
         Sigma_eta_base = jnp.eye(3) * (eta**2)
     else:
         # If disabled, the tensor is perfectly zeroed out.
+        eta = 0.0
         Sigma_eta_base = jnp.zeros((3, 3))
 
-    def fit_one_peak(patch, bg, dr, dc, P_true, D_i, R_gonio):
+    def fit_one_peak(patch, bg, dr, dc, P_true, D_i, R_gonio, streak3):
         # 3. Rotate Crystal Shape to the Lab Frame
         Sigma_shape_lab = R_gonio @ Sigma_shape_sample @ R_gonio.T
 
-        # 4. Add the tensors. If fit_mosaicity is False, D_i * 0 = 0.
-        Sigma_total_3D = Sigma_shape_lab + (D_i**2) * Sigma_eta_base
+        if mosaicity_radial:
+            # A mosaic block rotated within the scattering plane stays
+            # reflective at an adjusted wavelength, so the mosaic spread
+            # streaks the spot along the 2-theta gradient (measured 3.7x
+            # radial-to-tangential on cg4d-t4-lysozyme) -- not the
+            # isotropic blur below.  streak3 is the unit radial direction
+            # in the lab; the projected displacement per radian of mosaic
+            # rotation is D_i * P streak3, which also carries the
+            # incidence-angle stretch of the footprint.
+            Sigma_2D_physical = P_true @ Sigma_shape_lab @ P_true.T
+            streak_pix = P_true @ (D_i * streak3)
+            Sigma_2D_physical = Sigma_2D_physical + (eta**2) * jnp.outer(
+                streak_pix, streak_pix
+            )
+        else:
+            # 4. Add the tensors. If fit_mosaicity is False, D_i * 0 = 0.
+            Sigma_total_3D = Sigma_shape_lab + (D_i**2) * Sigma_eta_base
+            Sigma_2D_physical = P_true @ Sigma_total_3D @ P_true.T
 
         # 5. Exact 2D Projection and Pixel Conversion
-        Sigma_2D_physical = P_true @ Sigma_total_3D @ P_true.T
         Sigma_2D = Sigma_2D_physical / (1.0**2)  # assuming 1.0mm pitch in P_true
 
         var_r = jnp.maximum(Sigma_2D[0, 0], 1e-6)
@@ -1222,19 +1249,30 @@ def global_shape_objective(
         residual = y_sub - amp * template
         return jnp.sum(residual**2)
 
-    mses = vmap(fit_one_peak)(patches, bgs, drs, dcs, P_mats, distances, R_mats)
+    mses = vmap(fit_one_peak)(
+        patches, bgs, drs, dcs, P_mats, distances, R_mats, streak_dirs
+    )
     return jnp.mean(mses)
 
 
 # Bind the val_and_grad wrapper to recognize the new static argument
 val_and_grad_fn = jit(
     jax.value_and_grad(global_shape_objective),
-    static_argnames=["patch_size", "fit_mosaicity"],
+    static_argnames=["patch_size", "fit_mosaicity", "mosaicity_radial"],
 )
 
 
 def optimize_global_crystal(
-    patches, bgs, drs, dcs, P_mats, distances, R_mats, fit_mosaicity=False
+    patches,
+    bgs,
+    drs,
+    dcs,
+    P_mats,
+    distances,
+    R_mats,
+    streak_dirs,
+    fit_mosaicity=False,
+    mosaicity_radial=False,
 ):
     # 1. Dynamically size the optimizer state based on the configuration
     if fit_mosaicity:
@@ -1257,8 +1295,10 @@ def optimize_global_crystal(
             P_mats,
             distances,
             R_mats,
+            streak_dirs,
             patches.shape[-1],
             fit_mosaicity=fit_mosaicity,
+            mosaicity_radial=mosaicity_radial,
         )
         grad_opt = np.array(grad_phys, dtype=np.float64) * scales
         return np.array(val, dtype=np.float64), grad_opt
@@ -1743,6 +1783,7 @@ def integrate_peaks_rbf_ssn(
     nominal_sigma: float = 2.0,
     anisotropic: bool = False,
     fit_mosaicity: bool = False,
+    mosaicity_radial: bool = False,
     border_width: int = 0,
     chunk_size: int = 1024,
     create_visualizations: bool = False,
@@ -2004,6 +2045,9 @@ def integrate_peaks_rbf_ssn(
     all_P_mats = []
     all_R_mats = []
     all_distances = []
+    all_streak_dirs = []
+    ki_hat = np.asarray(ki_vec, dtype=float)
+    ki_hat = ki_hat / np.linalg.norm(ki_hat)
 
     for idx, img_key in enumerate(meta_keys):
         det = peaks_obj.get_detector_by_img(img_key)
@@ -2018,6 +2062,17 @@ def integrate_peaks_rbf_ssn(
         distance = np.linalg.norm(k_f)
         all_distances.append(distance)
         k_f_hat = k_f / distance
+
+        # Unit radial (2-theta gradient) direction in the lab: the axis
+        # the mosaic spread streaks the spot along.  Degenerate frames
+        # (near-forward peaks) get a zero vector: no streak contribution.
+        t3 = np.cross(ki_hat, k_f_hat)
+        t3_norm = np.linalg.norm(t3)
+        if t3_norm > 1e-6:
+            r3 = np.cross(t3 / t3_norm, k_f_hat)
+            all_streak_dirs.append(r3 / np.linalg.norm(r3))
+        else:
+            all_streak_dirs.append(np.zeros(3))
 
         # Detector Normal & Orthogonal Projection
         n_det = np.cross(det.uhat, det.vhat)
@@ -2043,6 +2098,7 @@ def integrate_peaks_rbf_ssn(
     all_P_mats = np.array(all_P_mats)
     all_R_mats = np.array(all_R_mats)
     all_distances = np.array(all_distances)
+    all_streak_dirs = np.array(all_streak_dirs)
 
     # ==========================================
     # 2. Extract exact patches for global optimization
@@ -2050,7 +2106,7 @@ def integrate_peaks_rbf_ssn(
     opt_P = 15
     opt_half = opt_P // 2
     opt_patches, opt_bgs, opt_drs, opt_dcs = [], [], [], []
-    opt_Pmats, opt_dists, opt_Rmats = [], [], []
+    opt_Pmats, opt_dists, opt_Rmats, opt_streaks = [], [], [], []
 
     if show_progress:
         print(f"  > 3D Tensor Optimization: Using ALL {len(frames)} peaks.")
@@ -2070,6 +2126,7 @@ def integrate_peaks_rbf_ssn(
         opt_Pmats.append(all_P_mats[idx])
         opt_dists.append(all_distances[idx])
         opt_Rmats.append(all_R_mats[idx])
+        opt_streaks.append(all_streak_dirs[idx])
 
         ri, ci = int(round(r)) + opt_P, int(round(c)) + opt_P
 
@@ -2125,29 +2182,42 @@ def integrate_peaks_rbf_ssn(
             jnp.array(opt_Pmats),
             jnp.array(opt_dists),
             jnp.array(opt_Rmats),
+            jnp.array(opt_streaks),
             fit_mosaicity=fit_mosaicity,
+            mosaicity_radial=mosaicity_radial,
         )
 
         # 5. Project the EXACT 2D footprints for ALL peaks
         Sigma_shape_jnp = build_3d_cov(jnp.array(res_x[:6]))
 
         if fit_mosaicity:
-            Sigma_eta_jnp = jnp.eye(3) * (abs(res_x[6]) ** 2 + 1e-12)
+            eta_opt = abs(res_x[6]) + 1e-6
+            Sigma_eta_jnp = jnp.eye(3) * (eta_opt**2)
         else:
+            eta_opt = 0.0
             Sigma_eta_jnp = jnp.zeros((3, 3))
 
         @jit
-        def project_all_shapes(P_mats, dists, R_mats):
-            def project_one(P, D_i, R_gonio):
+        def project_all_shapes(P_mats, dists, R_mats, streaks):
+            def project_one(P, D_i, R_gonio, streak3):
                 # Rotate to Lab Frame before projecting
                 Sigma_shape_lab = R_gonio @ Sigma_shape_jnp @ R_gonio.T
+                if mosaicity_radial:
+                    Sigma_2D = P @ Sigma_shape_lab @ P.T
+                    streak_pix = P @ (D_i * streak3)
+                    return Sigma_2D + (eta_opt**2) * jnp.outer(
+                        streak_pix, streak_pix
+                    )
                 Sigma_total = Sigma_shape_lab + (D_i**2) * Sigma_eta_jnp
                 return P @ Sigma_total @ P.T
 
-            return vmap(project_one)(P_mats, dists, R_mats)
+            return vmap(project_one)(P_mats, dists, R_mats, streaks)
 
         all_Sigma_2D = project_all_shapes(
-            jnp.array(all_P_mats), jnp.array(all_distances), jnp.array(all_R_mats)
+            jnp.array(all_P_mats),
+            jnp.array(all_distances),
+            jnp.array(all_R_mats),
+            jnp.array(all_streak_dirs),
         )
 
         all_var_u = np.array(all_Sigma_2D[:, 0, 0])
