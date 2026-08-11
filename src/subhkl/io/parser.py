@@ -625,8 +625,7 @@ def metrics(
         instrument=instrument,
         d_min=d_min,
         per_run=per_run,
-        per_hkl=per_hkl,
-        plot=plot,
+        per_peak=per_peak,
         metric=metric,
         ki_vec=ki_vec_parsed,
     )
