@@ -994,29 +994,42 @@ class VectorizedObjective:
         loss = jnp.mean(dist_min, axis=1)
         return loss, dist_min, best_hkl.transpose((0, 2, 1)), best_lamb
 
-    def geometric_loss_jax(self, ub_mat, kf_ki_sample):
+    def geometric_loss_jax(self, ub_mat, kf_ki_sample, ki_sample):
+        """Predicted-vs-observed scattering-direction residual at fixed hkl.
+
+        The wavelength is not a free parameter here: the elastic condition
+        fixes it from the assigned integer hkl and the current geometry,
+        lam = -2 (ki . G) / |G|^2 with G = UB hkl, so a geometry error must
+        surface as a direction mismatch instead of being absorbed into a
+        per-peak wavelength.  In particular kf_pred = ki + lam G is exactly
+        invariant under an isotropic lattice rescale (G -> sG, lam -> lam/s),
+        which removes the detector-distance <-> lattice-scale valley the
+        free-wavelength indexing loss slides along.
+
+        The residual is the chord |kf_pred - kf_obs| between unit vectors:
+        equal to the angular error in radians to third order, and smooth at
+        zero where arccos is not.
         """
-        Direct displacement loss in q-space bypassing integer grid search.
-        Minimizes || q_obs - q_pred ||_2 where q_pred = UB * hkl.
-        """
-        # q_obs: (S, 3, N) | Derived from exact detector pixels and fixed lambda
-        q_obs = kf_ki_sample / self.lambda_fixed[None, None, :]
+        G = jnp.matmul(ub_mat, self.hkl_fixed)  # (S, 3, N)
+        G_sq = jnp.sum(G * G, axis=1)
+        lam = -2.0 * jnp.sum(ki_sample * G, axis=1) / jnp.where(G_sq == 0.0, 1.0, G_sq)
+        kf_pred = ki_sample + lam[:, None, :] * G
+        kf_obs = kf_ki_sample + ki_sample
 
-        # q_pred: (S, 3, N) | Theoretical q-vector from dynamic UB matrix
-        q_pred = jnp.matmul(ub_mat, self.hkl_fixed)
+        dist = jnp.linalg.norm(kf_pred - kf_obs, axis=1)
+        # hkl = 0 rows (peaks the bootstrap left unassigned) carry no
+        # assignment information and must not enter the loss: their
+        # kf_pred = ki makes the residual |kf_obs - ki| = 2 sin(theta),
+        # which the detector and beam parameters CAN shrink -- measured on
+        # t4, 1800 such peaks dragged the fit to its bounds.  They still
+        # get lam = 0 and a reported residual, and always fail the cut.
+        assigned = jnp.any(self.hkl_fixed != 0.0, axis=0)
+        n_assigned = jnp.maximum(jnp.sum(assigned), 1.0)
+        loss = jnp.sum(dist * assigned[None, :], axis=1) / n_assigned
 
-        # Vector displacement distance
-        dist = jnp.linalg.norm(q_obs - q_pred, axis=1)
-
-        # Mean loss across all peaks for the optimizer
-        loss = jnp.mean(dist, axis=1)
-
-        # Format returns to match indexer_dynamic_soft_jax signature (loss, dist, hkl, lamb)
-        S, _, _ = kf_ki_sample.shape
+        S = kf_ki_sample.shape[0]
         hkl_ret = jnp.tile(self.hkl_fixed.T[None, :, :], (S, 1, 1))
-        lamb_ret = jnp.tile(self.lambda_fixed[None, :], (S, 1))
-
-        return loss, dist, hkl_ret, lamb_ret
+        return loss, dist, hkl_ret, lam
 
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
@@ -1098,24 +1111,25 @@ class VectorizedObjective:
         # q_lab is a pure momentum vector, so it strictly requires the
         # inverse goniometer rotation (R^T) to reach the sample frame
         if R_curr is not None:
-            q_lab_vec = q_lab.transpose(0, 2, 1)[..., None]
             if R_curr.ndim == 4:
-                R_per_peak_full = R_curr[:, self.peak_run_indices, :, :]
-                RT = R_per_peak_full.transpose(0, 1, 3, 2)
-                kf_ki_vec_T = jnp.matmul(RT, q_lab_vec).squeeze(-1)
+                RT = R_curr[:, self.peak_run_indices, :, :].transpose(0, 1, 3, 2)
             elif R_curr.ndim == 3:
-                R_per_peak_full = R_curr[self.peak_run_indices, :, :]
-                RT = R_per_peak_full.transpose(0, 2, 1)[None, ...]
-                kf_ki_vec_T = jnp.matmul(RT, q_lab_vec).squeeze(-1)
+                RT = R_curr[self.peak_run_indices, :, :].transpose(0, 2, 1)[None, ...]
             else:
                 RT = R_curr.T[None, None, ...]
-                kf_ki_vec_T = jnp.matmul(RT, q_lab_vec).squeeze(-1)
-            kf_ki_vec = kf_ki_vec_T.transpose(0, 2, 1)
+
+            def to_sample(vec):
+                vec_T = jnp.matmul(RT, vec.transpose(0, 2, 1)[..., None]).squeeze(-1)
+                return vec_T.transpose(0, 2, 1)
+
+            kf_ki_vec = to_sample(q_lab)
         else:
             kf_ki_vec = q_lab
 
         if self.no_index:
-            res = self.geometric_loss_jax(UB, kf_ki_vec)
+            ki_full = jnp.broadcast_to(ki, q_lab.shape)
+            ki_sample = to_sample(ki_full) if R_curr is not None else ki_full
+            res = self.geometric_loss_jax(UB, kf_ki_vec, ki_sample)
         else:
             res = self.indexer_dynamic_soft_jax(
                 UB,
@@ -1742,7 +1756,11 @@ class FindUB:
 
             loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
             dist_min_final = np.array(dist_min[0])
-            mask = dist_min_final < 0.15
+            # Soft indexing measures fractional-hkl distance; the fixed-hkl
+            # geometric loss measures an angular chord, cut at the 1 degree
+            # line the metrics report already calls BAD.
+            threshold = np.deg2rad(1.0) if objective.no_index else 0.15
+            mask = dist_min_final < threshold
             num_indexed = int(np.sum(mask))
             hkl_final = np.array(hkl[0])
             hkl_final[~mask] = 0
@@ -2075,7 +2093,8 @@ class FindUB:
         loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
         dist_min_final = np.array(dist_min[0])
 
-        mask = dist_min_final < 0.15
+        threshold = np.deg2rad(1.0) if objective.no_index else 0.15
+        mask = dist_min_final < threshold
         num_indexed = int(np.sum(mask))
 
         hkl_final = np.array(hkl[0])
