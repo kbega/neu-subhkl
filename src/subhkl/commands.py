@@ -109,6 +109,8 @@ def run_index(
     no_index: bool | None = None,
     radial_weight: float = 1.0,
     radial_weight_poly: list[float] | None = None,
+    hkl_metric: str = "isotropic",
+    hkl_metric_floor: float = 0.1,
     multi_gpu: bool = False,
 ):
     input_data = input_data or {}
@@ -613,6 +615,8 @@ def run_index(
         no_index=no_index,
         radial_weight=radial_weight,
         radial_weight_poly=radial_weight_poly,
+        hkl_metric=hkl_metric,
+        hkl_metric_floor=hkl_metric_floor,
         multi_gpu=multi_gpu,
     )
 
@@ -731,6 +735,8 @@ def run_index(
             "no_index": opt.no_index,
             "radial_weight": radial_weight,
             "radial_weight_poly": radial_weight_poly,
+            "hkl_metric": hkl_metric,
+            "hkl_metric_floor": hkl_metric_floor,
             "refine_lattice": refine_lattice,
             "refine_goniometer": refine_goniometer,
             "refine_goniometer_axis_vector": refine_goniometer_axis_vector,

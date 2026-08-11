@@ -232,6 +232,8 @@ class VectorizedObjective:
         lambda_fixed=None,
         radial_weight=1.0,
         radial_weight_poly=None,
+        hkl_metric="isotropic",
+        hkl_metric_floor=0.1,
     ):
         self.no_index = no_index
         if self.no_index:
@@ -251,6 +253,16 @@ class VectorizedObjective:
         self.radial_weight_active = bool(
             radial_weight_poly is not None or self.radial_weight < 1.0
         )
+        # Soft-indexer basin metric.  "isotropic" is the plain fractional-hkl
+        # washboard; "positional" warps each basin by the per-peak Jacobian
+        # that maps fractional defects to detector displacement, weighted by
+        # radial_weight in the streak frame, with hkl_metric_floor as the
+        # dimensionless isotropic floor that keeps the Jacobian's null
+        # direction (the wavelength tube) from becoming gauge.
+        if hkl_metric not in ("isotropic", "positional"):
+            raise ValueError(f"Unknown hkl_metric: {hkl_metric!r}")
+        self.hkl_metric_positional = hkl_metric == "positional"
+        self.hkl_metric_floor = float(hkl_metric_floor)
 
         self.B = jnp.array(B)
         self.kf_ki_dir_init = jnp.array(kf_ki_dir)
@@ -596,6 +608,7 @@ class VectorizedObjective:
             )
         else:  # Default to P
             self.M_prim = jnp.eye(3)
+        self.M_prim_inv = jnp.linalg.inv(self.M_prim)
 
     def orientation_U_jax(self, param):
         U = jax.vmap(rotation_matrix_from_rodrigues_jax)(param)
@@ -924,7 +937,57 @@ class VectorizedObjective:
             axis_tilts,
         )
 
-    def indexer_dynamic_soft_jax(self, ub_mat, kf_ki_sample, k_sq_override=None):
+    def _positional_metric_vectors(self, ub_mat, kf_ki_sample, ki_sample, k_sq):
+        """Per-peak rows of the Jacobian mapping fractional-hkl defects to
+        detector displacement, in the streak frame.
+
+        kf_pred depends on hkl only through q_hat = normalize(UB hkl), so
+        d(kf) = -2 [q_hat ki^T + (ki.q_hat) I] (I - q_hat q_hat^T) UB dhkl
+        times lambda/|q| (applied per candidate in the scan, where the
+        analytic lambda lives).  Projected on the per-peak frame
+        t = ki x kf (tangential; t.q_hat = 0 collapses that row) and
+        r = t x kf (radial, streak-elongated, weighted by radial_weight).
+        Centering is folded in: the scan's fractional defects are primitive,
+        so UB is post-multiplied by M_prim^-1.
+
+        Returns (p_t, p_r, floor): two (S, 3, N) row vectors and the
+        per-peak isotropic floor, set to 1 where the frame is degenerate
+        (near-forward peaks) so those keep the plain fractional distance.
+        """
+        k_norm = jnp.sqrt(jnp.maximum(k_sq, 1e-12))
+        q_hat = kf_ki_sample / k_norm[:, None, :]
+        kf_s = kf_ki_sample + ki_sample
+
+        t_vec = jnp.cross(ki_sample, kf_s, axis=1)
+        t_norm = jnp.linalg.norm(t_vec, axis=1, keepdims=True)
+        degenerate = t_norm[:, 0, :] < 1e-6
+        t_hat = t_vec / jnp.where(t_norm == 0.0, 1.0, t_norm)
+        r_vec = jnp.cross(t_hat, kf_s, axis=1)
+        r_hat = r_vec / jnp.maximum(
+            jnp.linalg.norm(r_vec, axis=1, keepdims=True), 1e-12
+        )
+
+        c = jnp.sum(ki_sample * q_hat, axis=1)  # (S, N)
+        rq = jnp.sum(r_hat * q_hat, axis=1)
+        ki_perp = ki_sample - c[:, None, :] * q_hat
+        r_perp = r_hat - rq[:, None, :] * q_hat
+
+        b_t = -2.0 * c[:, None, :] * t_hat
+        b_r = -2.0 * (rq[:, None, :] * ki_perp + c[:, None, :] * r_perp)
+
+        W = jnp.matmul(ub_mat, self.M_prim_inv[None, :, :])  # (S, 3, 3)
+        p_t = jnp.einsum("sji,sjn->sin", W, b_t)
+        p_r = jnp.einsum("sji,sjn->sin", W, b_r)
+
+        zero = jnp.zeros_like(p_t)
+        p_t = jnp.where(degenerate[:, None, :], zero, p_t)
+        p_r = jnp.where(degenerate[:, None, :], zero, p_r)
+        floor = jnp.where(degenerate, 1.0, self.hkl_metric_floor)
+        return p_t, p_r, floor
+
+    def indexer_dynamic_soft_jax(
+        self, ub_mat, kf_ki_sample, k_sq_override=None, pos_metric=None
+    ):
         ub_inv = jnp.linalg.inv(ub_mat)
         v = jnp.matmul(ub_inv, kf_ki_sample)
 
@@ -935,11 +998,21 @@ class VectorizedObjective:
         )
 
         S, _, N = v.shape
-        initial_carry = (
-            jnp.inf * jnp.ones((S, N)),
-            jnp.zeros((S, 3, N), dtype=jnp.int32),
-            jnp.zeros((S, N)),
-        )
+        if pos_metric is not None:
+            p_t, p_r, floor = pos_metric
+            k_norm = jnp.sqrt(jnp.maximum(k_sq, 1e-12))
+            initial_carry = (
+                jnp.inf * jnp.ones((S, N)),
+                jnp.zeros((S, N)),
+                jnp.zeros((S, 3, N), dtype=jnp.int32),
+                jnp.zeros((S, N)),
+            )
+        else:
+            initial_carry = (
+                jnp.inf * jnp.ones((S, N)),
+                jnp.zeros((S, 3, N), dtype=jnp.int32),
+                jnp.zeros((S, N)),
+            )
 
         # 1. Unpack v
         v_h = v[:, 0, :]
@@ -953,7 +1026,10 @@ class VectorizedObjective:
         ub_T_kf_ki_l = ub_T_kf_ki[:, 2, :]
 
         def scan_body(carry, i):
-            curr_min, curr_best_hkl, curr_best_lamb = carry
+            if pos_metric is not None:
+                curr_min, curr_best_frac, curr_best_hkl, curr_best_lamb = carry
+            else:
+                curr_min, curr_best_hkl, curr_best_lamb = carry
 
             lamda_cand = lam_grid[i]
 
@@ -994,6 +1070,27 @@ class VectorizedObjective:
             dl = jnp.sin(jnp.pi * l_p)
             dist = jnp.sqrt(dh**2 + dk**2 + dl**2) / jnp.pi
 
+            if pos_metric is not None:
+                # Basin metric: the positional displacement this fractional
+                # defect implies, weighted in the streak frame, plus the
+                # isotropic floor for the Jacobian's null direction.  The
+                # candidate is SELECTED by this metric (anisotropic
+                # assignment); `dist` keeps the fractional units downstream.
+                c_t = (p_t[:, 0] * dh + p_t[:, 1] * dk + p_t[:, 2] * dl) / jnp.pi
+                c_r = (p_r[:, 0] * dh + p_r[:, 1] * dk + p_r[:, 2] * dl) / jnp.pi
+                scale = lambda_opt / k_norm
+                pos_sq = scale**2 * (c_t**2 + (self.radial_weight * c_r) ** 2)
+                metric = jnp.sqrt(pos_sq + (floor * dist) ** 2)
+
+                update_mask = metric < curr_min
+                new_min = jnp.where(update_mask, metric, curr_min)
+                new_frac = jnp.where(update_mask, dist, curr_best_frac)
+                new_best_hkl = jnp.where(
+                    update_mask[:, None, :], hkl_int, curr_best_hkl
+                )
+                new_best_lamb = jnp.where(update_mask, lambda_opt, curr_best_lamb)
+                return (new_min, new_frac, new_best_hkl, new_best_lamb), None
+
             # 6. Update states
             update_mask = dist < curr_min
             new_min = jnp.where(update_mask, dist, curr_min)
@@ -1005,9 +1102,12 @@ class VectorizedObjective:
         final_carry, _ = lax.scan(
             scan_body, initial_carry, jnp.arange(self.num_candidates)
         )
-        dist_min, best_hkl, best_lamb = final_carry
-
-        loss = jnp.mean(dist_min, axis=1)
+        if pos_metric is not None:
+            metric_min, dist_min, best_hkl, best_lamb = final_carry
+            loss = jnp.mean(metric_min, axis=1)
+        else:
+            dist_min, best_hkl, best_lamb = final_carry
+            loss = jnp.mean(dist_min, axis=1)
         return loss, dist_min, best_hkl.transpose((0, 2, 1)), best_lamb
 
     def geometric_loss_jax(self, ub_mat, kf_ki_sample, ki_sample):
@@ -1181,15 +1281,22 @@ class VectorizedObjective:
         else:
             kf_ki_vec = q_lab
 
-        if self.no_index:
+        if self.no_index or self.hkl_metric_positional:
             ki_full = jnp.broadcast_to(ki, q_lab.shape)
             ki_sample = to_sample(ki_full) if R_curr is not None else ki_full
+        if self.no_index:
             res = self.geometric_loss_jax(UB, kf_ki_vec, ki_sample)
         else:
+            pos_metric = None
+            if self.hkl_metric_positional:
+                pos_metric = self._positional_metric_vectors(
+                    UB, kf_ki_vec, ki_sample, k_sq_dyn
+                )
             res = self.indexer_dynamic_soft_jax(
                 UB,
                 kf_ki_vec,
                 k_sq_override=k_sq_dyn,
+                pos_metric=pos_metric,
             )
 
         return jax.tree.map(
@@ -1527,6 +1634,8 @@ class FindUB:
         no_index: bool | None = None,
         radial_weight: float = 1.0,
         radial_weight_poly: list | None = None,
+        hkl_metric: str = "isotropic",
+        hkl_metric_floor: float = 0.1,
         multi_gpu: bool = False,
         **kwargs,
     ):
@@ -1752,6 +1861,8 @@ class FindUB:
             lambda_fixed=self.lambdas,
             radial_weight=radial_weight,
             radial_weight_poly=radial_weight_poly,
+            hkl_metric=hkl_metric,
+            hkl_metric_floor=hkl_metric_floor,
         )
 
         num_dims = 0 if freeze_orientation else 3

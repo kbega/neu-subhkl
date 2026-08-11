@@ -462,6 +462,24 @@ def indexer(
             "in Angstrom, highest degree first; overrides --radial-weight."
         ),
     ] = None,
+    hkl_metric: Annotated[
+        str,
+        typer.Option(
+            help="Basin metric for the soft indexing loss: 'isotropic' "
+            "(plain fractional-hkl distance) or 'positional' (each basin "
+            "warped by the Jacobian to detector displacement, radial "
+            "component weighted by --radial-weight; candidate selection "
+            "becomes the anisotropic assignment)."
+        ),
+    ] = "isotropic",
+    hkl_metric_floor: Annotated[
+        float,
+        typer.Option(
+            help="Dimensionless isotropic floor added to the positional "
+            "metric; keeps the wavelength-tube null direction from "
+            "becoming gauge."
+        ),
+    ] = 0.1,
     multi_gpu: Annotated[
         bool,
         typer.Option(
@@ -577,6 +595,8 @@ def indexer(
             if radial_weight_poly
             else None
         ),
+        hkl_metric=hkl_metric,
+        hkl_metric_floor=hkl_metric_floor,
         multi_gpu=multi_gpu,
     )
 
