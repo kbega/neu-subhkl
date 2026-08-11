@@ -481,6 +481,24 @@ class VectorizedObjective:
                 peak_pixel_coords["bank_indices"], dtype=jnp.int32
             )
 
+            # Peaks on banks outside the refined subset keep their static
+            # lab positions; without this they would all collapse onto
+            # refined bank 0 (bank_indices defaults to zero for them).
+            refined_mask = np.asarray(
+                peak_pixel_coords.get(
+                    "refined_mask",
+                    np.ones(len(peak_pixel_coords["bank_indices"]), dtype=bool),
+                ),
+                dtype=bool,
+            )
+            self.peak_det_refined = jnp.array(refined_mask)
+            self.all_peaks_on_refined_banks = bool(np.all(refined_mask))
+            if not self.all_peaks_on_refined_banks and self.peak_xyz is None:
+                raise ValueError(
+                    "Refining a subset of detector banks requires peaks/xyz "
+                    "for the peaks on the unrefined banks."
+                )
+
             self.num_banks = self.det_centers.shape[0]
 
             self.det_modes = detector_params.get("modes", ["independent"])
@@ -1055,6 +1073,12 @@ class VectorizedObjective:
                 c + u_offset[None, :, None] * u_vec + v_offset[None, :, None] * v_vec
             )
             p = dynamic_xyz.transpose(0, 2, 1)
+            if not self.all_peaks_on_refined_banks:
+                p = jnp.where(
+                    self.peak_det_refined[None, None, :],
+                    p,
+                    self.peak_xyz[None, :, :],
+                )
         else:
             p = self.peak_xyz[None, :, :] if self.peak_xyz is not None else None
 

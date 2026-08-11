@@ -322,6 +322,7 @@ def run_index(
             u_offsets = np.zeros(len(pixel_r))
             v_offsets = np.zeros(len(pixel_r))
             bank_indices = np.zeros(len(pixel_r), dtype=np.int32)
+            bank_refined = np.zeros(len(pixel_r), dtype=bool)
 
             for phys_bank in np.unique(bank_array):
                 mask = bank_array == phys_bank
@@ -341,6 +342,7 @@ def run_index(
 
                     if refine_detector and int(phys_bank) in bank_to_idx:
                         bank_indices[mask] = bank_to_idx[int(phys_bank)]
+                        bank_refined[mask] = True
                         u_offsets[mask] = np.dot(xyz_p - det.center, det.uhat)
                         v_offsets[mask] = np.dot(xyz_p - det.center, det.vhat)
 
@@ -358,6 +360,7 @@ def run_index(
                     "u_offsets": u_offsets.tolist(),
                     "v_offsets": v_offsets.tolist(),
                     "bank_indices": bank_indices.tolist(),
+                    "refined_mask": bank_refined.tolist(),
                 }
         else:
             raise ValueError(
@@ -728,6 +731,7 @@ def run_index(
             "refine_goniometer_trans": refine_goniometer_trans,
             "refine_beam": refine_beam,
             "refine_detector": refine_detector,
+            "refine_detector_banks": refine_detector_banks,
             "detector_modes": detector_modes,
             "freeze_orientation": freeze_orientation,
         }
