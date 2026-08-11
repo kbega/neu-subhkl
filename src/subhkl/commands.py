@@ -8,6 +8,7 @@ from subhkl.instrument.goniometer import (
 from subhkl.integration import Peaks
 from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
+from subhkl.viz import detector_assembly, replay
 
 from typing import List
 
@@ -104,6 +105,7 @@ def run_index(
     input_data: dict | None = None,
     num_candidates: int | None = None,
     no_index: bool | None = None,
+    multi_gpu: bool = False,
 ):
     input_data = input_data or {}
 
@@ -582,6 +584,7 @@ def run_index(
         freeze_orientation=freeze_orientation,
         num_candidates=num_candidates,
         no_index=no_index,
+        multi_gpu=multi_gpu,
     )
 
     print(f"\nOptimization complete. Best solution indexed {num} peaks.")
@@ -733,17 +736,27 @@ def run_finder(
     peak_minimum_pixels: int = 30,
     peak_minimum_signal_to_noise: float = 1.0,
     peak_pixel_outlier_threshold: float = 2.0,
-    sparse_rbf_alpha: float = 0.1,
-    sparse_rbf_gamma: float = 1.0,
+    hull_filter: bool = True,
+    sparse_rbf_alpha: float | None = None,
+    sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
-    sparse_rbf_max_sigma: float = 10.0,
-    sparse_rbf_chunk_size: int = 512,
+    sparse_rbf_max_sigma: float | None = None,
+    sparse_rbf_num_sigmas: int | None = None,
+    sparse_rbf_false_alarms_per_image: float = 1.0,
+    sparse_rbf_max_fragmentation_rate: float = 1.0,
+    sparse_rbf_profile_file: str | None = "auto",
+    sparse_rbf_shape_ratio: float = 1.2,
+    sparse_rbf_shape_orientations: int = 4,
+    sparse_rbf_chunk_size: int = 64,
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
-    sparse_rbf_loss: str = "gaussian",
+    sparse_rbf_loss: str = "poisson",
+    sparse_rbf_legacy: bool = False,
     sparse_rbf_auto_tune_alpha: bool = False,
     sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",
     max_workers: int = 16,
+    multi_gpu: bool = False,
+    static_mask_file: str | None = None,
 ):
     print(f"Creating peaks from {filename} for instrument {instrument}")
 
@@ -783,11 +796,20 @@ def run_finder(
                 "gamma": sparse_rbf_gamma,
                 "min_sigma": sparse_rbf_min_sigma,
                 "max_sigma": sparse_rbf_max_sigma,
+                "num_sigmas": sparse_rbf_num_sigmas,
+                "false_alarms_per_image": sparse_rbf_false_alarms_per_image,
+                "max_fragmentation_rate": sparse_rbf_max_fragmentation_rate,
+                "profile_file": sparse_rbf_profile_file,
+                "shape_ratio": sparse_rbf_shape_ratio,
+                "shape_orientations": sparse_rbf_shape_orientations,
                 "chunk_size": sparse_rbf_chunk_size,
+                "multi_gpu": multi_gpu,
+                "static_mask_file": static_mask_file,
                 "show_steps": show_steps,
                 "show_scale": "linear",
                 "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
                 "loss": sparse_rbf_loss,
+                "legacy": sparse_rbf_legacy,
                 "auto_tune_alpha": sparse_rbf_auto_tune_alpha,
                 "candidate_alphas": alpha_list,
             }
@@ -812,6 +834,10 @@ def run_finder(
         "peak_minimum_pixels": peak_minimum_pixels,
         "peak_minimum_signal_to_noise": peak_minimum_signal_to_noise,
         "peak_pixel_outlier_threshold": peak_pixel_outlier_threshold,
+        # Consumed directly by the harvest worker, not by
+        # PeakIntegrator.build_from_dictionary, like
+        # region_growth_minimum_sigma above it.
+        "hull_filter": hull_filter,
     }
 
     detector_peaks = peaks.get_detector_peaks(
@@ -841,6 +867,20 @@ def run_finder(
     ]
 
     with h5py.File(output_filename, "a") as f:
+        f.attrs["finder_algorithm"] = finder_algorithm
+
+        # `peaks/sigma` means different things depending on who filled it: the
+        # sparse-RBF finder writes its per-peak Gaussian width in pixels, every
+        # other path writes the uncertainty on the intensity.  Only the first
+        # describes how big a peak is on the detector, so say which one this
+        # is rather than leaving a reader to guess from a bare number.
+        if "peaks/sigma" in f:
+            f["peaks/sigma"].attrs["quantity"] = (
+                replay.WIDTH_QUANTITY
+                if finder_algorithm == "sparse_rbf"
+                else "intensity_sigma"
+            )
+
         with h5py.File(filename, "r") as f_in:
             for key in copy_keys:
                 if key in f_in:
@@ -1123,11 +1163,21 @@ def run_rbf_integrator(
 
     print(f"Saving RBF integrated peaks to {output_filename}")
     with h5py.File(output_filename, "w") as f:
+        f.attrs["instrument"] = instrument
         f["peaks/h"], f["peaks/k"], f["peaks/l"] = result.h, result.k, result.l
         f["peaks/lambda"] = result.wavelength
         f["peaks/intensity"], f["peaks/sigma"] = result.intensity, result.sigma
         f["peaks/two_theta"], f["peaks/azimuthal"] = result.tt, result.az
         f["peaks/bank"], f["peaks/run_index"] = result.bank, result.run_id
+
+        # Where each peak sits on its detector image, and the shape the fit
+        # gave it.  The integrator computes all of this to draw its own plots
+        # and then dropped it on the way out, which left the plots impossible
+        # to redraw afterwards; `integrator-visualize` reads it back.
+        f["peaks/image_index"] = result.image_index
+        f["peaks/pixel_r"], f["peaks/pixel_c"] = result.peak_rows, result.peak_cols
+        f["peaks/var_u"], f["peaks/var_v"] = result.var_u, result.var_v
+        f["peaks/cov_uv"] = result.cov_uv
 
         # Copy metadata
         copy_keys = [
@@ -1685,3 +1735,188 @@ def run_zone_axis_search(
     print(
         f"Done. You can now run:\n subhkl indexer {merged_h5_filename} <output.h5> --bootstrap {output_h5_filename} ..."
     )
+
+
+def run_finder_visualize(
+    images_filename: str,
+    peaks_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Redraw the finder's unrolled-detector plots from its output file.
+
+    Takes the same pair of files the finder itself worked from and wrote to,
+    and reproduces the `-found.png` it would have produced with
+    `--create-visualizations`, without repeating the peak search.
+    """
+    written = replay.replay_plots(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        suffix="-found",
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written
+
+
+def run_integrator_visualize(
+    images_filename: str,
+    peaks_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Redraw the RBF integrator's unrolled-detector plots from its output file.
+
+    Reproduces the `-pred.png` that `rbf-integrator --create-visualizations`
+    would have produced, without repeating the integration.
+    """
+    written = replay.replay_plots(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        suffix="-pred",
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written
+
+
+def run_static_mask(
+    output_filename: str,
+    input_filenames: list[str],
+    peaks_filenames: list[str] | None = None,
+    pooled_peaks_filename: str | None = None,
+    peak_deviance_min: float = 9.488,
+    peak_residual_max: float = 2.0,
+    peak_clear_nsigmas: float = 3.5,
+    min_frames: int = 5,
+    smooth_sigma: float = 2.0,
+    grad_nmads: float = 8.0,
+    texture_factor: float = 0.15,
+    wide_sigma: float = 20.0,
+    edge_sigma: float = 25.0,
+    dilate_px: int = 8,
+    static_quantile: float = 25.0,
+    grad_min_frac: float = 0.02,
+):
+    """Build a static-structure mask from reduced/merged frame stacks.
+
+    See subhkl.search.static_mask for the estimator; the output is itself a
+    reduced single-frame stack (1 = valid, 0 = masked, one frame per physical
+    bank), so any tool that reads reduced files can display it, and the
+    finder maps it onto its input by bank id (--static-mask-file).
+    """
+    from subhkl.search.static_mask import build_mask_file
+
+    summary = build_mask_file(
+        input_filenames,
+        output_filename,
+        peaks=peaks_filenames,
+        pooled_peaks=pooled_peaks_filename,
+        peak_deviance_min=peak_deviance_min,
+        peak_residual_max=peak_residual_max,
+        peak_clear_nsigmas=peak_clear_nsigmas,
+        min_frames=min_frames,
+        smooth_sigma=smooth_sigma,
+        grad_nmads=grad_nmads,
+        texture_factor=texture_factor,
+        wide_sigma=wide_sigma,
+        edge_sigma=edge_sigma,
+        dilate_px=dilate_px,
+        static_quantile=static_quantile,
+        grad_min_frac=grad_min_frac,
+    )
+    print(
+        f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "
+        f"{100 * summary['masked_fraction']:.2f}% of pixels masked."
+    )
+    if summary["thin_banks"]:
+        print(
+            f"Banks with fewer than {min_frames} distinct frames stay fully "
+            "valid: " + ", ".join(str(b) for b in summary["thin_banks"])
+        )
+    if summary.get("n_exonerated"):
+        print(
+            f"Exonerated {summary['n_exonerated']} metric-certified peak "
+            "footprint(s) from the static evidence."
+        )
+    if summary.get("n_exonerated_pooled"):
+        print(
+            f"Exonerated {summary['n_exonerated_pooled']} bank-level peak "
+            "footprint(s) certified by the pooled (summed-frame) fit."
+        )
+    if summary["duplicates_dropped"]:
+        n = sum(summary["duplicates_dropped"].values())
+        print(
+            f"WARNING: dropped {n} duplicate frame(s) (same goniometer "
+            "orientation or identical content).  The estimator needs the "
+            "sample to move between frames; repeats would promote true "
+            "signal into the mask."
+        )
+    return summary
+
+
+def run_sum_images(
+    output_filename: str,
+    input_filenames: list[str],
+):
+    """Sum each physical bank's deduplicated frames into a one-frame-per-bank
+    stack.
+
+    The companion of `static-mask`: a finder run on the summed stack sees the
+    pooled evidence exactly as the static-map quantile does, so quasi-static
+    reflections too faint for any single frame's certificate compound to
+    certification there (deviance is additive across frames).  Feed that
+    finder output back to `static-mask` as --pooled-peaks.
+    """
+    from subhkl.search.static_mask import build_summed_file
+
+    summary = build_summed_file(input_filenames, output_filename)
+    print(
+        f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "
+        f"{sum(summary['n_frames'].values())} frame(s) summed."
+    )
+    if summary["duplicates_dropped"]:
+        n = sum(summary["duplicates_dropped"].values())
+        print(f"Dropped {n} duplicate frame(s) before summing.")
+    return summary
+
+
+def run_mask_visualize(
+    images_filename: str,
+    mask_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 600,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Draw the static mask over the frames it applies to (`<label>-mask.png`)."""
+    written = replay.replay_mask_plots(
+        images_filename=images_filename,
+        mask_filename=mask_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written

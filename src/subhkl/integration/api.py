@@ -334,6 +334,25 @@ class Peaks:
             f["peaks/sigma"] = detector_peaks.sigma
             f["peaks/radius"] = detector_peaks.radii
 
+            # Per-peak quality metrics, written only when the finder supplies
+            # them.  `deviance` is the leave-one-out likelihood-ratio statistic
+            # for that peak's presence (is it real?), calibrated against chi^2
+            # with four degrees of freedom; `residual_deviance` is the local
+            # goodness of fit per degree of freedom over the peak's own
+            # footprint (is it fitted correctly?), calibrated near 1.  A
+            # mis-sized peak scores high on the first and badly on the second.
+            n_peaks = len(detector_peaks.intensity)
+            if (
+                detector_peaks.deviance is not None
+                and len(detector_peaks.deviance) == n_peaks
+            ):
+                f["peaks/deviance"] = detector_peaks.deviance
+            if (
+                detector_peaks.residual_deviance is not None
+                and len(detector_peaks.residual_deviance) == n_peaks
+            ):
+                f["peaks/residual_deviance"] = detector_peaks.residual_deviance
+
             # Use pixel coordinates exclusively
             f["peaks/pixel_r"] = detector_peaks.peak_rows
             f["peaks/pixel_c"] = detector_peaks.peak_cols
@@ -361,6 +380,8 @@ class Peaks:
         lamda_max: list[float] = []
         intensity: list[float] = []
         sigma: list[float] = []
+        deviance: list[float] = []
+        residual_deviance: list[float] = []
         radii: list[float] = []
         xyz_out: list[list[float]] = []
         banks: list[int] = []
@@ -369,6 +390,7 @@ class Peaks:
         gonio_angles_out: list[list[float]] = []
         peak_rows: list[int] = []
         peak_cols: list[int] = []
+        width: list[float] | None = []
 
         for img_key in sorted(self.image.ims.keys()):
             res = results_by_key.get(img_key)
@@ -380,6 +402,18 @@ class Peaks:
                 lamda_max.extend(res["lamda_max"])
                 intensity.extend(res["intensity"])
                 sigma.extend(res["sigma"])
+                deviance.extend(res.get("deviance", [0.0] * res["count"]))
+                residual_deviance.extend(
+                    res.get("residual_deviance", [0.0] * res["count"])
+                )
+                # Absent for the finders that fit no width; a bank that
+                # reports none leaves the whole column unusable, since a peak
+                # with no size cannot be told apart from one of size zero.
+                bank_widths = res.get("width")
+                if bank_widths is None:
+                    width = None
+                elif width is not None:
+                    width.extend(bank_widths)
                 radii.extend(res["radii"])
                 xyz_out.extend(res["xyz"])
                 banks.extend(res["banks"])
@@ -409,6 +443,9 @@ class Peaks:
             self.goniometer.names_raw,
             peak_rows,
             peak_cols,
+            deviance,
+            residual_deviance,
+            width if width else None,
         )
 
         if visualize:
@@ -440,6 +477,13 @@ class Peaks:
             for r_id, data in runs_plot_data.items():
                 mask = [i for i, run in enumerate(peaks.run_id) if run == r_id]
 
+                # Draw each peak at the width the finder fitted it, when it
+                # fitted one: an isotropic covariance is the same statement as
+                # a radius, and it is the form the plotter already draws.
+                # Without it every peak is drawn the same size, which hides
+                # exactly what these plots are looked at to see.
+                variances = [peaks.width[i] ** 2 for i in mask] if peaks.width else None
+
                 run_peaks = _RunPeaksFinder(
                     xyz=[peaks.xyz[i] for i in mask] if peaks.xyz else [],
                     image_index=[peaks.image_index[i] for i in mask]
@@ -451,6 +495,9 @@ class Peaks:
                     peak_cols=[peaks.peak_cols[i] for i in mask]
                     if peaks.peak_cols
                     else [],
+                    var_u=variances,
+                    var_v=variances,
+                    cov_uv=[0.0] * len(mask) if variances else None,
                 )
 
                 out_name = os.path.join(base_dir, f"{data['label']}-found.png")

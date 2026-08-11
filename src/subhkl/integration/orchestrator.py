@@ -6,6 +6,7 @@ from typing import List, Any, Optional, Dict, Tuple
 from .image_data import ImageData
 from subhkl.config import beamlines
 from subhkl.instrument.goniometer import Goniometer
+from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 from subhkl.search.sparse_rbf import SparseRBFPeakFinder
 
 
@@ -37,6 +38,15 @@ class DetectorPeaks:
     gonio_names: Optional[List[str]]
     peak_rows: Optional[List[int]]
     peak_cols: Optional[List[int]]
+    # Per-peak quality metrics from the finder, when it reports them.
+    # Trailing and defaulted so that positional construction and unpacking of
+    # the fields above are unaffected.
+    deviance: Optional[List[float]] = None
+    residual_deviance: Optional[List[float]] = None
+    # The per-peak Gaussian width, for the finders that fit one.  None when no
+    # width was measured, which is the difference from `sigma` above: that one
+    # always holds a number, but only sometimes a width.
+    width: Optional[List[float]] = None
 
     def __iter__(self):
         """Allows tuple unpacking"""
@@ -87,6 +97,8 @@ def prepare_harvest_tasks(
 
     # --- BATCH PRE-PROCESSING (SparseRBF) ---
     precomputed_peaks = {}
+    precomputed_deviance = {}
+    precomputed_residual = {}
     if finder_algorithm == "sparse_rbf":
         img_keys = sorted(ims.keys())
         images_list = [ims[k] for k in img_keys]
@@ -97,20 +109,109 @@ def prepare_harvest_tasks(
             border_width = 0.0
         border_width *= min(img_stack.shape[1], img_stack.shape[2])
 
-        alg = SparseRBFPeakFinder(
-            alpha=harvest_peaks_kwargs.get("alpha", 0.1),
-            gamma=harvest_peaks_kwargs.get("gamma", 2.0),
-            loss=harvest_peaks_kwargs.get("loss", "gaussian"),
-            min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
-            max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
-            border_width=int(border_width),
-            chunk_size=harvest_peaks_kwargs.get("chunk_size", 128),
-            show_steps=harvest_peaks_kwargs.get("show_steps", False),
-            auto_tune_alpha=harvest_peaks_kwargs.get("auto_tune_alpha", False),
-            candidate_alphas=harvest_peaks_kwargs.get("candidate_alphas", None),
-        )
-        batch_coords = alg.find_peaks_batch(img_stack)
+        # The global basis-pursuit finder is the default; the greedy
+        # matching-pursuit one is kept behind `legacy` while it is retired.
+        # Both return [amplitude, row, column, sigma] per peak.
+        if harvest_peaks_kwargs.get("legacy", False):
+            legacy_alpha = harvest_peaks_kwargs.get("alpha")
+            alg = SparseRBFPeakFinder(
+                # The greedy finder has no notion of the false-alarm floor, so
+                # it keeps its historical constant when none is given.
+                alpha=0.1 if legacy_alpha is None else legacy_alpha,
+                gamma=harvest_peaks_kwargs.get("gamma", 2.0),
+                loss=harvest_peaks_kwargs.get("loss", "gaussian"),
+                min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
+                max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
+                border_width=int(border_width),
+                chunk_size=harvest_peaks_kwargs.get("chunk_size", 128),
+                show_steps=harvest_peaks_kwargs.get("show_steps", False),
+                auto_tune_alpha=harvest_peaks_kwargs.get("auto_tune_alpha", False),
+                candidate_alphas=harvest_peaks_kwargs.get("candidate_alphas", None),
+            )
+        else:
+            alg = MatrixFreeSparseRBFPeakFinder(
+                # None means "derive it from the image size"; see
+                # MatrixFreeSparseRBFPeakFinder.effective_alpha.
+                alpha=harvest_peaks_kwargs.get("alpha"),
+                # 0, not the historical 2.0: the flux-matched default; see the
+                # class docstring.  The legacy branch above keeps 2.0 so that
+                # it still reproduces what it always did.
+                gamma=harvest_peaks_kwargs.get("gamma", 0.0),
+                loss=harvest_peaks_kwargs.get("loss", "poisson"),
+                min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
+                # None measures the ceiling from the first batch's own width
+                # census (matrix-free finder only; the legacy branch above
+                # keeps its fixed default).
+                max_sigma=harvest_peaks_kwargs.get("max_sigma"),
+                # Bank resolution, independent of the ceiling.  None lets the
+                # finder auto-size the bank against carpet fragmentation; an
+                # explicit count keeps the historical uniform grid.
+                num_sigmas=harvest_peaks_kwargs.get("num_sigmas"),
+                # Tolerable unsupported atoms per image.  Mapped onto the
+                # brightness quantile the auto bank protects, via the moment
+                # census of each batch -- arithmetic, no extra solves; see
+                # _frag_protected_quantile.  Non-positive keeps the fixed
+                # p90 census quantile.
+                max_fragmentation_rate=harvest_peaks_kwargs.get(
+                    "max_fragmentation_rate", 1.0
+                ),
+                # The m0 of the false-alarm calibration: expected false peaks
+                # per image.  The one knob that sets the detection budget.
+                false_alarms_per_image=harvest_peaks_kwargs.get(
+                    "false_alarms_per_image", 1.0
+                ),
+                show_steps=harvest_peaks_kwargs.get("show_steps", False),
+                # These four were not forwarded at first, and the omission was
+                # invisible from the CLI: the constructor's **kwargs swallows
+                # nothing, the class defaults are sensible, and every unit test
+                # builds the class directly.  The visible symptoms were that
+                # --sparse-rbf-profile-file gaussian (the documented opt-out
+                # of the learned family) did nothing, and that a suite tuned
+                # to --sparse-rbf-chunk-size 64 was actually running at
+                # whatever the class default happened to be.
+                profile_file=harvest_peaks_kwargs.get("profile_file", "auto"),
+                shape_ratio=harvest_peaks_kwargs.get("shape_ratio", 1.2),
+                shape_orientations=harvest_peaks_kwargs.get("shape_orientations", 4),
+                chunk_size=harvest_peaks_kwargs.get("chunk_size", 64),
+                multi_gpu=harvest_peaks_kwargs.get("multi_gpu", False),
+            )
+        # A static-structure mask (see subhkl.search.static_mask) is mapped
+        # onto the input by *physical* bank, so a mask built from any scans of
+        # this instrument -- different sample included -- applies here, and a
+        # bank the mask file does not carry runs unmasked.
+        valid_stack = None
+        static_mask_file = harvest_peaks_kwargs.get("static_mask_file")
+        if static_mask_file and isinstance(alg, MatrixFreeSparseRBFPeakFinder):
+            from subhkl.search.static_mask import load_mask_for_banks
+
+            valid_stack = load_mask_for_banks(
+                static_mask_file,
+                [bank_mapping.get(k, k) for k in img_keys],
+                img_stack.shape[1:],
+            )
+        elif static_mask_file:
+            print(
+                "WARNING: --static-mask-file is only honored by the "
+                "matrix-free finder; the legacy path ignores it."
+            )
+
+        if valid_stack is not None:
+            batch_coords = alg.find_peaks_batch(img_stack, valid=valid_stack)
+        else:
+            batch_coords = alg.find_peaks_batch(img_stack)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}
+        # Per-peak quality metrics, when the finder reports them (the
+        # matrix-free finder does; the legacy greedy one does not).
+        batch_deviance = getattr(alg, "peak_deviance", None)
+        if batch_deviance is not None:
+            precomputed_deviance = {
+                k: d for k, d in zip(img_keys, batch_deviance, strict=False)
+            }
+        batch_residual = getattr(alg, "peak_residual_deviance", None)
+        if batch_residual is not None:
+            precomputed_residual = {
+                k: d for k, d in zip(img_keys, batch_residual, strict=False)
+            }
 
     tasks = []
     for img_key in sorted(ims.keys()):
@@ -149,11 +250,26 @@ def prepare_harvest_tasks(
         pre_coords = None
         if finder_algorithm == "sparse_rbf":
             coords = precomputed_peaks[img_key]
-            # coords shape is [intensity, r, c, sigma]
+            # coords shape is [intensity, r, c, sigma].  The third slot of
+            # pre_coords carries the finder's per-peak Gaussian width so the
+            # harvest output can record it (peaks/sigma) for --max-sigma
+            # tuning diagnostics; the fourth carries the per-peak leave-one-out
+            # deviance (peaks/deviance), the significance of that atom against
+            # chi^2 on its four parameters; the fifth the local residual
+            # deviance per degree of freedom (peaks/residual_deviance), which
+            # says whether the neighbourhood is actually explained -- a
+            # mis-sized sigma scores high on the fourth and badly on the fifth.
+            dev = precomputed_deviance.get(img_key)
+            res = precomputed_residual.get(img_key)
             if len(coords) > 0:
-                pre_coords = (coords[:, 1], coords[:, 2])
+                if dev is None or len(dev) != len(coords):
+                    dev = np.zeros(len(coords))
+                if res is None or len(res) != len(coords):
+                    res = np.zeros(len(coords))
+                pre_coords = (coords[:, 1], coords[:, 2], coords[:, 3], dev, res)
             else:
-                pre_coords = (np.array([]), np.array([]))
+                empty = np.array([])
+                pre_coords = (empty, empty, empty, empty, empty)
 
         finder_info = (finder_algorithm, harvest_peaks_kwargs, pre_coords)
         mask_info = (

@@ -6,6 +6,9 @@ import typer
 import h5py
 import os
 
+from subhkl.utils.devices import restrict_to_first_device
+from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
+
 from subhkl.commands import (
     run_index,
     run_rbf_integrator,
@@ -17,6 +20,11 @@ from subhkl.commands import (
     run_reduce,
     run_merge_images,
     run_zone_axis_search,
+    run_finder_visualize,
+    run_integrator_visualize,
+    run_static_mask,
+    run_sum_images,
+    run_mask_visualize,
 )
 
 
@@ -88,14 +96,128 @@ def finder(
     peak_minimum_pixels: int = 30,
     peak_minimum_signal_to_noise: float = 1.0,
     peak_pixel_outlier_threshold: float = 2.0,
-    sparse_rbf_alpha: float = 0.1,
-    sparse_rbf_gamma: float = 1.0,
+    hull_filter: Annotated[
+        bool,
+        typer.Option(
+            "--hull-filter/--no-hull-filter",
+            help=(
+                "Drop candidates the convex-hull stage cannot fit a region to. "
+                "On by default, where the hull acts as a true-positive filter "
+                "on the finder's output. Switch it off to report everything "
+                "the finder proposes, with an aperture intensity for the peaks "
+                "the hull stage rejects -- only sensible when the finder's own "
+                "per-peak metrics are trusted to do the filtering."
+            ),
+        ),
+    ] = True,
+    sparse_rbf_alpha: Annotated[
+        float | None,
+        typer.Option(
+            help="Significance threshold in units of coefficient noise. Left "
+            "unset it is derived so the expected number of false detections "
+            "over the image is O(1), which depends on the image size; set it "
+            "to demand more evidence than that."
+        ),
+    ] = None,
+    sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
-    sparse_rbf_max_sigma: float = 10.0,
-    sparse_rbf_chunk_size: int = 512,
+    sparse_rbf_max_sigma: Annotated[
+        float | None,
+        typer.Option(
+            help="Bank ceiling in pixels.  The default (unset) measures it "
+            "from the first batch's own bright peaks -- a truncated-moment "
+            "width census with a two-aperture consistency guard -- and sets "
+            "the ceiling at a high percentile of the measured widths; too "
+            "few usable peaks falls back to 10 with a warning.  Set it to "
+            "pin the ceiling by hand."
+        ),
+    ] = None,
+    sparse_rbf_false_alarms_per_image: Annotated[
+        float,
+        typer.Option(
+            help="Expected number of false peaks per image (the m0 of the "
+            "false-alarm calibration). This is the parameter that sets the "
+            "detection budget: the significance threshold is solved from "
+            "E[false peaks] = m0 over every (position, scale) tested, so "
+            "lowering it demands more evidence everywhere at once. gamma "
+            "reshapes the threshold across scales at constant budget."
+        ),
+    ] = 0.1,
+    sparse_rbf_max_fragmentation_rate: Annotated[
+        float,
+        typer.Option(
+            help="Tolerable unsupported atoms per image -- the bank-sizing "
+            "analogue of --sparse-rbf-false-alarms-per-image.  An unsupported "
+            "atom is one whose leave-one-out deviance falls below the chi^2_4 "
+            "95% point: the signature of one peak reported as a cluster of "
+            "fragments.  Costs nothing extra: the rate maps onto the "
+            "brightness quantile of the measured peak census the bank "
+            "protects (peaks above it may fragment, ~2 unsupported atoms "
+            "each), so it is arithmetic on window moments, not extra solves.  "
+            "The realised rate is reported with the final statistics.  Set "
+            "to 0 (or negative) to keep the fixed p90 census quantile."
+        ),
+    ] = 1.0,
+    sparse_rbf_profile_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Peak profile replacing the Gaussian atom.  'auto' (default) "
+            "measures the radial profile f(u), u = r/sigma, from the first "
+            "batch's own bright peaks and rebuilds the bank; a path reads a "
+            "measured profile as JSON {u: [...], f: [...]}; 'gaussian' keeps "
+            "the analytic Gaussian."
+        ),
+    ] = "auto",
+    sparse_rbf_shape_ratio: Annotated[
+        float,
+        typer.Option(
+            help="Axis ratio of elliptical shape variants added per scale, "
+            "area-preserving.  The default 1.2 is the measured anisotropy of "
+            "CG4D/MANDI reflections; 1.0 restores the isotropic basis (and "
+            "cuts the bank convolution cost 5x)."
+        ),
+    ] = 1.2,
+    sparse_rbf_shape_orientations: Annotated[
+        int,
+        typer.Option(
+            help="Number of position angles for the elliptical variants "
+            "(uniform over 180 deg)."
+        ),
+    ] = 4,
+    sparse_rbf_num_sigmas: Annotated[
+        int | None,
+        typer.Option(
+            help="Number of widths in the basis bank, spaced linearly from "
+            "--sparse-rbf-min-sigma to --sparse-rbf-max-sigma. Controls the "
+            "bank's resolution independently of its ceiling: raising max-sigma "
+            "alone widens the spacing, which approximates a peak whose true "
+            "width falls between two available scales with several atoms "
+            "instead of one. The default (unset) auto-sizes an adaptive bank "
+            "just dense enough to prevent exactly that fragmentation, and an "
+            "explicit value below that density warns at startup."
+        ),
+    ] = None,
+    # 64, matching MatrixFreeSparseRBFPeakFinder's own default.  This said 512
+    # while the orchestrator was not forwarding it, so 512 was never what
+    # actually ran -- aligning the defaults keeps "no flag given" meaning what
+    # it always meant now that the flag is honored.
+    sparse_rbf_chunk_size: int = 64,
     sparse_rbf_loss: Annotated[
-        str, typer.Option(help="Likelihood for peak finder.")
-    ] = "gaussian",
+        str,
+        typer.Option(
+            help="Likelihood for the peak finder. Detector frames are photon "
+            "counts, so 'poisson' is the matching noise model; 'gaussian' "
+            "assumes a single constant variance across the frame."
+        ),
+    ] = "poisson",
+    sparse_rbf_legacy: Annotated[
+        bool,
+        typer.Option(
+            help="Use the original greedy matching-pursuit sparse-RBF finder "
+            "instead of the global basis-pursuit one. Opt-out for the new "
+            "default; the greedy path is scheduled for removal."
+        ),
+    ] = False,
     sparse_rbf_auto_tune_alpha: Annotated[
         bool, typer.Option(help="Auto-tune SNR threshold.")
     ] = False,
@@ -103,7 +225,29 @@ def finder(
         str, typer.Option(help="Candidate SNR thresholds alpha for auto-tuning")
     ] = "3.0,5.0,10.0,15.0,20.0,25.0,30.0",
     max_workers: int = 16,
+    multi_gpu: Annotated[
+        bool,
+        typer.Option(
+            "--multi-gpu/--no-multi-gpu",
+            help="Shard the solve across every visible GPU (the image axis "
+            "of each chunk).  Off by default so one process never claims "
+            "every device in the machine; scope visibility with "
+            "CUDA_VISIBLE_DEVICES.",
+        ),
+    ] = False,
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(
+            "--static-mask-file",
+            help="Static-structure mask built by `static-mask`, mapped onto "
+            "the input by physical bank.  Masked pixels enter the solve as "
+            "missing data (the counts are never modified) and no peak is "
+            "reported from inside the mask.",
+        ),
+    ] = None,
 ):
+    if not multi_gpu:
+        restrict_to_first_device()
     # Pass everything straight into the core logic function
     run_finder(
         filename=filename,
@@ -133,15 +277,25 @@ def finder(
         peak_minimum_pixels=peak_minimum_pixels,
         peak_minimum_signal_to_noise=peak_minimum_signal_to_noise,
         peak_pixel_outlier_threshold=peak_pixel_outlier_threshold,
+        hull_filter=hull_filter,
         sparse_rbf_alpha=sparse_rbf_alpha,
         sparse_rbf_gamma=sparse_rbf_gamma,
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
+        sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
+        sparse_rbf_max_fragmentation_rate=sparse_rbf_max_fragmentation_rate,
+        sparse_rbf_profile_file=sparse_rbf_profile_file,
+        sparse_rbf_shape_ratio=sparse_rbf_shape_ratio,
+        sparse_rbf_shape_orientations=sparse_rbf_shape_orientations,
+        sparse_rbf_false_alarms_per_image=sparse_rbf_false_alarms_per_image,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
+        sparse_rbf_legacy=sparse_rbf_legacy,
         sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
         sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
         max_workers=max_workers,
+        multi_gpu=multi_gpu,
+        static_mask_file=static_mask_file,
     )
 
 
@@ -267,7 +421,19 @@ def indexer(
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
     index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
+    multi_gpu: Annotated[
+        bool,
+        typer.Option(
+            "--multi-gpu/--no-multi-gpu",
+            help="Shard the independent optimization runs across every "
+            "visible GPU.  Off by default so one process never claims every "
+            "device in the machine; scope visibility with "
+            "CUDA_VISIBLE_DEVICES.",
+        ),
+    ] = False,
 ) -> None:
+    if not multi_gpu:
+        restrict_to_first_device()
     # 1. Safely Parse Comma-Separated Strings into Python Lists
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
     gonio_axes_parsed = (
@@ -352,6 +518,7 @@ def indexer(
         batch_size=batch_size,
         num_candidates=num_candidates,
         no_index=not index if index is not None else None,
+        multi_gpu=multi_gpu,
     )
 
 
@@ -683,6 +850,311 @@ def zone_axis_search(
         num_runs=num_runs,
         output_hough=output_hough,
         batch_size=batch_size,
+    )
+
+
+_IMAGES_HELP = "Reduced (or merged) HDF5 file holding the image stack the search ran on"
+_INSTRUMENT_HELP = (
+    "Instrument name. Read from the peaks file when not given; merged image "
+    "files do not record it, so pass it if the peaks file predates the change."
+)
+_OUTPUT_DIR_HELP = "Where to write the plots (default: next to the peaks file)"
+_N_SIGMA_HELP = (
+    "How many standard deviations out to draw each peak's outline. A peak has "
+    "no edge, only a width, so the circle is a choice of contour; 2 sigma "
+    "holds about 86% of a 2D Gaussian's flux."
+)
+_DPI_HELP = (
+    "Resolution of the saved plots. The inline plots are written at 600, which "
+    "is too heavy to keep for every run of a benchmark sweep."
+)
+
+
+@app.command()
+def finder_visualize(
+    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
+    peaks_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
+    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
+    n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
+    max_workers: Optional[int] = None,
+    show_progress: bool = True,
+):
+    """
+    Redraw the finder's unrolled-detector plots from an existing output file.
+
+    Produces the same '-found.png' per run that 'finder
+    --create-visualizations' would have, reading the peak centres and widths
+    back out of the peaks file instead of searching the images again. Run the
+    finder without visualizations, keep the two HDF5 files, and come back to
+    the pictures later.
+    """
+    run_finder_visualize(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+
+
+@app.command()
+def integrator_visualize(
+    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
+    peaks_filename: Annotated[
+        str, typer.Argument(help="rbf-integrator output HDF5 file")
+    ],
+    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
+    n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
+    max_workers: Optional[int] = None,
+    show_progress: bool = True,
+):
+    """
+    Redraw the RBF integrator's unrolled-detector plots from an existing output file.
+
+    Produces the same '-pred.png' per run that 'rbf-integrator
+    --create-visualizations' would have, drawing each peak at the shape the
+    integrator fitted it, without repeating the integration.
+    """
+    run_integrator_visualize(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+
+
+@app.command()
+def static_mask(
+    output_filename: Annotated[str, typer.Argument(help="Mask HDF5 to write")],
+    input_filenames: Annotated[
+        list[str],
+        typer.Argument(
+            help="Reduced/merged HDF5 stacks (images + bank_ids).  Any "
+            "number of files, any samples -- what matters is that they come "
+            "from the same instrument configuration, because the estimator "
+            "keeps what never moves."
+        ),
+    ],
+    peaks: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--peaks",
+            help="Finder outputs from an unmasked run, one per input file in "
+            "the same order.  Optional: unnecessary when the inputs are a "
+            "control experiment without a sample.  Detections whose fit "
+            "metrics certify them as genuine (see --peak-deviance-min / "
+            "--peak-residual-max) are exonerated: their footprints leave "
+            "the static evidence, so a reflection cannot be declared "
+            "static however many frames it persists through.",
+        ),
+    ] = None,
+    pooled_peaks: Annotated[
+        Optional[str],
+        typer.Option(
+            "--pooled-peaks",
+            help="Finder output from a run on the per-bank *summed* stack "
+            "(see `sum-images`).  Certified detections are exonerated in "
+            "every frame of their bank: significance compounds across "
+            "frames in the pooled fit, rescuing quasi-static reflections "
+            "too faint for any single frame's certificate -- which the "
+            "static map, pooling the same frames, would otherwise mask.",
+        ),
+    ] = None,
+    peak_deviance_min: Annotated[
+        float,
+        typer.Option(
+            help="Exoneration needs per-peak deviance above this.  The "
+            "default is the chi^2_4 admission level (9.49): the finder's "
+            "calibrated false-alarm control already governs evidence above "
+            "it, and a higher bar leaves faint genuine peaks -- bright "
+            "enough to mask, too faint to certify -- with no route to "
+            "exoneration."
+        ),
+    ] = 9.488,
+    peak_residual_max: Annotated[
+        float,
+        typer.Option(
+            help="Exoneration needs residual deviance per DoF below this "
+            "(a shape the atom family explains; artifacts fail it)."
+        ),
+    ] = 2.0,
+    peak_clear_nsigmas: Annotated[
+        float,
+        typer.Option(
+            help="Minimum protected radius around an exonerated peak, in "
+            "units of its fitted width; brightness extends it further (to "
+            "where the peak's own tail falls below the texture threshold)."
+        ),
+    ] = 3.5,
+    min_frames: Annotated[
+        int,
+        typer.Option(
+            help="Banks with fewer frames than this across all inputs stay "
+            "fully valid (and are reported): statistics too thin to tell a "
+            "peak from a shadow must not silently mask either."
+        ),
+    ] = 5,
+    smooth_sigma: Annotated[
+        float, typer.Option(help="Gaussian smoothing of the per-bank median, px.")
+    ] = 2.0,
+    grad_nmads: Annotated[
+        float,
+        typer.Option(
+            help="Boundary criterion: mask where the smoothed median's "
+            "gradient exceeds this many MADs of the panel-wide gradient "
+            "(illumination edges, beam-stop shadows)."
+        ),
+    ] = 8.0,
+    texture_factor: Annotated[
+        float,
+        typer.Option(
+            help="Band-pass level criterion, in units of the ambient rate: "
+            "mask static structure at scales between the atom footprint and "
+            "the background window.  A wide smooth halo vanishes from the "
+            "band-pass (the background model follows it, and real peaks "
+            "live there); the plume texture and illumination steps remain."
+        ),
+    ] = 0.15,
+    wide_sigma: Annotated[
+        float,
+        typer.Option(
+            help="Long end of the *level* band, px (the glow-texture "
+            "scale).  Longer lets plateaus inflate the noise floor and "
+            "re-admits dense-diffraction texture."
+        ),
+    ] = 20.0,
+    edge_sigma: Annotated[
+        float,
+        typer.Option(
+            help="Long end of the *contrast* band, px: the scale the "
+            "finder's background model can actually follow (its window is "
+            "max(15, 5 * max_sigma) px).  Shorter opens a blind gap -- "
+            "edges too diffuse for the band yet too sharp for the finder "
+            "produced false atoms at 10; their capture saturates at 25."
+        ),
+    ] = 25.0,
+    dilate_px: Annotated[
+        int,
+        typer.Option(
+            help="Dilation of the masked region, px.  Size it to an atom "
+            "footprint (~2x the finder's max sigma) so atoms whose tails "
+            "rest on the structure are covered."
+        ),
+    ] = 8,
+    static_quantile: Annotated[
+        float,
+        typer.Option(
+            help="Per-pixel quantile across frames that defines the static "
+            "map.  Low (default p25) so a dense diffraction pattern cannot "
+            "leak into it: a static feature is in every frame and survives "
+            "any quantile, a reflection would have to sit still through "
+            "more than (100 - q)%% of the scan."
+        ),
+    ] = 25.0,
+    grad_min_frac: Annotated[
+        float,
+        typer.Option(
+            help="Effect-size floor for the boundary criterion, as gradient "
+            "per pixel in units of the ambient rate.  Significance (MADs) "
+            "alone masks soft genuine variation on flat panels; a real "
+            "illumination edge runs percents of ambient per pixel."
+        ),
+    ] = 0.02,
+):
+    """Build a static-structure mask from frame stacks of one instrument.
+
+    Beam-stop shadows, illumination boundaries and instrument glow are fixed
+    in the detector frame while Bragg peaks move with the sample, so the
+    per-bank median across enough frames contains the artifacts and none of
+    the crystal.  The output is itself a reduced single-frame stack (uint8,
+    1 = valid, one frame per physical bank); feed it to the finder as
+    --static-mask-file, which maps it onto its input by bank id.
+    """
+    run_static_mask(
+        output_filename=output_filename,
+        input_filenames=list(input_filenames),
+        peaks_filenames=list(peaks) if peaks else None,
+        pooled_peaks_filename=pooled_peaks,
+        peak_deviance_min=peak_deviance_min,
+        peak_residual_max=peak_residual_max,
+        peak_clear_nsigmas=peak_clear_nsigmas,
+        min_frames=min_frames,
+        smooth_sigma=smooth_sigma,
+        grad_nmads=grad_nmads,
+        texture_factor=texture_factor,
+        wide_sigma=wide_sigma,
+        edge_sigma=edge_sigma,
+        dilate_px=dilate_px,
+        static_quantile=static_quantile,
+        grad_min_frac=grad_min_frac,
+    )
+
+
+@app.command()
+def sum_images(
+    output_filename: Annotated[str, typer.Argument(help="Summed HDF5 to write")],
+    input_filenames: Annotated[
+        list[str],
+        typer.Argument(
+            help="Reduced/merged HDF5 stacks (images + bank_ids), the same "
+            "inputs `static-mask` will see."
+        ),
+    ],
+):
+    """Sum each bank's deduplicated frames into a one-frame-per-bank stack.
+
+    The companion of `static-mask`: run the finder on the summed stack and
+    pass its output back as --pooled-peaks.  Deviance is additive across
+    frames, so a quasi-static reflection sitting just below every single
+    frame's admission level -- bright enough for the static map to mask,
+    too faint for any per-frame certificate -- compounds to certification
+    in the pooled fit.  Goniometer angles in the output are placeholders;
+    the file exists for peak metrics only, never for indexing.
+    """
+    run_sum_images(
+        output_filename=output_filename,
+        input_filenames=list(input_filenames),
+    )
+
+
+@app.command()
+def mask_visualize(
+    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
+    mask_filename: Annotated[
+        str, typer.Argument(help="Static mask HDF5 (from `static-mask`)")
+    ],
+    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 600,
+    max_workers: Optional[int] = None,
+    show_progress: bool = True,
+):
+    """
+    Draw the static mask over the frames it applies to.
+
+    The same unrolled-detector rendering as finder-visualize, with masked
+    pixels burnt to the top of the intensity scale so they read as solid
+    regions against the data.  One `<label>-mask.png` per run.
+    """
+    run_mask_visualize(
+        images_filename=images_filename,
+        mask_filename=mask_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        max_workers=max_workers,
+        show_progress=show_progress,
     )
 
 
