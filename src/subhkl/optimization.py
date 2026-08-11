@@ -230,11 +230,25 @@ class VectorizedObjective:
         no_index=False,
         hkl_fixed=None,
         lambda_fixed=None,
+        radial_downweight=1.0,
+        radial_downweight_poly=None,
     ):
         self.no_index = no_index
         if self.no_index:
             self.hkl_fixed = jnp.array(hkl_fixed)  # Shape: (3, N)
             self.lambda_fixed = jnp.array(lambda_fixed)  # Shape: (N,)
+        # kappa >= 1: dimensionless radial-to-tangential residual scale
+        # ratio; a polynomial in the elastic wavelength (Angstrom,
+        # highest-degree coefficient first) overrides the scalar.
+        self.radial_downweight = float(radial_downweight)
+        self.radial_downweight_poly = (
+            jnp.array(radial_downweight_poly)
+            if radial_downweight_poly is not None
+            else None
+        )
+        self.radial_downweight_active = bool(
+            radial_downweight_poly is not None or self.radial_downweight > 1.0
+        )
 
         self.B = jnp.array(B)
         self.kf_ki_dir_init = jnp.array(kf_ki_dir)
@@ -1009,6 +1023,18 @@ class VectorizedObjective:
         The residual is the chord |kf_pred - kf_obs| between unit vectors:
         equal to the angular error in radians to third order, and smooth at
         zero where arccos is not.
+
+        Laue spots are streaks along the 2-theta gradient (mosaic blocks
+        rotated within the scattering plane stay reflective at an adjusted
+        wavelength), so the observed centroid scatters radially far more
+        than tangentially (measured 3.7x on cg4d-t4-lysozyme).  The chord
+        is therefore decomposed in the per-peak frame t = ki x kf (out of
+        the scattering plane), r = t x kf (2-theta gradient), and the
+        radial component is divided by the dimensionless scatter ratio
+        kappa = radial_downweight, optionally wavelength-dependent through
+        a polynomial kappa(lam) -- streak-centroid noise then cannot steer
+        the geometry, while the narrow tangential direction keeps full
+        weight.  kappa = 1 reproduces the plain chord exactly.
         """
         G = jnp.matmul(ub_mat, self.hkl_fixed)  # (S, 3, N)
         G_sq = jnp.sum(G * G, axis=1)
@@ -1016,7 +1042,32 @@ class VectorizedObjective:
         kf_pred = ki_sample + lam[:, None, :] * G
         kf_obs = kf_ki_sample + ki_sample
 
-        dist = jnp.linalg.norm(kf_pred - kf_obs, axis=1)
+        delta = kf_pred - kf_obs
+        if self.radial_downweight_active:
+            t_vec = jnp.cross(ki_sample, kf_obs, axis=1)
+            t_norm = jnp.linalg.norm(t_vec, axis=1, keepdims=True)
+            t_hat = t_vec / jnp.where(t_norm == 0.0, 1.0, t_norm)
+            r_vec = jnp.cross(t_hat, kf_obs, axis=1)
+            r_norm = jnp.linalg.norm(r_vec, axis=1, keepdims=True)
+            r_hat = r_vec / jnp.where(r_norm == 0.0, 1.0, r_norm)
+
+            c_t = jnp.sum(delta * t_hat, axis=1)
+            c_r = jnp.sum(delta * r_hat, axis=1)
+            c_l = jnp.sum(delta * kf_obs, axis=1)
+
+            if self.radial_downweight_poly is not None:
+                kappa = jnp.polyval(self.radial_downweight_poly, lam)
+            else:
+                kappa = self.radial_downweight
+            kappa = jnp.maximum(kappa, 1.0)
+
+            weighted = jnp.sqrt(c_t**2 + c_l**2 + (c_r / kappa) ** 2)
+            # Near-forward peaks (ki x kf -> 0) have no defined frame:
+            # keep the isotropic chord there.
+            degenerate = t_norm[:, 0, :] < 1e-6
+            dist = jnp.where(degenerate, jnp.linalg.norm(delta, axis=1), weighted)
+        else:
+            dist = jnp.linalg.norm(delta, axis=1)
         # hkl = 0 rows (peaks the bootstrap left unassigned) carry no
         # assignment information and must not enter the loss: their
         # kf_pred = ki makes the residual |kf_obs - ki| = 2 sin(theta),
@@ -1470,6 +1521,8 @@ class FindUB:
         detector_rot_bound_deg: float = 1.0,
         freeze_orientation: bool = False,
         no_index: bool | None = None,
+        radial_downweight: float = 1.0,
+        radial_downweight_poly: list | None = None,
         multi_gpu: bool = False,
         **kwargs,
     ):
@@ -1693,6 +1746,8 @@ class FindUB:
             no_index=self.no_index,
             hkl_fixed=self.hkl,
             lambda_fixed=self.lambdas,
+            radial_downweight=radial_downweight,
+            radial_downweight_poly=radial_downweight_poly,
         )
 
         num_dims = 0 if freeze_orientation else 3

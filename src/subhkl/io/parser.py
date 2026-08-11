@@ -445,6 +445,21 @@ def indexer(
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
     index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
+    radial_downweight: Annotated[
+        float,
+        typer.Option(
+            help="Dimensionless kappa >= 1: divide the radial (2-theta "
+            "gradient) component of the --no-index positional residual by "
+            "this streak-scatter ratio; 1 keeps the isotropic chord."
+        ),
+    ] = 1.0,
+    radial_downweight_poly: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Comma-separated polynomial coefficients for kappa(lambda) "
+            "in Angstrom, highest degree first; overrides --radial-downweight."
+        ),
+    ] = None,
     multi_gpu: Annotated[
         bool,
         typer.Option(
@@ -554,6 +569,12 @@ def indexer(
         batch_size=batch_size,
         num_candidates=num_candidates,
         no_index=not index if index is not None else None,
+        radial_downweight=radial_downweight,
+        radial_downweight_poly=(
+            [float(x.strip()) for x in radial_downweight_poly.split(",")]
+            if radial_downweight_poly
+            else None
+        ),
         multi_gpu=multi_gpu,
     )
 

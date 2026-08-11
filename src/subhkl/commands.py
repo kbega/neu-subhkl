@@ -107,6 +107,8 @@ def run_index(
     input_data: dict | None = None,
     num_candidates: int | None = None,
     no_index: bool | None = None,
+    radial_downweight: float = 1.0,
+    radial_downweight_poly: list[float] | None = None,
     multi_gpu: bool = False,
 ):
     input_data = input_data or {}
@@ -609,6 +611,8 @@ def run_index(
         freeze_orientation=freeze_orientation,
         num_candidates=num_candidates,
         no_index=no_index,
+        radial_downweight=radial_downweight,
+        radial_downweight_poly=radial_downweight_poly,
         multi_gpu=multi_gpu,
     )
 
@@ -725,6 +729,8 @@ def run_index(
 
         flags = {
             "no_index": opt.no_index,
+            "radial_downweight": radial_downweight,
+            "radial_downweight_poly": radial_downweight_poly,
             "refine_lattice": refine_lattice,
             "refine_goniometer": refine_goniometer,
             "refine_goniometer_axis_vector": refine_goniometer_axis_vector,

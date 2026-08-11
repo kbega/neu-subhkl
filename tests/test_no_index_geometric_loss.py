@@ -124,3 +124,89 @@ def test_unassigned_peaks_are_excluded_from_the_loss_and_fail_the_cut():
     assert (dist[:5] > np.deg2rad(1.0)).all()
     np.testing.assert_allclose(dist[5:], 0.0, atol=1e-6)
     np.testing.assert_allclose(np.array(loss[0]), 0.0, atol=1e-6)
+
+
+def _rotate_each(kfs, ki, direction, delta):
+    """Rotate each kf about its per-peak frame axis: 'radial' displacement
+    rotates about t = ki x kf (in-plane, 2-theta change), 'tangential'
+    rotates about r = t x kf (out-of-plane)."""
+    out = np.empty_like(kfs)
+    for i, kf in enumerate(kfs):
+        t = np.cross(ki, kf)
+        t /= np.linalg.norm(t)
+        axis = t if direction == "radial" else np.cross(t, kf)
+        out[i] = Rotation.from_rotvec(delta * axis).as_matrix() @ kf
+    return out
+
+
+def test_radial_downweight_suppresses_only_the_radial_component():
+    B, ki, hkls, lams, kfs = _make_peaks()
+    delta = np.deg2rad(0.5)
+    chord = 2.0 * np.sin(delta / 2.0)
+    kappa = 4.0
+
+    for direction, expected in (("radial", chord / kappa), ("tangential", chord)):
+        moved = _rotate_each(kfs, ki, direction, delta)
+        obj = VectorizedObjective(
+            B,
+            (moved - ki).T,
+            None,
+            np.array([1.0, 4.0]),
+            beam_nominal=ki,
+            kf_lab_fixed_vectors=(moved - ki).T,
+            no_index=True,
+            hkl_fixed=hkls.T.astype(float),
+            lambda_fixed=lams,
+            radial_downweight=kappa,
+        )
+        _, dist, _, _ = obj.get_results(np.zeros((1, 3)))
+        np.testing.assert_allclose(np.array(dist[0]), expected, rtol=2e-3)
+
+
+def test_constant_polynomial_kappa_of_one_is_the_plain_chord():
+    B, ki, hkls, lams, kfs = _make_peaks()
+    delta = np.deg2rad(0.4)
+    moved = _rotate_each(kfs, ki, "radial", delta)
+
+    def build(**kw):
+        return VectorizedObjective(
+            B,
+            (moved - ki).T,
+            None,
+            np.array([1.0, 4.0]),
+            beam_nominal=ki,
+            kf_lab_fixed_vectors=(moved - ki).T,
+            no_index=True,
+            hkl_fixed=hkls.T.astype(float),
+            lambda_fixed=lams,
+            **kw,
+        )
+
+    _, d_plain, _, _ = build().get_results(np.zeros((1, 3)))
+    _, d_poly, _, _ = build(radial_downweight_poly=[1.0]).get_results(np.zeros((1, 3)))
+    # The decomposed weighted form at kappa = 1 must equal the isotropic
+    # chord exactly: t, r, kf form a complete orthonormal frame.
+    np.testing.assert_allclose(np.array(d_poly[0]), np.array(d_plain[0]), atol=1e-7)
+
+
+def test_wavelength_polynomial_applies_kappa_per_peak():
+    B, ki, hkls, lams, kfs = _make_peaks()
+    delta = np.deg2rad(0.5)
+    chord = 2.0 * np.sin(delta / 2.0)
+    moved = _rotate_each(kfs, ki, "radial", delta)
+    poly = [2.0, -1.0]  # kappa(lam) = 2 lam - 1, in [1, 7] over the band
+    obj = VectorizedObjective(
+        B,
+        (moved - ki).T,
+        None,
+        np.array([1.0, 4.0]),
+        beam_nominal=ki,
+        kf_lab_fixed_vectors=(moved - ki).T,
+        no_index=True,
+        hkl_fixed=hkls.T.astype(float),
+        lambda_fixed=lams,
+        radial_downweight_poly=poly,
+    )
+    _, dist, _, lam = obj.get_results(np.zeros((1, 3)))
+    kappa = np.maximum(np.polyval(poly, np.array(lam[0])), 1.0)
+    np.testing.assert_allclose(np.array(dist[0]), chord / kappa, rtol=2e-3)
