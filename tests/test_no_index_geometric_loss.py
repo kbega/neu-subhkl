@@ -139,13 +139,20 @@ def _rotate_each(kfs, ki, direction, delta):
     return out
 
 
-def test_radial_downweight_suppresses_only_the_radial_component():
+def test_radial_weight_suppresses_only_the_radial_component():
     B, ki, hkls, lams, kfs = _make_peaks()
     delta = np.deg2rad(0.5)
     chord = 2.0 * np.sin(delta / 2.0)
-    kappa = 4.0
 
-    for direction, expected in (("radial", chord / kappa), ("tangential", chord)):
+    # At w = 0 the radial direction is discarded and only the chord's
+    # second-order longitudinal component (chord^2 / 2) survives.
+    floor = chord**2 / 2.0
+    for w, direction, expected in (
+        (0.25, "radial", 0.25 * chord),
+        (0.25, "tangential", chord),
+        (0.0, "radial", floor),
+        (0.0, "tangential", chord),
+    ):
         moved = _rotate_each(kfs, ki, direction, delta)
         obj = VectorizedObjective(
             B,
@@ -157,13 +164,13 @@ def test_radial_downweight_suppresses_only_the_radial_component():
             no_index=True,
             hkl_fixed=hkls.T.astype(float),
             lambda_fixed=lams,
-            radial_downweight=kappa,
+            radial_weight=w,
         )
         _, dist, _, _ = obj.get_results(np.zeros((1, 3)))
-        np.testing.assert_allclose(np.array(dist[0]), expected, rtol=2e-3)
+        np.testing.assert_allclose(np.array(dist[0]), expected, rtol=6e-3, atol=1e-6)
 
 
-def test_constant_polynomial_kappa_of_one_is_the_plain_chord():
+def test_constant_polynomial_weight_of_one_is_the_plain_chord():
     B, ki, hkls, lams, kfs = _make_peaks()
     delta = np.deg2rad(0.4)
     moved = _rotate_each(kfs, ki, "radial", delta)
@@ -183,18 +190,18 @@ def test_constant_polynomial_kappa_of_one_is_the_plain_chord():
         )
 
     _, d_plain, _, _ = build().get_results(np.zeros((1, 3)))
-    _, d_poly, _, _ = build(radial_downweight_poly=[1.0]).get_results(np.zeros((1, 3)))
-    # The decomposed weighted form at kappa = 1 must equal the isotropic
+    _, d_poly, _, _ = build(radial_weight_poly=[1.0]).get_results(np.zeros((1, 3)))
+    # The decomposed weighted form at w = 1 must equal the isotropic
     # chord exactly: t, r, kf form a complete orthonormal frame.
     np.testing.assert_allclose(np.array(d_poly[0]), np.array(d_plain[0]), atol=1e-7)
 
 
-def test_wavelength_polynomial_applies_kappa_per_peak():
+def test_wavelength_polynomial_applies_the_weight_per_peak():
     B, ki, hkls, lams, kfs = _make_peaks()
     delta = np.deg2rad(0.5)
     chord = 2.0 * np.sin(delta / 2.0)
     moved = _rotate_each(kfs, ki, "radial", delta)
-    poly = [2.0, -1.0]  # kappa(lam) = 2 lam - 1, in [1, 7] over the band
+    poly = [0.2, -0.3]  # w(lam) = 0.2 lam - 0.3, clipped to [0, 1]
     obj = VectorizedObjective(
         B,
         (moved - ki).T,
@@ -205,8 +212,9 @@ def test_wavelength_polynomial_applies_kappa_per_peak():
         no_index=True,
         hkl_fixed=hkls.T.astype(float),
         lambda_fixed=lams,
-        radial_downweight_poly=poly,
+        radial_weight_poly=poly,
     )
     _, dist, _, lam = obj.get_results(np.zeros((1, 3)))
-    kappa = np.maximum(np.polyval(poly, np.array(lam[0])), 1.0)
-    np.testing.assert_allclose(np.array(dist[0]), chord / kappa, rtol=2e-3)
+    w = np.clip(np.polyval(poly, np.array(lam[0])), 0.0, 1.0)
+    expected = np.sqrt((chord * w) ** 2 + (chord**2 / 2.0) ** 2)
+    np.testing.assert_allclose(np.array(dist[0]), expected, rtol=6e-3, atol=1e-6)
