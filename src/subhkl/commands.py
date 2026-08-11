@@ -8,7 +8,6 @@ from subhkl.instrument.goniometer import (
 from subhkl.integration import Peaks
 from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
-<<<<<<< HEAD
 from subhkl.viz import replay
 from subhkl.instrument.plot_metrics import plot_metric
 from subhkl.viz import detector_assembly, replay
