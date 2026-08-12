@@ -225,6 +225,90 @@ def test_static_mask_removes_ridge_bias():
     assert abs(np.mean(biased)) > 30.0, np.mean(biased)
 
 
+def _render_profile(positions, fluxes, rng, trunk):
+    """Scene whose peaks follow an arbitrary radial trunk f(m), unit flux."""
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
+    mm = np.linspace(0, 6, 601)
+    norm = np.trapezoid(trunk(mm) * mm, mm) * 2 * np.pi * VAR
+    rate = np.full((H, W), BG_RATE)
+    for (r, c), flux in zip(positions, fluxes):
+        m = np.sqrt(((yy - r) ** 2 + (xx - c) ** 2) / VAR)
+        rate += flux * trunk(m) / norm
+    return rng.poisson(rate).astype(np.float64)
+
+
+def _solve_profile(image, positions, profile):
+    n = len(positions)
+    return integrate_reflections_matrix_free(
+        image[None],
+        np.zeros(n, dtype=int),
+        np.array([p[0] for p in positions], dtype=float),
+        np.array([p[1] for p in positions], dtype=float),
+        np.full(n, VAR),
+        np.full(n, VAR),
+        np.zeros(n),
+        alpha=1.0,
+        gamma=1.0,
+        ref_sigma=1.0,
+        max_sigma=3.0,
+        profile=profile,
+        profile_min_peaks=5,
+    )
+
+
+def test_measured_trunk_removes_template_mismatch_bias():
+    """Truth peaks are Gaussian-cored with TRUNCATED tails -- the shape
+    the t4 stack measured (no detectable flux beyond m ~ 2.5 where the
+    Gaussian still claims 2%).  Gaussian atoms mis-apportion that
+    phantom tail mass under the Poisson loss; the measured trunk must
+    not.  (A flat-topped trunk would also defeat the log-parabolic
+    position snap, whose curvature floor turns a curvature-free core
+    into noise-driven +-1.5 px shifts -- a separate, known limitation
+    inherited from the patch integrator; this test isolates the
+    template shape.)  The census needs many peaks, so the scene
+    carries a grid of isolated bright ones."""
+
+    def truncated_gauss(m):
+        # 30% wider than the model tensor claims, tails cut at m = 2.8:
+        # the two deviations the t4 stack measured (there: 15% and 2.5).
+        m = np.asarray(m, dtype=float)
+        return np.exp(-0.5 * (m / 1.3) ** 2) * (m < 2.8)
+
+    # sub-pixel dither as on a real detector: in-phase integer positions
+    # alias the census against the pixel lattice
+    positions = [
+        (r + 0.31 * ((r + c) % 3), c + 0.47 * ((r - c) % 3 - 1))
+        for r in (10.0, 30.0, 50.0)
+        for c in (10.0, 30.0, 50.0)
+    ]
+    truth = np.full(len(positions), 4000.0)
+    pulls_g, pulls_a = [], []
+    for seed in range(6):
+        rng = np.random.default_rng(700 + seed)
+        image = _render_profile(positions, truth, rng, truncated_gauss)
+        out_g = _solve_profile(image, positions, "gaussian")
+        out_a = _solve_profile(image, positions, "auto")
+        pulls_g.append((out_g[:, 0] - truth) / out_g[:, 4])
+        pulls_a.append((out_a[:, 0] - truth) / out_a[:, 4])
+    bias_g = np.mean(pulls_g)
+    bias_a = np.mean(pulls_a)
+    # Gaussian atoms on a truncated truth are measurably biased...
+    assert abs(bias_g) > 1.0, bias_g
+    # ...and the measured trunk removes most of it.
+    assert abs(bias_a) < abs(bias_g) / 2.0, (bias_g, bias_a)
+
+
+def test_auto_profile_falls_back_to_gaussian_when_starved():
+    """One faint peak cannot seed a trunk; auto must silently equal the
+    Gaussian solve rather than fit a profile to nothing."""
+    positions = [(30.0, 30.0)]
+    rng = np.random.default_rng(42)
+    image = _render(positions, [200.0], rng)
+    out_g = _solve_profile(image, positions, "gaussian")
+    out_a = _solve_profile(image, positions, "auto")
+    np.testing.assert_allclose(out_a[:, 0], out_g[:, 0], rtol=1e-6)
+
+
 def test_empty_input_returns_empty():
     out = integrate_reflections_matrix_free(
         np.zeros((1, H, W)),

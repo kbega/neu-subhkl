@@ -761,6 +761,18 @@ def rbf_integrator(
             "mutual covariance penalty.",
         ),
     ] = False,
+    matrix_free_profile: Annotated[
+        str,
+        typer.Option(
+            help="Radial atom profile for --matrix-free: 'gaussian' "
+            "(analytic), 'auto' (measure the family's trunk from "
+            "isolated bright peaks in Mahalanobis coordinates of the "
+            "projected shape model -- the finder's low-rank census with "
+            "known centroids and covariances -- falling back to the "
+            "Gaussian if too few qualify), or a path to a finder-style "
+            "profile JSON."
+        ),
+    ] = "gaussian",
     static_mask_file: Annotated[
         str | None,
         typer.Option(
@@ -802,6 +814,7 @@ def rbf_integrator(
         shape_fit_normalized=shape_fit_normalized,
         robust_patch_fit=robust_patch_fit,
         matrix_free=matrix_free,
+        matrix_free_profile=matrix_free_profile,
         static_mask_file=static_mask_file,
         rel_border_width=rel_border_width,
         show_progress=show_progress,

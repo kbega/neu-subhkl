@@ -3499,8 +3499,130 @@ def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
     return vmap(snap_one)(frames, rs, cs)
 
 
+def _measure_whitened_profile(
+    images,
+    rate_maps,
+    valid,
+    frames,
+    rs,
+    cs,
+    var_us,
+    var_vs,
+    cov_uvs,
+    min_peaks=50,
+    u_max=4.0,
+    du=0.1,
+):
+    """The reflection family's radial profile, measured in model sigmas.
+
+    The finder's ``_measure_radial_profile`` census, upgraded with what
+    the integrator knows and the finder had to estimate: centroids come
+    from the predicted (snapped) positions instead of window moments,
+    the u axis is the MAHALANOBIS radius of each peak's projected
+    covariance instead of an isotropic moment width -- so anisotropy is
+    divided out exactly, and the rank-1-after-scale result the finder
+    measured on cg4d-garnet (mean profile = 95.5% of family energy)
+    holds a fortiori: on cg4d-t4-lysozyme the whitened mean peak is
+    round to the eye at 3 sigma -- and the background under each window
+    is the footprint-masked rate map instead of a local ring, so the
+    profile's own tails cannot subtract themselves.
+
+    Same guards as the finder: a window flux floor at 8 sigma of the
+    background noise, one vote per peak, windows overlapping another
+    footprint or a masked pixel are skipped, flux-weighted averaging,
+    and ``None`` (caller stays on the Gaussian) when fewer than
+    ``min_peaks`` qualify.  No functional form is fitted anywhere.
+
+    Returns:
+        (u, f) with f[0] = 1, or None.
+    """
+    edges = np.arange(0.0, u_max + du, du)
+    centres = 0.5 * (edges[1:] + edges[:-1])
+    acc = np.zeros(centres.size)
+    wgt = np.zeros(centres.size)
+    n_used = 0
+
+    sig_maj = np.sqrt(
+        0.5 * (var_us + var_vs)
+        + np.sqrt(np.maximum(0.25 * (var_us - var_vs) ** 2 + cov_uvs**2, 0.0))
+    )
+    B, H, W = images.shape
+    by_frame = [np.where(frames == f)[0] for f in range(B)]
+
+    for f in range(B):
+        idx = by_frame[f]
+        if len(idx) == 0:
+            continue
+        img = np.asarray(images[f], dtype=np.float64)
+        bg = np.asarray(rate_maps[f], dtype=np.float64)
+        v = np.asarray(valid[f], dtype=np.float64)
+        for i in idx:
+            half = int(np.ceil(u_max * sig_maj[i])) + 1
+            r0, c0 = int(round(rs[i])), int(round(cs[i]))
+            if not (half <= r0 < H - half and half <= c0 < W - half):
+                continue
+            # one vote per peak: skip windows contaminated by a
+            # neighbouring footprint (3 sigma_major each)
+            others = idx[idx != i]
+            if len(others):
+                d = np.hypot(rs[others] - rs[i], cs[others] - cs[i])
+                if np.any(d < 3.0 * (sig_maj[others] + sig_maj[i])):
+                    continue
+            win_v = v[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
+            if win_v.min() < 1.0:
+                continue
+            win = (
+                img[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
+                - bg[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
+            )
+            dv, dr = np.mgrid[-half : half + 1, -half : half + 1].astype(float)
+            dv += r0 - rs[i]
+            dr += c0 - cs[i]
+            det = max(var_us[i] * var_vs[i] - cov_uvs[i] ** 2, 1e-6)
+            m = np.sqrt(
+                (var_vs[i] * dr**2 - 2.0 * cov_uvs[i] * dr * dv + var_us[i] * dv**2)
+                / det
+            )
+            disk = m < u_max
+            flux = float(win[disk].sum())
+            bg_hi = float(np.median(bg[r0, c0 - half : c0 + half + 1]))
+            area = int(disk.sum())
+            if flux < max(50.0, 8.0 * np.sqrt(max(bg_hi, 0.05) * area)):
+                continue
+            u = m[disk].ravel()
+            val = win[disk].ravel() / flux
+            # Linear bin sharing: each pixel splits its vote between the
+            # two nearest bin centres.  A hard assignment aliases against
+            # the pixel lattice -- peaks near-integer positions sample m
+            # at discrete radii, and when several peaks are in phase the
+            # binned profile turns into a comb (measured on a synthetic
+            # integer grid: non-monotone by 40%).  Sharing is the same
+            # census with a triangular kernel one bin wide, not a fit.
+            t = np.clip(u / du - 0.5, 0.0, centres.size - 1.0)
+            lo = np.floor(t).astype(int)
+            hi = np.minimum(lo + 1, centres.size - 1)
+            w_hi = t - lo
+            np.add.at(acc, lo, flux * val * (1.0 - w_hi))
+            np.add.at(acc, hi, flux * val * w_hi)
+            np.add.at(wgt, lo, flux * (1.0 - w_hi))
+            np.add.at(wgt, hi, flux * w_hi)
+            n_used += 1
+
+    if n_used < min_peaks:
+        return None
+    ok = wgt > 0
+    f_prof = np.zeros(centres.size)
+    f_prof[ok] = acc[ok] / wgt[ok]
+    if f_prof[0] <= 0:
+        return None
+    f_prof = np.maximum(f_prof / f_prof[0], 0.0)
+    return centres, f_prof
+
+
 @jit
-def _solve_image_amplitudes(image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok):
+def _solve_image_amplitudes(
+    image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, profile=None
+):
     """One image, all its reflections: nonnegative Poisson amplitude solve.
 
     This is measurement, not detection: the dictionary IS the support
@@ -3529,6 +3651,9 @@ def _solve_image_amplitudes(image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom
         valid: [-] (H, W), 1 = usable pixel
         rs, cs, var_u, var_v, cov_uv: atom geometry, padded to a fixed K
         atom_ok: 1.0 for real atoms, 0.0 for padding (zeroes the column)
+        profile: optional (u, f, norm) measured radial trunk in model
+            sigmas with norm = integral of f(m) m dm, from
+            _measure_whitened_profile; None keeps the analytic Gaussian
     Returns:
         (flux [photons], sigma [photons]) per atom
     """
@@ -3543,10 +3668,21 @@ def _solve_image_amplitudes(image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom
         cc = vu / det
         du = xx - c
         dv = yy - r
-        g = jnp.exp(-0.5 * (a * du**2 + 2.0 * b * du * dv + cc * dv**2))
-        # Unit total volume: the coefficient is TOTAL PHOTON FLUX, and
-        # g carries [1/Pixel] so c * g matches bg in [photons/Pixel].
-        return (g / (2.0 * jnp.pi * jnp.sqrt(det))).flatten() * ok * v_flat
+        m2 = a * du**2 + 2.0 * b * du * dv + cc * dv**2
+        if profile is None:
+            g = jnp.exp(-0.5 * m2)
+            # Unit total volume: integral of exp(-m^2/2) over the plane in
+            # Mahalanobis measure is 2*pi, times the Jacobian sqrt(det).
+            norm = 2.0 * jnp.pi * jnp.sqrt(det)
+        else:
+            prof_u, prof_f, prof_int = profile
+            g = jnp.interp(jnp.sqrt(m2), prof_u, prof_f, left=prof_f[0], right=0.0)
+            # Same change of variables with the measured trunk:
+            # integral f(m(x)) dA = sqrt(det) * 2*pi * integral f(m) m dm.
+            norm = 2.0 * jnp.pi * jnp.sqrt(det) * prof_int
+        # The coefficient is TOTAL PHOTON FLUX, and g/norm carries
+        # [1/Pixel] so c * g matches bg in [photons/Pixel].
+        return (g / norm).flatten() * ok * v_flat
 
     A = vmap(atom)(rs, cs, var_u, var_v, cov_uv, atom_ok).T  # (H*W, K)
     y = image.flatten() * v_flat
@@ -3593,6 +3729,8 @@ def integrate_reflections_matrix_free(
     ref_sigma,
     max_sigma,
     static_valid=None,
+    profile="gaussian",
+    profile_min_peaks=50,
     rate_chunk_size=64,
     show_progress=False,
 ):
@@ -3617,6 +3755,11 @@ def integrate_reflections_matrix_free(
             (1 = usable), e.g. from ``static-mask`` via
             ``load_mask_for_banks``; excluded from the rate map AND the
             likelihood
+        profile: "gaussian" (analytic atoms), "auto" (measure the
+            family's radial trunk from the data with
+            _measure_whitened_profile, falling back to the Gaussian if
+            too few peaks qualify), or a path to the finder's profile
+            JSON ({"u": [...], "f": [...]})
     """
     # Local import: sparse_rbf imports this function lazily at its call
     # site, so a top-level import there would be circular.
@@ -3679,6 +3822,54 @@ def integrate_reflections_matrix_free(
     snap_r = np.array(snap_r)
     snap_c = np.array(snap_c)
 
+    trunk = None
+    if profile == "auto":
+        measured = _measure_whitened_profile(
+            np.asarray(images_batch, dtype=np.float32),
+            np.asarray(rate_maps),
+            static_valid,
+            frames,
+            snap_r,
+            snap_c,
+            var_us,
+            var_vs,
+            cov_uvs,
+            min_peaks=profile_min_peaks,
+        )
+        if measured is not None:
+            trunk = measured
+            if show_progress:
+                u_, f_ = measured
+                half_m = float(np.interp(0.5, f_[::-1], u_[::-1]))
+                print(
+                    f"  > measured radial trunk: half-max at m = {half_m:.2f} "
+                    f"(Gaussian: 1.18); f(2.5) = {np.interp(2.5, u_, f_):.3f} "
+                    f"(Gaussian: {np.exp(-(2.5**2) / 2):.3f})"
+                )
+        elif show_progress:
+            print("  > too few isolated bright peaks for a trunk; Gaussian atoms")
+    elif profile not in (None, "gaussian"):
+        import json
+
+        with open(profile, encoding="utf-8") as fh:
+            prof = json.load(fh)
+        trunk = (np.asarray(prof["u"], float), np.asarray(prof["f"], float))
+
+    if trunk is not None:
+        u_, f_ = trunk
+        # integral of f(m) m dm over the measured support -- the exact
+        # flux normalization for atoms built from the trunk (trapezoid on
+        # the measurement grid; the trunk is zero beyond it by
+        # construction).
+        prof_int = float(np.trapezoid(f_ * u_, u_))
+        trunk_jax = (
+            jnp.array(u_, dtype=jnp.float32),
+            jnp.array(f_, dtype=jnp.float32),
+            jnp.float32(prof_int),
+        )
+    else:
+        trunk_jax = None
+
     # Group peaks by image and pad every group to a common atom count so
     # the solve compiles once.
     by_frame = [np.where(frames == f)[0] for f in range(B)]
@@ -3715,6 +3906,7 @@ def integrate_reflections_matrix_free(
             padded(var_vs, fill=1.0),
             padded(cov_uvs),
             atom_ok,
+            profile=trunk_jax,
         )
         flux = np.array(flux[:k], dtype=np.float64)
         sigma = np.array(sigma[:k], dtype=np.float64)
