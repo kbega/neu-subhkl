@@ -381,6 +381,25 @@ def indexer(
             "vector, or a single float.",
         ),
     ] = "1.0",
+    refine_goniometer_per_run: Annotated[
+        Optional[str],
+        typer.Option(
+            "--refine-goniometer-per-run",
+            help="Motor name (e.g. 'phi') to refine one bounded angle "
+            "correction per scan run: per-setting positioning errors "
+            "(encoder repeatability, mount settling) cannot be "
+            "represented by any static geometry parameter.  Needs a "
+            "merged --nexus file with file_offsets for the frame -> run "
+            "bookkeeping.",
+        ),
+    ] = None,
+    goniometer_per_run_bound_deg: Annotated[
+        float,
+        typer.Option(
+            "--goniometer-per-run-bound-deg",
+            help="Bound (deg) for each per-run angle correction.",
+        ),
+    ] = 0.5,
     refine_goniometer_trans: Annotated[
         bool, typer.Option("--refine-goniometer-trans")
     ] = False,
@@ -569,6 +588,8 @@ def indexer(
         refine_goniometer_axes=gonio_axes_parsed,
         goniometer_bound_deg=gonio_bounds_parsed,
         refine_goniometer_axis_vector=gonio_axis_vec_parsed,
+        refine_goniometer_per_run=refine_goniometer_per_run,
+        goniometer_per_run_bound_deg=goniometer_per_run_bound_deg,
         goniometer_axis_vector_bound_deg=gonio_axis_vec_bounds_parsed,
         refine_goniometer_trans=refine_goniometer_trans,
         goniometer_trans_bound_meters=gonio_trans_bounds_parsed,

@@ -87,6 +87,8 @@ def run_index(
     goniometer_bound_deg: float | list[float] | np.ndarray = 5.0,
     refine_goniometer_axis_vector: list[str] | None = None,
     goniometer_axis_vector_bound_deg: float | list[float] | np.ndarray = 1.0,
+    refine_goniometer_per_run: str | None = None,
+    goniometer_per_run_bound_deg: float = 0.5,
     refine_goniometer_trans: bool = False,
     goniometer_trans_bound_meters: float | list[float] | np.ndarray = 0.005,
     refine_beam: bool = False,
@@ -436,6 +438,8 @@ def run_index(
 
     goniometer_names = None
 
+    per_run_file_offsets = None
+    per_run_files = None
     if original_nexus_filename and instrument_name:
         is_merged = False
         with h5py.File(original_nexus_filename, "r") as f_check:
@@ -443,6 +447,17 @@ def run_index(
                 is_merged = True
                 axes = f_check["goniometer/axes"][()]
                 angles = f_check["goniometer/angles"][()]
+                per_run_file_offsets = (
+                    f_check["file_offsets"][()] if "file_offsets" in f_check else None
+                )
+                per_run_files = (
+                    [
+                        x.decode() if isinstance(x, bytes) else str(x)
+                        for x in f_check["files"][()]
+                    ]
+                    if "files" in f_check
+                    else None
+                )
                 names = (
                     [n.decode("utf-8") for n in f_check["goniometer/names"][()]]
                     if "goniometer/names" in f_check
@@ -557,6 +572,18 @@ def run_index(
                 if boot_axes.shape == np.asarray(opt.goniometer_axes).shape:
                     opt.goniometer_axes = boot_axes
                     input_data["goniometer/axes"] = boot_axes
+            # A previous pass's per-run-corrected angles likewise become
+            # this pass's nominal angles (goniometer/angles in the
+            # bootstrap is written per image, already corrected).
+            if "goniometer/per_run" in b_f and "goniometer/angles" in b_f:
+                boot_ang = np.asarray(b_f["goniometer/angles"][()], dtype=float)
+                cur = np.asarray(opt.goniometer_angles)
+                if boot_ang.shape == cur.shape:
+                    opt.goniometer_angles = boot_ang
+                    input_data["goniometer/angles"] = boot_ang
+                elif boot_ang.T.shape == cur.shape:
+                    opt.goniometer_angles = boot_ang.T
+                    input_data["goniometer/angles"] = boot_ang
 
     # Apply the console messages appropriately
     if refine_goniometer:
@@ -584,6 +611,21 @@ def run_index(
             freeze_orientation=freeze_orientation,
         )
 
+    per_run_frame_map = None
+    if refine_goniometer_per_run:
+        if per_run_file_offsets is None:
+            raise ValueError(
+                "--refine-goniometer-per-run needs a merged --nexus file "
+                "with file_offsets (the frame -> run bookkeeping)."
+            )
+        n_frames = int(np.asarray(opt.goniometer_angles).shape[-1])
+        per_run_frame_map = (
+            np.searchsorted(
+                np.asarray(per_run_file_offsets), np.arange(n_frames), side="right"
+            )
+            - 1
+        )
+
     num, hkl, lamda, U = opt.minimize(
         strategy_name=strategy_name,
         population_size=population_size,
@@ -599,6 +641,9 @@ def run_index(
         refine_goniometer_axes=refine_goniometer_axes,
         refine_goniometer_axis_vector=refine_goniometer_axis_vector,
         goniometer_axis_vector_bound_deg=goniometer_axis_vector_bound_deg,
+        refine_goniometer_per_run=refine_goniometer_per_run,
+        goniometer_per_run_bound_deg=goniometer_per_run_bound_deg,
+        per_run_frame_map=per_run_frame_map,
         goniometer_names=goniometer_names,
         refine_sample=refine_goniometer_trans,
         goniometer_trans_bound_meters=goniometer_trans_bound_meters,
@@ -688,6 +733,46 @@ def run_index(
             elif tilts is not None:
                 f[grp_name] = tilts
 
+        if (
+            refine_goniometer_per_run
+            and getattr(opt, "goniometer_per_run_delta", None) is not None
+        ):
+            # Downstream stages read per-image goniometer/angles from this
+            # file, so the corrected angles go there; nominal angles, the
+            # per-run deltas, the image -> run map and the source run
+            # files are kept alongside for provenance.
+            delta = np.asarray(opt.goniometer_per_run_delta, dtype=float)
+            ang = np.asarray(f["goniometer/angles"][()], dtype=float)
+            names_axes = [
+                n.decode() if isinstance(n, bytes) else str(n)
+                for n in f["goniometer/names"][()]
+            ]
+            axis_cols = [
+                i
+                for i, n in enumerate(names_axes)
+                if refine_goniometer_per_run.lower() in n.lower()
+            ]
+            frame_first = ang.shape[0] == len(per_run_frame_map)
+            corr = delta[np.asarray(per_run_frame_map)]
+            safe_write(f, "goniometer/angles_nominal", ang)
+            for col in axis_cols:
+                if frame_first:
+                    ang[:, col] += corr
+                else:
+                    ang[col, :] += corr
+            safe_write(f, "goniometer/angles", ang)
+            grp_name = "goniometer/per_run"
+            if grp_name in f:
+                del f[grp_name]
+            grp = f.create_group(grp_name)
+            grp["motor"] = refine_goniometer_per_run
+            grp["delta_deg"] = delta
+            grp["frame_to_run"] = np.asarray(per_run_frame_map, dtype=np.int32)
+            if per_run_files is not None:
+                grp["run_files"] = np.array(per_run_files, dtype="S")
+            if per_run_file_offsets is not None:
+                grp["run_file_offsets"] = np.asarray(per_run_file_offsets)
+
         if opt.goniometer_offsets is not None:
             grp_name = "goniometer/offsets"
             if grp_name in f:
@@ -740,6 +825,8 @@ def run_index(
             "refine_lattice": refine_lattice,
             "refine_goniometer": refine_goniometer,
             "refine_goniometer_axis_vector": refine_goniometer_axis_vector,
+            "refine_goniometer_per_run": refine_goniometer_per_run,
+            "goniometer_per_run_bound_deg": goniometer_per_run_bound_deg,
             "refine_goniometer_trans": refine_goniometer_trans,
             "refine_beam": refine_beam,
             "refine_detector": refine_detector,

@@ -210,6 +210,9 @@ class VectorizedObjective:
         goniometer_nominal_offsets=None,
         goniometer_axis_vector_mask=None,
         goniometer_axis_vector_bound_deg=1.0,
+        per_run_motor_index=None,
+        per_run_frame_map=None,
+        per_run_bound_deg=0.5,
         refine_sample=False,
         goniometer_trans_bound_meters=0.005,
         sample_nominal=None,
@@ -404,6 +407,30 @@ class VectorizedObjective:
             self.axis_dirs_nominal = jnp.array(dirs)
             self.axis_e1 = jnp.array(e1)
             self.axis_e2 = jnp.array(e2)
+
+            # Per-run angle corrections: one bounded delta per scan run for
+            # a single motor, applied to every frame of that run.  Static
+            # per-setting positioning errors (encoder repeatability, mount
+            # settling; measured 0.13 deg rms across the six t4 phi
+            # settings, random signs) cannot be represented by any static
+            # geometry parameter -- offsets, axis vectors and detector
+            # modes all slid along a flat valley trying to average them.
+            self.per_run_motor_idx = (
+                int(per_run_motor_index) if per_run_motor_index is not None else None
+            )
+            if self.per_run_motor_idx is not None:
+                if per_run_frame_map is None:
+                    raise ValueError(
+                        "Per-run refinement needs per_run_frame_map "
+                        "(frame index -> run ordinal)."
+                    )
+                frame_map_np = np.asarray(per_run_frame_map, dtype=int)
+                self.per_run_frame_map = jnp.array(frame_map_np, dtype=jnp.int32)
+                self.num_per_run_params = int(frame_map_np.max()) + 1
+                self.per_run_bound_deg = float(per_run_bound_deg)
+            else:
+                self.per_run_frame_map = None
+                self.num_per_run_params = 0
         else:
             self.gonio_axes = None
             self.num_gonio_axes = 0
@@ -412,6 +439,9 @@ class VectorizedObjective:
             self.num_motors = 0
             self.axis_vec_mask = np.zeros(0, dtype=bool)
             self.num_active_axis_vec = 0
+            self.per_run_motor_idx = None
+            self.per_run_frame_map = None
+            self.num_per_run_params = 0
 
         self.refine_gonio_trans = refine_sample
         num_trans = max(1, self.num_gonio_axes)
@@ -714,6 +744,7 @@ class VectorizedObjective:
         R_cum = None
         axis_dirs = None
         axis_tilts = None
+        per_run_delta = None
         sample_origin_lab = jnp.zeros((x.shape[0], 1, 3))
 
         if self.gonio_axes is not None:
@@ -763,6 +794,14 @@ class VectorizedObjective:
                 )
                 axis_dirs = d / jnp.linalg.norm(d, axis=-1, keepdims=True)
 
+            per_run_delta = None
+            per_frame_corr = None
+            if self.num_per_run_params > 0:
+                pr_norm = x[:, idx : idx + self.num_per_run_params]
+                idx += self.num_per_run_params
+                per_run_delta = _forward_map_param(pr_norm, self.per_run_bound_deg)
+                per_frame_corr = per_run_delta[:, self.per_run_frame_map]  # (S, M)
+
             R_list = []
             deg2rad = jnp.pi / 180.0
 
@@ -779,6 +818,11 @@ class VectorizedObjective:
                     self.gonio_angles[i, :][None, :]
                     + offsets_total[:, motor_idx][:, None]
                 )
+                if (
+                    per_frame_corr is not None
+                    and self._motor_map_list[i] == self.per_run_motor_idx
+                ):
+                    current_axis_angle = current_axis_angle + per_frame_corr
 
                 theta = direction_mult * current_axis_angle * deg2rad
                 if axis_dirs is not None and self.axis_vec_refined_per_axis[i]:
@@ -935,6 +979,7 @@ class VectorizedObjective:
             area_scale,
             axis_dirs,
             axis_tilts,
+            per_run_delta,
         )
 
     def _positional_metric_vectors(self, ub_mat, kf_ki_sample, ki_sample, k_sq):
@@ -1233,6 +1278,7 @@ class VectorizedObjective:
             area_scale,
             _,
             _,
+            _,
         ) = self._get_physical_params_jax(x_pad)
 
         R_curr = R_cum if R_cum is not None else self.static_R
@@ -1344,6 +1390,8 @@ class FindUB:
         self.goniometer_offsets = None
         self.goniometer_axes_refined = None
         self.goniometer_axis_tilts = None
+        self.goniometer_per_run_delta = None
+        self.goniometer_per_run_motor = None
         self.goniometer_names = None
         self.sample_offset = None
         self.peak_xyz = None
@@ -1644,6 +1692,9 @@ class FindUB:
         refine_goniometer_axes: list | None = None,
         refine_goniometer_axis_vector: list | None = None,
         goniometer_axis_vector_bound_deg: float | list | np.ndarray = 1.0,
+        refine_goniometer_per_run: str | None = None,
+        goniometer_per_run_bound_deg: float = 0.5,
+        per_run_frame_map: np.ndarray | None = None,
         refine_sample: bool = False,
         goniometer_trans_bound_meters: float | list | np.ndarray = 0.005,
         refine_beam: bool = False,
@@ -1811,6 +1862,25 @@ class FindUB:
         else:
             bounds_array_axis_vec = np.full(len(unique_motors), 1.0)
 
+        # Per-run corrections: resolve the single target motor by the same
+        # case-insensitive name rule.
+        per_run_motor_index = None
+        if refine_goniometer_per_run:
+            for i, name in enumerate(unique_motors):
+                if refine_goniometer_per_run.lower() in name.lower():
+                    per_run_motor_index = i
+                    break
+            if per_run_motor_index is None:
+                raise ValueError(
+                    f"Motor {refine_goniometer_per_run!r} not found in "
+                    f"{unique_motors} for per-run refinement."
+                )
+            if per_run_frame_map is None:
+                raise ValueError(
+                    "Per-run refinement needs per_run_frame_map "
+                    "(frame index -> run ordinal)."
+                )
+
         # Map translation bounds to active axes
         if isinstance(goniometer_trans_bound_meters, (int, float)):
             gonio_trans_bounds_list = [float(goniometer_trans_bound_meters)]
@@ -1865,6 +1935,9 @@ class FindUB:
             goniometer_bound_deg=bounds_array,
             goniometer_axis_vector_mask=axis_vector_mask,
             goniometer_axis_vector_bound_deg=bounds_array_axis_vec,
+            per_run_motor_index=per_run_motor_index,
+            per_run_frame_map=per_run_frame_map,
+            per_run_bound_deg=goniometer_per_run_bound_deg,
             goniometer_trans_bound_meters=bounds_array_trans,
             sample_nominal=self.base_sample_offset,
             refine_beam=refine_beam,
@@ -1913,6 +1986,8 @@ class FindUB:
             )
         if axis_vector_mask is not None:
             num_dims += 2 * int(np.sum(axis_vector_mask))
+        if per_run_motor_index is not None:
+            num_dims += objective.num_per_run_params
         if refine_detector:
             num_dims += objective.num_det_params
 
@@ -1938,6 +2013,7 @@ class FindUB:
                 area_scale,
                 axes_refined_batch,
                 axis_tilts_batch,
+                per_run_delta_batch,
             ) = objective._get_physical_params_jax(x_batch)
             self.sample_offset = np.array(t_axes_batch[0])
             self.ki_vec = np.array(ki_vec_batch[0]).flatten()
@@ -2208,6 +2284,7 @@ class FindUB:
             area_scale,
             axes_refined_batch,
             axis_tilts_batch,
+            per_run_delta_batch,
         ) = objective._get_physical_params_jax(x_batch)
 
         self.sample_offset = np.array(t_axes_batch[0])
@@ -2249,6 +2326,15 @@ class FindUB:
             ):
                 if abs(ta) > 1e-6 or abs(tb) > 1e-6:
                     print(f"Refined axis tilt {name}: ({ta:+.4f}, {tb:+.4f}) deg")
+
+        if per_run_motor_index is not None and per_run_delta_batch is not None:
+            self.goniometer_per_run_delta = np.array(per_run_delta_batch[0])
+            self.goniometer_per_run_motor = refine_goniometer_per_run
+            print(
+                f"Per-run corrections for {refine_goniometer_per_run}: "
+                + " ".join(f"{d:+.4f}" for d in self.goniometer_per_run_delta)
+                + " deg"
+            )
 
         if freeze_orientation:
             rot_params = self.fixed_rot_params
