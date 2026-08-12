@@ -87,6 +87,11 @@ include = ["pyproject.toml", "src/**/*.py", "scripts/**/*.py", "tests/**/*.py"]
 [tool.ruff.lint]
 ignore = ["E741"]
 
+[tool.versioningit.format]
+distance = "{base_version}"
+dirty = "{base_version}"
+distance-dirty = "{base_version}"
+
 [dependency-groups]
 dev = [
     "pyright>=1.1.408",

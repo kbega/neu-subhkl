@@ -30,12 +30,12 @@ RUN apt-get update
 RUN apt-get install -y libgl1 libglib2.0-0 libxcb1 
 
 # Copy the virtual environment from build stage
-COPY --from=build /build/dist/subhkl-0.1.0-py3-none-any.whl subhkl-0.1.0-py3-none-any.whl
+COPY --from=build /build/dist/subhkl-1.3.0-py3-none-any.whl subhkl-1.3.0-py3-none-any.whl
 #ENV PATH="/opt/venv/bin:$PATH"
 
 RUN python -m pip install jax[cuda13] evosax
-RUN python -m pip install subhkl-0.1.0-py3-none-any.whl
-RUN rm subhkl-0.1.0-py3-none-any.whl
+RUN python -m pip install subhkl-1.3.0-py3-none-any.whl
+RUN rm subhkl-1.3.0-py3-none-any.whl
 
 # Set working directory
 WORKDIR /app
