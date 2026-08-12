@@ -735,32 +735,17 @@ def rbf_integrator(
             "dominate the global template).",
         ),
     ] = False,
-    robust_patch_fit: Annotated[
-        bool,
-        typer.Option(
-            "--robust-patch-fit/--no-robust-patch-fit",
-            help="Down-weight unmodeled-structure pixels (diffuse ridges, "
-            "bad pixels) with Huber IRLS passes in the per-patch amplitude "
-            "fit.  Diffuse ridges narrower than the background median "
-            "window stay in the residual and bias whole regions of weak "
-            "predictions negative.",
-        ),
-    ] = False,
     matrix_free: Annotated[
         bool,
         typer.Option(
             "--matrix-free/--no-matrix-free",
-            help="Replace the per-patch amplitude fit with one global "
-            "solve per image: fixed dictionary of flux-normalized "
-            "anisotropic Gaussians at the predicted positions, "
-            "background fixed to the finder's Poisson rate map, and "
-            "strictly nonnegative amplitudes solved under the Poisson "
-            "likelihood by the finder's semi-smooth Newton engine.  "
-            "Sigmas come from the Fisher information at the "
-            "constrained optimum, so crowded reflections report their "
-            "mutual covariance penalty.",
+            help="Deprecated no-op: the matrix-free amplitude solve is the "
+            "only integration path (one nonnegative Poisson solve per "
+            "image on the finder's rate-map noise model).  The per-patch "
+            "fit it replaced was retired after losing on every common "
+            "reflection set; --no-matrix-free is an error.",
         ),
-    ] = False,
+    ] = True,
     matrix_free_profile: Annotated[
         str,
         typer.Option(
@@ -811,6 +796,12 @@ def rbf_integrator(
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
     Calculates intensities and rigorous I/SIGI via Fisher Information matrix SVD.
     """
+    if not matrix_free:
+        raise typer.BadParameter(
+            "the per-patch integrator was retired; --no-matrix-free has no "
+            "implementation (see the matrix-free integration notes in "
+            "subhkl.search.matrix_free)"
+        )
     run_rbf_integrator(
         filename=filename,
         instrument=instrument,
@@ -827,8 +818,6 @@ def rbf_integrator(
         mosaicity_bound_mrad=mosaicity_bound_mrad,
         shape_fit_min_snr=shape_fit_min_snr,
         shape_fit_normalized=shape_fit_normalized,
-        robust_patch_fit=robust_patch_fit,
-        matrix_free=matrix_free,
         matrix_free_profile=matrix_free_profile,
         matrix_free_fp_target=matrix_free_fp_target,
         static_mask_file=static_mask_file,

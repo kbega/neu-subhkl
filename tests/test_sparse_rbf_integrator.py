@@ -44,84 +44,55 @@ def generate_erf_peak(y_coords, x_coords, r, c, sig, amp):
 
 
 def test_single_isolated_peak():
-    """
-    Validates that a single isolated Gaussian peak is correctly integrated by the
-    new Patch-Based SSN Integrator, that the best shape is activated, and that
-    the unpenalized Tikhonov debiasing accurately recovers the mass.
-    """
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseLaueIntegrator
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseLaueIntegrator
-
+    """A single isolated Gaussian peak is integrated to its true mass by
+    the matrix-free amplitude solve (the retired per-patch integrator's
+    founding scenario, kept as a contract on its replacement)."""
     import numpy as np
+
+    from subhkl.search.matrix_free import integrate_reflections_matrix_free
 
     H, W = 50, 50
     bg_level = 15.0
-
     np.random.seed(42)
     y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
 
-    # Flat background
     image = np.full((H, W), bg_level, dtype=np.float32)
-
     cx, cy = 25.0, 25.0
     true_sigma = 2.0
     true_amp = 100.0
-
-    # generate_erf_peak should already be in your test file
     image += generate_erf_peak(y_coords, x_coords, cy, cx, true_sigma, true_amp)
-
-    # Apply Poisson noise
     image = np.random.poisson(image).astype(np.float32)
 
-    # Use the new Unified Patch Integrator
-    integrator = SparseLaueIntegrator(
-        alpha=4.0,  # 4-sigma detection threshold
-        min_sigma=1.0,
-        max_sigma=5.0,
-        # gamma=1 is safe here, unlike in the finder: integration is given the
-        # peak positions and does no model selection over them, so the scale
-        # degeneracy of docs/matrix_free_theory.md Theorem 1 does not apply.
+    out = integrate_reflections_matrix_free(
+        image[np.newaxis, ...],
+        np.array([0]),
+        np.array([cy]),
+        np.array([cx]),
+        np.full(1, true_sigma**2),
+        np.full(1, true_sigma**2),
+        np.zeros(1),
+        alpha=1.0,
         gamma=1.0,
-        loss="gaussian",
+        ref_sigma=1.0,
+        max_sigma=5.0,
     )
-
-    images_batch = image[np.newaxis, ...]
-    frames = [0]
-    rs = [cy]
-    cs = [cx]
-
-    results = integrator.integrate_reflections(images_batch, frames, rs, cs)
-
-    assert len(results) == 1, "The integrator dropped the peak!"
-
-    intensity, r_found, c_found, sig_found, sigI_found = results[0]
-
-    # 1. Did it pick the right shape from the linspace dictionary?
-    assert abs(sig_found - true_sigma) < 0.25, (
-        f"Sigma warped! Expected ~{true_sigma}, Found {sig_found}"
-    )
-
-    # 2. Did the debiasing properly recover the physical mass?
+    assert out.shape == (1, 5)
+    intensity, r_found, c_found, sig_eff, sigI = out[0]
     expected_intensity = true_amp * 2 * np.pi * true_sigma**2
     assert np.isclose(intensity, expected_intensity, rtol=0.15), (
-        f"Debiasing failed: {intensity} vs {expected_intensity}"
+        f"flux recovery failed: {intensity} vs {expected_intensity}"
     )
+    assert sigI > 0.0
 
 
 def test_overlapping_peaks_crosstalk():
-    """
-    Validates that the patch-based integrator can independently resolve closely
-    overlapping peaks without the backgrounds swallowing each other, thanks to the
-    local median filter and robust NCC warm start.
-    """
-    try:
-        from subhkl.peakfinder.sparse_rbf import SparseLaueIntegrator
-    except ImportError:
-        from subhkl.search.sparse_rbf import SparseLaueIntegrator
-
+    """Two peaks two sigma apart share pixels; the per-image joint solve
+    must split the flux by shape.  The retired per-patch integrator
+    passed this at 20% tolerance via Voronoi pixel ownership; the joint
+    solve owes a tighter answer."""
     import numpy as np
+
+    from subhkl.search.matrix_free import integrate_reflections_matrix_free
 
     H, W = 50, 50
     bg_level = 10.0
@@ -130,61 +101,61 @@ def test_overlapping_peaks_crosstalk():
     image = np.full((H, W), bg_level, dtype=np.float32)
     y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
 
-    # Peak 1
     cx1, cy1 = 20.0, 25.0
     true_sig1, true_amp1 = 2.0, 80.0
     image += generate_erf_peak(y_coords, x_coords, cy1, cx1, true_sig1, true_amp1)
 
-    # Peak 2 (Highly overlapping, only 2-sigma away!)
     cx2, cy2 = 24.0, 25.0
     true_sig2, true_amp2 = 2.0, 60.0
     image += generate_erf_peak(y_coords, x_coords, cy2, cx2, true_sig2, true_amp2)
 
     image = np.random.poisson(image).astype(np.float32)
 
-    integrator = SparseLaueIntegrator(
-        alpha=4.0, min_sigma=1.0, max_sigma=5.0, gamma=2.0, loss="gaussian"
+    out = integrate_reflections_matrix_free(
+        image[np.newaxis, ...],
+        np.array([0, 0]),
+        np.array([cy1, cy2]),
+        np.array([cx1, cx2]),
+        np.full(2, 4.0),
+        np.full(2, 4.0),
+        np.zeros(2),
+        alpha=1.0,
+        gamma=1.0,
+        ref_sigma=1.0,
+        max_sigma=5.0,
     )
-
-    images_batch = image[np.newaxis, ...]
-    frames = [0, 0]
-    rs = [cy1, cy2]
-    cs = [cx1, cx2]
-
-    results = integrator.integrate_reflections(images_batch, frames, rs, cs)
-
-    assert len(results) == 2, "Integrator crashed on one of the overlapping peaks!"
-
-    i1, r1, c1, sig1, sigI1 = results[0]
-    i2, r2, c2, sig2, sigI2 = results[1]
-
-    # Ensure both survived the sparsity constraints
-    assert sig1 > 0.0, "Peak 1 was crushed"
-    assert sig2 > 0.0, "Peak 2 was crushed"
-
-    # Because we evaluate them as independent local patches now (instead of a giant joint matrix),
-    # there is a slight geometric overlap accepted into the unpenalized volume.
-    # We use a 20% tolerance to ensure crosstalk bleeding stays mathematically bounded.
+    assert out.shape == (2, 5)
     exp_i1 = true_amp1 * 2 * np.pi * true_sig1**2
     exp_i2 = true_amp2 * 2 * np.pi * true_sig2**2
-
-    assert np.isclose(i1, exp_i1, rtol=0.20), (
-        f"Peak 1 Crosstalk Bleed: {i1} vs {exp_i1}"
+    assert np.isclose(out[0, 0], exp_i1, rtol=0.15), (
+        f"peak 1 crosstalk: {out[0, 0]} vs {exp_i1}"
     )
-    assert np.isclose(i2, exp_i2, rtol=0.20), (
-        f"Peak 2 Crosstalk Bleed: {i2} vs {exp_i2}"
+    assert np.isclose(out[1, 0], exp_i2, rtol=0.15), (
+        f"peak 2 crosstalk: {out[1, 0]} vs {exp_i2}"
     )
 
 
 def test_integrate_peaks_rbf_ssn_orchestrator():
-    H, W = 40, 40
+    # Large enough that the rate map's quantile windows keep unmasked
+    # pixels around the peak footprint: on a 40x40 toy frame with a
+    # centred peak the footprint mask starves the windows and the
+    # background under the peak collapses -- a small-image artifact,
+    # not a solver property.
+    H, W = 96, 96
     image = np.full((H, W), 5.0, dtype=np.float32)
-    cx, cy = 20.0, 20.0
+    cx, cy = 48.0, 48.0
     y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
 
     true_sigma = 2.0
     true_amp = 50.0
     image += generate_erf_peak(y_coords, x_coords, cy, cx, true_sigma, true_amp)
+    # Counted data: the rate-map background estimator inverts integer
+    # Poisson quantiles and is explicitly not defined on a noise-free
+    # fractional-valued image (its own docstring says so); the retired
+    # per-patch fit tolerated that only because it re-fit a constant
+    # background per patch.
+    np.random.seed(7)
+    image = np.random.poisson(image).astype(np.float32)
 
     class MockImageHandler:
         def __init__(self, ims):

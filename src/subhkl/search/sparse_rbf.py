@@ -1420,415 +1420,6 @@ def optimize_global_crystal(
     return x_final_phys
 
 
-class SparseLaueIntegrator(SparseRBFPeakFinder):
-    """
-    Physics-Informed Sniper.
-    Takes predicted spot coordinates, extracts patches, and uses Volume-Penalized
-    Sparse RBF to accurately integrate intensity using the Preconditioned SSN Engine.
-
-    Units:
-        alpha: [-] (Z-score threshold)
-        min_sigma / max_sigma / nominal_sigma: [-]
-        mosaicity_eta: [Pixel^0.5] (?)
-        gamma: [-]
-        Returns integrations containing sigI: [photons^0.5 / Pixel^0.5]
-    """
-
-    def __init__(
-        self,
-        alpha=0.05,
-        min_sigma=0.1,  # [Pixels] at theta=45
-        max_sigma=15.0,  # [Pixels] at theta=45
-        gamma=2.0,
-        loss="poisson",
-        border_width=0,
-        num_sigmas=32,
-        nominal_sigma=2.0,
-        anisotropic=False,
-        robust_patch_fit=False,
-        chunk_size=1024,
-        show_steps=False,
-    ):
-        # 1. Initialize parent with safe dummy pixel values to keep it functional
-        # (in case you ever call super().find_peaks_batch)
-        super().__init__(
-            alpha=alpha,
-            gamma=gamma,
-            min_sigma=0.5,
-            max_sigma=5.0,
-            loss=loss,
-            border_width=border_width,
-            num_sigmas=num_sigmas,
-            chunk_size=chunk_size,
-            show_steps=show_steps,
-        )
-
-        self.nominal_sigma = nominal_sigma
-        self.anisotropic = anisotropic
-        self.robust_patch_fit = robust_patch_fit
-
-    def integrate_reflections(
-        self, images_batch, frames, rs, cs, var_us=None, var_vs=None, cov_uvs=None
-    ):
-        """
-        Args:
-            images_batch: [photons/Pixel]
-            frames: [-]
-            rs, cs: [Pixel^0.5]
-            var_us, var_vs, cov_uvs: Pre-computed 2D projection tensors from the global optimizer.
-        Returns:
-            [intensity: [photons/Pixel], r: [Pixel^0.5], c: [Pixel^0.5], sigma: [Pixel^0.5], sigI: [photons^0.5 / Pixel^0.5]]
-        """
-        B, H, W = images_batch.shape
-        N_spots = len(frames)
-
-        # api backward compatibility for unit tests
-        if var_us is None or var_vs is None or cov_uvs is None:
-            # Fall back to a perfect isotropic circle using the nominal_sigma property
-            var_us = jnp.full(N_spots, self.nominal_sigma**2, dtype=jnp.float32)
-            var_vs = jnp.full(N_spots, self.nominal_sigma**2, dtype=jnp.float32)
-            cov_uvs = jnp.zeros(N_spots, dtype=jnp.float32)
-        else:
-            # Ensure they are JAX arrays for the JIT compiler
-            var_us = jnp.array(var_us, dtype=jnp.float32)
-            var_vs = jnp.array(var_vs, dtype=jnp.float32)
-            cov_uvs = jnp.array(cov_uvs, dtype=jnp.float32)
-
-        P = self.refine_patch_size  # [Pixel^0.5]
-        half_p = P // 2  # [Pixel^0.5]
-        PAD = P  # [Pixel^0.5]
-
-        K_NEIGHBORS = min(4, N_spots) if N_spots > 0 else 1
-
-        filter_size = max(15, int(self.max_sigma * 5))  # [Pixel^0.5]
-        if filter_size % 2 == 0:
-            filter_size += 1
-
-        # --- CHUNKED BACKGROUND EVALUATION ---
-        bg_map_list = []
-        bg_chunk_size = min(self.chunk_size, max(1, B // 4))
-
-        # In integrate_reflections, we use self.show_steps to match the parent
-        bg_pbar = tqdm(
-            range(0, B, bg_chunk_size),
-            desc="Integration Bg",
-            disable=not self.show_steps,
-        )
-
-        for i in bg_pbar:
-            chunk = jnp.array(images_batch[i : i + bg_chunk_size], dtype=jnp.float32)
-            bg_chunk = compute_bg_batch(chunk, filter_size)
-            bg_chunk.block_until_ready()
-            bg_map_list.append(
-                bg_chunk
-            )  # Keep as JAX array to avoid host transfer if possible
-
-        bg_maps_jax = jnp.concatenate(bg_map_list, axis=0)  # [photons/Pixel]
-        images_jax = jnp.array(images_batch, dtype=jnp.float32)  # [photons/Pixel]
-
-        img_jax_padded = jnp.pad(
-            images_jax, ((0, 0), (PAD, PAD), (PAD, PAD)), mode="reflect"
-        )  # [photons/Pixel]
-        bg_jax_padded = jnp.pad(
-            bg_maps_jax, ((0, 0), (PAD, PAD), (PAD, PAD)), mode="reflect"
-        )  # [photons/Pixel]
-
-        (float(P), float(P), self.min_sigma, self.max_sigma)  # [Pixel^0.5]
-        yy, xx = jnp.indices((P, P))  # [Pixel^0.5]
-        x_grid = jnp.array([yy, xx])  # [Pixel^0.5]
-
-        @jit
-        def extract_patches(img_src, bg_src, f_idx, r_idx, c_idx):
-            r_start = jnp.clip(
-                jnp.int32(jnp.round(r_idx)) - half_p, 0, img_src.shape[1] - P
-            )  # [Pixel^0.5]
-            c_start = jnp.clip(
-                jnp.int32(jnp.round(c_idx)) - half_p, 0, img_src.shape[2] - P
-            )  # [Pixel^0.5]
-
-            def slice_img(bi, ri, ci):
-                return lax.dynamic_slice(img_src[bi], (ri, ci), (P, P))
-
-            def slice_bg(bi, ri, ci):
-                return lax.dynamic_slice(bg_src[bi], (ri, ci), (P, P))
-
-            return (
-                vmap(slice_img)(f_idx, r_start, c_start),
-                vmap(slice_bg)(f_idx, r_start, c_start),
-                r_start,
-                c_start,
-            )
-
-        @jit
-        def solve_patches(
-            patches,
-            patches_bg,
-            fs_chunk,
-            rs_global_chunk,
-            cs_global_chunk,
-            r_starts,
-            c_starts,
-            all_fs_jnp,
-            all_rs_jnp,
-            all_cs_jnp,
-            var_us_jnp,
-            var_vs_jnp,
-            cov_uvs_jnp,
-        ):
-            alpha_z_score = self.alpha
-
-            def process_patch(
-                patch, patch_bg, f_global, r_global, c_global, r_start, c_start
-            ):
-                # 1. Fetch exact pre-computed global geometry
-                peak_var_u = var_us_jnp[f_global]
-                peak_var_v = var_vs_jnp[f_global]
-                peak_cov_uv = cov_uvs_jnp[f_global]
-
-                bg_med = jnp.maximum(jnp.median(patch_bg), 1e-3)
-                jnp.sqrt(bg_med)
-
-                dists = (all_rs_jnp - r_global) ** 2 + (all_cs_jnp - c_global) ** 2
-                frame_penalty = jnp.where(all_fs_jnp == f_global, 0.0, 1e9)
-                _, nbr_idxs = jax.lax.top_k(-(dists + frame_penalty), K_NEIGHBORS)
-
-                nbr_rs = all_rs_jnp[nbr_idxs]
-                nbr_cs = all_cs_jnp[nbr_idxs]
-                local_rs = nbr_rs - r_start
-                local_cs = nbr_cs - c_start
-
-                # SUBPIXEL RELAXATION (Log-Parabolic Target Snapping)
-                # We use a static 1.0px blur just to smooth the noise for the center-of-mass finding
-                y_sub_raw = patch - patch_bg
-                nominal_sig_sq2 = 1.0 * jnp.sqrt(2.0) + 1e-6
-                k_grid = jnp.arange(-2, 3)
-                k_1d = jax.scipy.special.erf(
-                    (k_grid + 0.5) / nominal_sig_sq2
-                ) - jax.scipy.special.erf((k_grid - 0.5) / nominal_sig_sq2)
-
-                temp = jax.scipy.signal.correlate2d(
-                    y_sub_raw, k_1d[:, None], mode="same"
-                )
-                dual_var_smooth = jax.scipy.signal.correlate2d(
-                    temp, k_1d[None, :], mode="same"
-                )
-
-                r_int = jnp.clip(jnp.int32(jnp.round(local_rs[0])), 1, P - 2)
-                c_int = jnp.clip(jnp.int32(jnp.round(local_cs[0])), 1, P - 2)
-
-                safe_dv = jnp.maximum(dual_var_smooth, 1e-6)
-                val = jnp.log(safe_dv[r_int, c_int])
-                val_up = jnp.log(safe_dv[r_int - 1, c_int])
-                val_dn = jnp.log(safe_dv[r_int + 1, c_int])
-                val_lf = jnp.log(safe_dv[r_int, c_int - 1])
-                val_rt = jnp.log(safe_dv[r_int, c_int + 1])
-
-                den_r = jnp.minimum(val_up - 2.0 * val + val_dn, -1e-6)
-                dr = 0.5 * (val_up - val_dn) / den_r
-
-                den_c = jnp.minimum(val_lf - 2.0 * val + val_rt, -1e-6)
-                dc = 0.5 * (val_lf - val_rt) / den_c
-
-                dr = jnp.clip(dr, -1.5, 1.5)
-                dc = jnp.clip(dc, -1.5, 1.5)
-
-                local_rs = local_rs.at[0].add(dr)
-                local_cs = local_cs.at[0].add(dc)
-
-                # =====================================================================
-                # ANALYTIC GAUSSIAN EVALUATION
-                # =====================================================================
-                def eval_neighbor(nr, nc):
-                    det_sigma = jnp.maximum(
-                        peak_var_u * peak_var_v - peak_cov_uv**2, 1e-6
-                    )
-
-                    a = peak_var_v / det_sigma
-                    b = -peak_cov_uv / det_sigma
-                    c = peak_var_u / det_sigma
-
-                    dr_grid = x_grid[0] - nr
-                    dc_grid = x_grid[1] - nc
-
-                    gaussian = jnp.exp(
-                        -0.5
-                        * (
-                            a * dc_grid**2
-                            + 2.0 * b * dr_grid * dc_grid
-                            + c * dr_grid**2
-                        )
-                    )
-
-                    # 1. The analytic volume of this specific 2D footprint
-                    area_scalar = 2.0 * jnp.pi * jnp.sqrt(det_sigma)
-
-                    # 2. Divide by the volume so the basis sums exactly to 1.0.
-                    # This guarantees the solver parameter 'c' perfectly equals TOTAL PHOTON FLUX.
-                    return (gaussian / area_scalar).flatten()
-
-                A_all = vmap(eval_neighbor)(local_rs, local_cs)
-                y_sub = (patch - patch_bg).flatten()
-
-                pixel_dists_k = (yy.flatten()[:, None] - local_rs[None, :]) ** 2 + (
-                    xx.flatten()[:, None] - local_cs[None, :]
-                ) ** 2
-                closest_k = jnp.argmin(pixel_dists_k, axis=1)
-                pixel_masks = jax.nn.one_hot(closest_k, K_NEIGHBORS)
-
-                A_k = A_all.T
-                A_k_masked = A_k * pixel_masks
-
-                # We use the scalar effective sigma solely for weighting the L1 Z-score threshold
-                effective_sigma = jnp.sqrt(
-                    jnp.sqrt(
-                        jnp.maximum(peak_var_u * peak_var_v - peak_cov_uv**2, 1e-6)
-                    )
-                )
-
-                c_warm_joint = jnp.zeros(K_NEIGHBORS, dtype=jnp.float32)
-                cand_params = jnp.stack(
-                    [
-                        c_warm_joint,
-                        local_rs,
-                        local_cs,
-                        jnp.full(K_NEIGHBORS, effective_sigma),
-                    ],
-                    axis=1,
-                )
-
-                c_ssn = self.solve_ssn_step(
-                    patch.flatten(),
-                    patch_bg.flatten(),
-                    A_k_masked,
-                    cand_params,
-                    alpha_override=alpha_z_score,  # Override to bypass tuning during final integration
-                )
-
-                surviving_mask_strict = c_ssn > 1e-9
-                is_target = jnp.arange(K_NEIGHBORS) == 0
-                surviving_mask = surviving_mask_strict | is_target
-
-                A_best_masked = A_k * surviving_mask[None, :]
-
-                # =====================================================================
-                # STAGE 2: UNCONSTRAINED OLS
-                # =====================================================================
-                A_tilde = jnp.hstack([A_best_masked, jnp.ones((P * P, 1))])
-                w = 1.0 / jnp.maximum(patch.flatten(), 1.0)
-
-                def wls(weights):
-                    I_m = A_tilde.T @ (weights[:, None] * A_tilde)
-                    C_m = jnp.linalg.inv(I_m + 1e-6 * jnp.eye(A_tilde.shape[1]))
-                    return C_m, C_m @ (A_tilde.T @ (weights * y_sub))
-
-                C_mat, c_ols = wls(w)
-                if self.robust_patch_fit:
-                    # Diffuse ridges narrower than the rolling-median window
-                    # are classified as signal, stay in the residual, and
-                    # correlate with the template -- measured on
-                    # cg4d-t4-lysozyme as whole banks of negative median
-                    # intensity.  A plane cannot represent them (they are
-                    # smoothed steps); instead down-weight
-                    # unmodeled-structure pixels with two Huber IRLS
-                    # passes at the Poisson noise scale.
-                    noise = jnp.sqrt(jnp.maximum(patch.flatten(), 1.0))
-                    for _ in range(2):
-                        # Core protection: never down-weight pixels the
-                        # peak model itself claims (bright cores deviate
-                        # from the Gaussian template by many Poisson sigma
-                        # and would be clipped -- measured as a 2.5x drop
-                        # in the healthy runs' median intensity).  Ridge
-                        # and bad pixels have model ~ 0 and stay
-                        # down-weightable.
-                        model_peaks = A_tilde[:, :K_NEIGHBORS] @ c_ols[:K_NEIGHBORS]
-                        core = jnp.abs(model_peaks) > noise
-                        resid = (y_sub - A_tilde @ c_ols) / noise
-                        w_huber = w * jnp.minimum(
-                            1.0, 2.5 / jnp.maximum(jnp.abs(resid), 1e-6)
-                        )
-                        w_rob = jnp.where(core, w, w_huber)
-                        C_mat, c_ols = wls(w_rob)
-
-                # Because the basis is normalized, c_ols is literally the total unpenalized photon count!
-                intensity = c_ols[0]
-
-                # The variance of the flux parameter from the Fisher Information diagonal
-                var_c0 = C_mat[0, 0]
-                sigI = jnp.sqrt(jnp.maximum(var_c0, 0.0))
-
-                return jnp.array(
-                    [intensity, local_rs[0], local_cs[0], effective_sigma, sigI]
-                )
-
-            return vmap(process_patch)(
-                patches,
-                patches_bg,
-                fs_chunk,
-                rs_global_chunk,
-                cs_global_chunk,
-                r_starts,
-                c_starts,
-            )
-
-        refined_peaks = []
-        rs_padded = np.array(rs) + PAD  # [Pixel^0.5]
-        cs_padded = np.array(cs) + PAD  # [Pixel^0.5]
-
-        PAD_N = max(N_spots, 4)
-        fs_full = np.pad(np.array(frames), (0, PAD_N - N_spots), constant_values=-1)
-        rs_full = np.pad(
-            rs_padded, (0, PAD_N - N_spots), constant_values=-10000.0
-        )  # [Pixel^0.5]
-        cs_full = np.pad(
-            cs_padded, (0, PAD_N - N_spots), constant_values=-10000.0
-        )  # [Pixel^0.5]
-
-        all_fs_jnp = jnp.array(fs_full, dtype=jnp.int32)
-        all_rs_jnp = jnp.array(rs_full, dtype=jnp.float32)  # [Pixel^0.5]
-        all_cs_jnp = jnp.array(cs_full, dtype=jnp.float32)  # [Pixel^0.5]
-
-        with tqdm(
-            total=N_spots, desc="Sparse Laue Integration", disable=not self.show_steps
-        ) as pbar:
-            for i in range(0, N_spots, self.chunk_size):
-                chunk_f = jnp.array(frames[i : i + self.chunk_size])
-                chunk_r = jnp.array(rs_padded[i : i + self.chunk_size])  # [Pixel^0.5]
-                chunk_c = jnp.array(cs_padded[i : i + self.chunk_size])  # [Pixel^0.5]
-
-                patches, patches_bg, r_starts, c_starts = extract_patches(
-                    img_jax_padded, bg_jax_padded, chunk_f, chunk_r, chunk_c
-                )
-
-                res = solve_patches(
-                    patches,
-                    patches_bg,
-                    chunk_f,
-                    chunk_r,
-                    chunk_c,
-                    r_starts,
-                    c_starts,
-                    all_fs_jnp,
-                    all_rs_jnp,
-                    all_cs_jnp,
-                    var_us,
-                    var_vs,
-                    cov_uvs,
-                )
-                res.block_until_ready()
-
-                res_cpu = np.array(res)
-                res_cpu[:, 1] = res_cpu[:, 1] + r_starts - PAD  # [Pixel^0.5]
-                res_cpu[:, 2] = res_cpu[:, 2] + c_starts - PAD  # [Pixel^0.5]
-
-                refined_peaks.append(res_cpu)
-                pbar.update(len(chunk_f))
-
-        if len(refined_peaks) == 0:
-            return np.empty((0, 4))
-
-        return np.vstack(refined_peaks)
-
-
 # =====================================================================
 # API WRAPPER FOR BACKWARD COMPATIBILITY
 # =====================================================================
@@ -1882,8 +1473,6 @@ def integrate_peaks_rbf_ssn(
     mosaicity_bound_rad: float = 0.010,
     shape_fit_min_snr: float = 0.0,
     shape_fit_normalized: bool = False,
-    robust_patch_fit: bool = False,
-    matrix_free: bool = False,
     matrix_free_profile: str = "gaussian",
     matrix_free_fp_target: float | None = None,
     static_mask_file: str | None = None,
@@ -2031,22 +1620,7 @@ def integrate_peaks_rbf_ssn(
         )
         return R_val @ s_off if R_val is not None else s_off
 
-    integrator = SparseLaueIntegrator(
-        alpha=alpha,
-        min_sigma=min(sigmas),
-        max_sigma=max(sigmas),
-        gamma=gamma,
-        loss="poisson",
-        border_width=border_width,
-        nominal_sigma=nominal_sigma,
-        anisotropic=anisotropic,
-        robust_patch_fit=robust_patch_fit,
-        chunk_size=chunk_size,
-        show_steps=show_progress,
-    )
-    # Ensure the solver dictionary perfectly matches the provided list
-    integrator.candidate_sigmas = jnp.array(sigmas, dtype=jnp.float32)
-    integrator.show_steps = show_progress
+    max_sigma = max(sigmas)
 
     # --- PHASE 1: GATHER AND BATCH ---
     images_list = []
@@ -2308,8 +1882,8 @@ def integrate_peaks_rbf_ssn(
                     f"  > Too few valid peaks ({len(opt_patches)}) for 3D tensor fit. Falling back to nominal isotropic circles."
                 )
 
-        all_var_u = np.full(len(all_rs), integrator.nominal_sigma**2, dtype=np.float32)
-        all_var_v = np.full(len(all_rs), integrator.nominal_sigma**2, dtype=np.float32)
+        all_var_u = np.full(len(all_rs), nominal_sigma**2, dtype=np.float32)
+        all_var_v = np.full(len(all_rs), nominal_sigma**2, dtype=np.float32)
         all_cov_uv = np.zeros(len(all_rs), dtype=np.float32)
     else:
         # ==========================================
@@ -2370,48 +1944,40 @@ def integrate_peaks_rbf_ssn(
         all_cov_uv = np.array(all_Sigma_2D[:, 0, 1])
 
     # --- PHASE 2: GPU INTEGRATION ---
-    if matrix_free:
-        # Amplitude-only global solve per image on the finder's rate-map
-        # noise model; same result contract as integrate_reflections.
-        # Imported here because matrix_free imports compute_rate_batch
-        # from this module.
-        from subhkl.search.matrix_free import integrate_reflections_matrix_free
+    # Amplitude-only global solve per image on the finder's rate-map noise
+    # model.  This is the only integration path: the per-patch fit it
+    # replaced compensated for patch locality (force-the-target, Voronoi
+    # pixel masks, Huber core protection) that a per-image joint solve
+    # removes by construction, and lost to it on every common reflection
+    # set measured.  Imported here because matrix_free imports
+    # compute_rate_batch from this module.
+    from subhkl.search.matrix_free import integrate_reflections_matrix_free
 
-        static_valid = None
-        if static_mask_file is not None:
-            from subhkl.search.static_mask import load_mask_for_banks
+    static_valid = None
+    if static_mask_file is not None:
+        from subhkl.search.static_mask import load_mask_for_banks
 
-            static_valid = load_mask_for_banks(
-                static_mask_file, batched_banks, images_batch.shape[1:]
-            )
-
-        integrated_results = integrate_reflections_matrix_free(
-            images_batch,
-            frames,
-            all_rs,
-            all_cs,
-            var_us=all_var_u,
-            var_vs=all_var_v,
-            cov_uvs=all_cov_uv,
-            alpha=alpha,
-            gamma=gamma,
-            ref_sigma=integrator.ref_sigma,
-            max_sigma=integrator.max_sigma,
-            static_valid=static_valid,
-            profile=matrix_free_profile,
-            fp_target=matrix_free_fp_target,
-            show_progress=show_progress,
+        static_valid = load_mask_for_banks(
+            static_mask_file, batched_banks, images_batch.shape[1:]
         )
-    else:
-        integrated_results = integrator.integrate_reflections(
-            images_batch,
-            frames,
-            all_rs,
-            all_cs,
-            var_us=all_var_u,
-            var_vs=all_var_v,
-            cov_uvs=all_cov_uv,
-        )
+
+    integrated_results = integrate_reflections_matrix_free(
+        images_batch,
+        frames,
+        all_rs,
+        all_cs,
+        var_us=all_var_u,
+        var_vs=all_var_v,
+        cov_uvs=all_cov_uv,
+        alpha=alpha,
+        gamma=gamma,
+        ref_sigma=1.0,
+        max_sigma=max_sigma,
+        static_valid=static_valid,
+        profile=matrix_free_profile,
+        fp_target=matrix_free_fp_target,
+        show_progress=show_progress,
+    )
 
     # --- PHASE 3: GEOMETRY AND METADATA MAPPING ---
     results_by_img = defaultdict(list)
