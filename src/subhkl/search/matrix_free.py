@@ -3740,6 +3740,13 @@ def integrate_reflections_matrix_free(
     returns one row [intensity, r, c, sigma_eff, sigI] per input peak,
     positions in the un-padded pixel frame.
 
+    Rows whose amplitude ends ON the nonnegativity boundary carry
+    sigI = 0: a constrained optimum pinned at zero is a censored
+    observation, not a measurement -- exporting it as "0 +- sigma"
+    would feed the merge a noise model it violates (only the positive
+    half of the fluctuation can ever be recorded), biasing weak merged
+    intensities upward.  The exporter drops sigI <= 0 rows.
+
     Args:
         images_batch: [photons/Pixel], (B, H, W)
         frames: [-] image index per peak
@@ -3910,6 +3917,9 @@ def integrate_reflections_matrix_free(
         )
         flux = np.array(flux[:k], dtype=np.float64)
         sigma = np.array(sigma[:k], dtype=np.float64)
+        # Boundary-pinned amplitudes are censored, not measured: mark
+        # them with sigI = 0 so the exporter drops them (see docstring).
+        sigma[flux <= 0.0] = 0.0
 
         out[idx, 0] = flux
         out[idx, 1] = snap_r[idx]

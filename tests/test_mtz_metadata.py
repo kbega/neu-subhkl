@@ -83,6 +83,23 @@ def test_plain_export_has_no_extra_columns(files, tmp_path):
     assert len(cols["I"]) == N - 1  # hkl=000 row dropped
 
 
+def test_boundary_marked_rows_are_not_exported(files, tmp_path):
+    """sigI = 0 marks a censored (nonneg-boundary) amplitude, not a
+    measurement; the exporter must drop it."""
+    import h5py
+
+    peaks, _, _ = files
+    with h5py.File(peaks, "r+") as f:
+        sig = f["peaks/sigma"][()]
+        sig[1] = 0.0  # mark the second (valid-hkl) row as censored
+        f["peaks/sigma"][...] = sig
+    out = tmp_path / "censored.mtz"
+    MTZExporter(str(peaks)).write_mtz(str(out))
+    cols = _columns(out)
+    assert len(cols["I"]) == N - 2  # hkl=000 row AND censored row dropped
+    np.testing.assert_allclose(sorted(cols["I"]), [10.0, 210.0, 310.0, 410.0])
+
+
 def test_metadata_columns_carry_the_right_values(files, tmp_path):
     peaks, predictions, corrections = files
     out = tmp_path / "meta.mtz"

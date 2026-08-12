@@ -68,11 +68,19 @@ def test_amplitudes_never_negative():
     background."""
     positions = [(20.0, 20.0), (45.0, 45.0), (10.0, 50.0), (50.0, 10.0)]
     truth = np.array([2000.0, 0.0, 0.0, 0.0])
+    saw_boundary = False
     for seed in range(4):
         rng = np.random.default_rng(100 + seed)
         image = _render(positions, truth, rng)
         out = _solve(image, positions)
         assert np.all(out[:, 0] >= 0.0)
+        # Boundary-pinned rows are censored, not measured: sigI = 0 marks
+        # them for the exporter to drop; measured rows keep sigI > 0.
+        at_boundary = out[:, 0] <= 0.0
+        assert np.all(out[at_boundary, 4] == 0.0)
+        assert np.all(out[~at_boundary, 4] > 0.0)
+        saw_boundary |= bool(at_boundary.any())
+    assert saw_boundary  # the scenario must actually exercise the marker
 
 
 def test_background_does_not_leak_into_empty_atoms():

@@ -331,6 +331,13 @@ class MTZExporter:
             if h == 0 and k == 0 and l == 0:
                 continue
 
+            # A nonpositive sigma is a marker, not a measurement: the
+            # matrix-free integrator stamps sigI = 0 on amplitudes pinned
+            # at its nonnegativity boundary (censored observations that
+            # would bias weak merged intensities if exported as 0 +- sigma).
+            if self.sigma[i] <= 0.0:
+                continue
+
             intensity, sigma = self.intensity[i], self.sigma[i]
             wl = self.lamda[i]
             theta = self.theta[i]
