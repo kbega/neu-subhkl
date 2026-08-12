@@ -1295,6 +1295,7 @@ def optimize_global_crystal(
     fit_mosaicity=False,
     mosaicity_radial=False,
     shape_spherical=False,
+    mosaicity_bound_rad=0.010,
 ):
     # 1. Dynamically size the optimizer state based on the configuration
     if fit_mosaicity:
@@ -1348,9 +1349,9 @@ def optimize_global_crystal(
         for idx in [1, 2, 3, 4, 5]:
             bounds[idx] = (0.0, 1e-12)
 
-    # 4. Mosaicity bound (if active, e.g., max 10 mrad = 0.010 rad)
+    # 4. Mosaicity bound (if active; 10 mrad default)
     if fit_mosaicity:
-        bounds[6] = (1e-6, 0.010 / scales[6])
+        bounds[6] = (1e-6, mosaicity_bound_rad / scales[6])
 
     x0_opt = x0_phys / scales
     res = scipy.optimize.minimize(
@@ -1814,6 +1815,8 @@ def integrate_peaks_rbf_ssn(
     fit_mosaicity: bool = False,
     mosaicity_radial: bool = False,
     shape_spherical: bool = False,
+    mosaicity_bound_rad: float = 0.010,
+    shape_fit_min_snr: float = 0.0,
     border_width: int = 0,
     chunk_size: int = 1024,
     create_visualizations: bool = False,
@@ -2186,6 +2189,41 @@ def integrate_peaks_rbf_ssn(
     # We require at least 15 valid peaks to mathematically constrain a 6-parameter 3D tensor
     MIN_PEAKS_FOR_GLOBAL_FIT = 15
 
+    # Weak patches carry no shape information -- only background.  Within
+    # the fitting window a wide template is a pedestal soaker (its MSE
+    # surface is nearly flat in width beyond half the window), so a fit
+    # over all peaks lets the many weak ones drag the widths to their
+    # bounds.  Restrict the SHAPE fit to significant peaks; integration
+    # itself still covers every prediction.
+    if shape_fit_min_snr > 0 and len(opt_patches) >= MIN_PEAKS_FOR_GLOBAL_FIT:
+        keep = []
+        for patch, bg in zip(opt_patches, opt_bgs):
+            core = patch[opt_half - 2 : opt_half + 3, opt_half - 2 : opt_half + 3]
+            signal = float(core.sum() - 25.0 * bg)
+            noise = float(np.sqrt(max(25.0 * bg, 1.0)))
+            keep.append(signal / noise >= shape_fit_min_snr)
+        keep = np.array(keep)
+        if keep.sum() >= MIN_PEAKS_FOR_GLOBAL_FIT:
+            if show_progress:
+                print(
+                    f"  > Shape fit restricted to {int(keep.sum())} of "
+                    f"{len(keep)} peaks with core SNR >= {shape_fit_min_snr}."
+                )
+            sel = np.where(keep)[0]
+            opt_patches = [opt_patches[i] for i in sel]
+            opt_bgs = [opt_bgs[i] for i in sel]
+            opt_drs = [opt_drs[i] for i in sel]
+            opt_dcs = [opt_dcs[i] for i in sel]
+            opt_Pmats = [opt_Pmats[i] for i in sel]
+            opt_dists = [opt_dists[i] for i in sel]
+            opt_Rmats = [opt_Rmats[i] for i in sel]
+            opt_streaks = [opt_streaks[i] for i in sel]
+        elif show_progress:
+            print(
+                f"  > Only {int(keep.sum())} peaks pass SNR >= "
+                f"{shape_fit_min_snr}; shape fit keeps all peaks."
+            )
+
     if not anisotropic or len(opt_patches) < MIN_PEAKS_FOR_GLOBAL_FIT:
         if show_progress:
             if not anisotropic:
@@ -2216,6 +2254,7 @@ def integrate_peaks_rbf_ssn(
             fit_mosaicity=fit_mosaicity,
             mosaicity_radial=mosaicity_radial,
             shape_spherical=shape_spherical,
+            mosaicity_bound_rad=mosaicity_bound_rad,
         )
 
         # 5. Project the EXACT 2D footprints for ALL peaks

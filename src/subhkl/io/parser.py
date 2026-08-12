@@ -655,6 +655,20 @@ def rbf_integrator(
             "question from the shape pathway.",
         ),
     ] = False,
+    mosaicity_bound_mrad: Annotated[
+        float,
+        typer.Option(help="Upper bound for the fitted mosaicity, in mrad."),
+    ] = 10.0,
+    shape_fit_min_snr: Annotated[
+        float,
+        typer.Option(
+            help="Restrict the global shape fit to peaks whose 5x5 core "
+            "exceeds this SNR over the local background.  Weak patches "
+            "carry no shape information and bias the fitted widths "
+            "upward (broad templates soak background pedestals).  "
+            "0 keeps every peak."
+        ),
+    ] = 0.0,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.0,
@@ -682,6 +696,8 @@ def rbf_integrator(
         fit_mosaicity=fit_mosaicity,
         mosaicity_radial=mosaicity_radial,
         shape_spherical=shape_spherical,
+        mosaicity_bound_mrad=mosaicity_bound_mrad,
+        shape_fit_min_snr=shape_fit_min_snr,
         rel_border_width=rel_border_width,
         show_progress=show_progress,
         create_visualizations=create_visualizations,
