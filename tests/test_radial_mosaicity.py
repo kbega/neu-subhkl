@@ -36,9 +36,7 @@ def _make_patches(phis, s_px=1.5, eta=0.005, amp=80.0, size=15, seed=3):
         C = s_px**2 * np.eye(2) + eta**2 * np.outer(e_pix, e_pix)
         Ci = np.linalg.inv(C)
         x = np.stack([dc, dr])  # index 0 = column = u
-        quad = (
-            Ci[0, 0] * x[0] ** 2 + 2 * Ci[0, 1] * x[0] * x[1] + Ci[1, 1] * x[1] ** 2
-        )
+        quad = Ci[0, 0] * x[0] ** 2 + 2 * Ci[0, 1] * x[0] * x[1] + Ci[1, 1] * x[1] ** 2
         patch = amp * np.exp(-0.5 * quad) + rng.normal(0, 0.3, size=(size, size))
         patches.append(patch)
         drs.append(dr)
@@ -49,7 +47,16 @@ def _make_patches(phis, s_px=1.5, eta=0.005, amp=80.0, size=15, seed=3):
         streaks.append(streak3)
     return tuple(
         jnp.array(np.array(a))
-        for a in (patches, np.zeros(len(phis)), drs, dcs, P_mats, dists, R_mats, streaks)
+        for a in (
+            patches,
+            np.zeros(len(phis)),
+            drs,
+            dcs,
+            P_mats,
+            dists,
+            R_mats,
+            streaks,
+        )
     )
 
 
@@ -83,9 +90,7 @@ def test_radial_mode_recovers_the_streak_where_isotropic_cannot():
             C = _project(res_x, P, DIST, streak3, radial)
             w, V = np.linalg.eigh(C)
             major = V[:, np.argmax(w)]
-            sink.append(
-                np.rad2deg(np.arccos(np.clip(abs(major @ e), 0.0, 1.0)))
-            )
+            sink.append(np.rad2deg(np.arccos(np.clip(abs(major @ e), 0.0, 1.0))))
             if radial:
                 ratio_rad.append(np.sqrt(w.max() / max(w.min(), 1e-12)))
 
@@ -96,3 +101,35 @@ def test_radial_mode_recovers_the_streak_where_isotropic_cannot():
     assert np.median(mis_iso) > 20.0
     # True aspect: sqrt(s^2 + (eta*800)^2)/s = sqrt(1.5^2+4^2)/1.5 ~ 2.85
     assert 2.0 < np.median(ratio_rad) < 4.0
+
+
+def test_spherical_shape_plus_streak_matches_the_full_model():
+    """The hypothesis test: if the data are core + streak, constraining
+    the sample tensor to a sphere must cost nothing."""
+    from subhkl.search.sparse_rbf import val_and_grad_fn
+    import jax.numpy as jnp_
+
+    phis = np.deg2rad(np.linspace(10, 170, 16))
+    args = _make_patches(phis)
+
+    x_full = optimize_global_crystal(*args, fit_mosaicity=True, mosaicity_radial=True)
+    x_sph = optimize_global_crystal(
+        *args, fit_mosaicity=True, mosaicity_radial=True, shape_spherical=True
+    )
+
+    def mse(x, spherical):
+        val, _ = val_and_grad_fn(
+            jnp_.array(x),
+            *args,
+            args[0].shape[-1],
+            fit_mosaicity=True,
+            mosaicity_radial=True,
+            shape_spherical=spherical,
+        )
+        return float(val)
+
+    m_full, m_sph = mse(x_full, False), mse(x_sph, True)
+    assert m_sph < 1.1 * m_full
+    # Recovered isotropic core: s = 1.5 px at 2000 px/m -> 7.5e-4 m.
+    assert abs(abs(x_sph[0]) - 7.5e-4) < 2.5e-4
+    assert abs(abs(x_sph[6]) - 0.005) < 0.0015

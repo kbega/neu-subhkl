@@ -1167,7 +1167,15 @@ def build_3d_cov(params):
     return L @ L.T
 
 
-@partial(jit, static_argnames=["patch_size", "fit_mosaicity", "mosaicity_radial"])
+@partial(
+    jit,
+    static_argnames=[
+        "patch_size",
+        "fit_mosaicity",
+        "mosaicity_radial",
+        "shape_spherical",
+    ],
+)
 def global_shape_objective(
     params,
     patches,
@@ -1181,9 +1189,17 @@ def global_shape_objective(
     patch_size,
     fit_mosaicity,
     mosaicity_radial=False,
+    shape_spherical=False,
 ):
-    # 1. Build the crystal shape tensor
-    Sigma_shape_sample = build_3d_cov(params[:6])
+    # 1. Build the crystal shape tensor.  The spherical constraint is the
+    # hypothesis test that the anisotropy is streak physics, not sample
+    # volume: a sphere is rotation-invariant, so it also removes any
+    # sample<->lab convention question from the shape pathway.
+    if shape_spherical:
+        r_s = jnp.abs(params[0]) + 1e-6
+        Sigma_shape_sample = jnp.eye(3) * r_s**2
+    else:
+        Sigma_shape_sample = build_3d_cov(params[:6])
 
     # 2. Handle the optional Mosaicity Tensor
     if fit_mosaicity:
@@ -1258,7 +1274,12 @@ def global_shape_objective(
 # Bind the val_and_grad wrapper to recognize the new static argument
 val_and_grad_fn = jit(
     jax.value_and_grad(global_shape_objective),
-    static_argnames=["patch_size", "fit_mosaicity", "mosaicity_radial"],
+    static_argnames=[
+        "patch_size",
+        "fit_mosaicity",
+        "mosaicity_radial",
+        "shape_spherical",
+    ],
 )
 
 
@@ -1273,6 +1294,7 @@ def optimize_global_crystal(
     streak_dirs,
     fit_mosaicity=False,
     mosaicity_radial=False,
+    shape_spherical=False,
 ):
     # 1. Dynamically size the optimizer state based on the configuration
     if fit_mosaicity:
@@ -1299,6 +1321,7 @@ def optimize_global_crystal(
             patches.shape[-1],
             fit_mosaicity=fit_mosaicity,
             mosaicity_radial=mosaicity_radial,
+            shape_spherical=shape_spherical,
         )
         grad_opt = np.array(grad_phys, dtype=np.float64) * scales
         return np.array(val, dtype=np.float64), grad_opt
@@ -1318,6 +1341,12 @@ def optimize_global_crystal(
             -max_radius_meters / scales[idx],
             max_radius_meters / scales[idx],
         )
+
+    if shape_spherical:
+        # Only params[0] (the sphere radius) is live; pin the rest of the
+        # Cholesky so the optimizer state stays 6+1 wide.
+        for idx in [1, 2, 3, 4, 5]:
+            bounds[idx] = (0.0, 1e-12)
 
     # 4. Mosaicity bound (if active, e.g., max 10 mrad = 0.010 rad)
     if fit_mosaicity:
@@ -1784,6 +1813,7 @@ def integrate_peaks_rbf_ssn(
     anisotropic: bool = False,
     fit_mosaicity: bool = False,
     mosaicity_radial: bool = False,
+    shape_spherical: bool = False,
     border_width: int = 0,
     chunk_size: int = 1024,
     create_visualizations: bool = False,
@@ -2185,10 +2215,14 @@ def integrate_peaks_rbf_ssn(
             jnp.array(opt_streaks),
             fit_mosaicity=fit_mosaicity,
             mosaicity_radial=mosaicity_radial,
+            shape_spherical=shape_spherical,
         )
 
         # 5. Project the EXACT 2D footprints for ALL peaks
-        Sigma_shape_jnp = build_3d_cov(jnp.array(res_x[:6]))
+        if shape_spherical:
+            Sigma_shape_jnp = jnp.eye(3) * (abs(res_x[0]) + 1e-6) ** 2
+        else:
+            Sigma_shape_jnp = build_3d_cov(jnp.array(res_x[:6]))
 
         if fit_mosaicity:
             eta_opt = abs(res_x[6]) + 1e-6
@@ -2205,9 +2239,7 @@ def integrate_peaks_rbf_ssn(
                 if mosaicity_radial:
                     Sigma_2D = P @ Sigma_shape_lab @ P.T
                     streak_pix = P @ (D_i * streak3)
-                    return Sigma_2D + (eta_opt**2) * jnp.outer(
-                        streak_pix, streak_pix
-                    )
+                    return Sigma_2D + (eta_opt**2) * jnp.outer(streak_pix, streak_pix)
                 Sigma_total = Sigma_shape_lab + (D_i**2) * Sigma_eta_jnp
                 return P @ Sigma_total @ P.T
 

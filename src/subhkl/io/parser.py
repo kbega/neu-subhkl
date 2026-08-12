@@ -643,6 +643,18 @@ def rbf_integrator(
             "instead of an isotropic 3D blur.  Requires --fit-mosaicity.",
         ),
     ] = False,
+    shape_spherical: Annotated[
+        bool,
+        typer.Option(
+            "--shape-spherical/--shape-ellipsoidal",
+            help="Constrain the sample tensor to a sphere (one radius).  "
+            "With --mosaicity-radial this is the hypothesis test that the "
+            "spot anisotropy is streak physics rather than the parallel "
+            "projection of the sample volume; a sphere is also "
+            "rotation-invariant, removing any sample<->lab convention "
+            "question from the shape pathway.",
+        ),
+    ] = False,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.0,
@@ -669,6 +681,7 @@ def rbf_integrator(
         anisotropic=anisotropic,
         fit_mosaicity=fit_mosaicity,
         mosaicity_radial=mosaicity_radial,
+        shape_spherical=shape_spherical,
         rel_border_width=rel_border_width,
         show_progress=show_progress,
         create_visualizations=create_visualizations,
