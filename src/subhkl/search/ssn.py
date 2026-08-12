@@ -11,7 +11,15 @@ from functools import partial
 
 @partial(jit, static_argnames=["max_iter", "loss_type", "force_target"])
 def solve_ssn_unified(
-    A, y, bg_flat, alpha_vec, loss_type, c_warm, max_iter=20, force_target=False
+    A,
+    y,
+    bg_flat,
+    alpha_vec,
+    loss_type,
+    c_warm,
+    max_iter=20,
+    force_target=False,
+    active_override=None,
 ):
     N_peaks = A.shape[1]
     N_params = N_peaks
@@ -124,6 +132,14 @@ def solve_ssn_unified(
     active_mask = c_l1 > 1e-5
     if force_target:
         active_mask = active_mask.at[0].set(True)
+    if active_override is not None:
+        # A caller whose dictionary IS the support (the amplitude-only
+        # integrator: every atom is a known reflection, nothing is a
+        # candidate) skips support selection entirely -- the debiased
+        # Newton phase with its nonnegative projection then computes the
+        # constrained MLE for every listed atom, including the ones the
+        # L1 phase left at zero.
+        active_mask = active_override
 
     def debias_cond(state):
         step, _, actual_step_norm = state

@@ -1,0 +1,264 @@
+"""Matrix-free amplitude-only integration: the global-solve contract.
+
+One Poisson-likelihood solve per image over a fixed dictionary of
+flux-normalized Gaussians, background pinned to the finder's rate map,
+amplitudes strictly nonnegative.  These tests pin the properties that
+motivated the design: flux recovery through overlap, no negative
+amplitudes, no background flux leaking into empty atoms, and a Fisher
+sigma that matches the actual estimator scatter.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from subhkl.search.matrix_free import integrate_reflections_matrix_free
+
+H = W = 64
+BG_RATE = 3.0  # [photons/Pixel]
+VAR = 4.0  # [Pixel^2] isotropic peak variance
+
+
+def _render(positions, fluxes, rng):
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
+    rate = np.full((H, W), BG_RATE)
+    for (r, c), flux in zip(positions, fluxes):
+        g = np.exp(-0.5 * ((yy - r) ** 2 + (xx - c) ** 2) / VAR)
+        rate += flux * g / (2.0 * np.pi * VAR)
+    return rng.poisson(rate).astype(np.float64)
+
+
+def _solve(image, positions, alpha=1.0):
+    n = len(positions)
+    return integrate_reflections_matrix_free(
+        image[None],
+        np.zeros(n, dtype=int),
+        np.array([p[0] for p in positions], dtype=float),
+        np.array([p[1] for p in positions], dtype=float),
+        np.full(n, VAR),
+        np.full(n, VAR),
+        np.zeros(n),
+        alpha=alpha,
+        gamma=1.0,
+        ref_sigma=1.0,
+        max_sigma=3.0,
+    )
+
+
+def test_overlapping_fluxes_recovered():
+    """Two peaks 3 px apart share pixels; the joint solve must split the
+    flux by shape, not by patch ownership."""
+    positions = [(30.0, 28.0), (30.0, 31.0), (14.0, 48.0)]
+    truth = np.array([4000.0, 1500.0, 800.0])
+    errs = []
+    for seed in range(6):
+        rng = np.random.default_rng(seed)
+        image = _render(positions, truth, rng)
+        out = _solve(image, positions)
+        errs.append((out[:, 0] - truth) / out[:, 4])
+    errs = np.array(errs)
+    # Mean pull per peak stays within ~2 standard errors of zero.
+    pulls = errs.mean(axis=0) * np.sqrt(len(errs))
+    assert np.all(np.abs(pulls) < 3.0), pulls
+
+
+def test_amplitudes_never_negative():
+    """37.9% of unconstrained-WLS amplitudes were negative on real data;
+    the constrained solve returns none, even for atoms placed on pure
+    background."""
+    positions = [(20.0, 20.0), (45.0, 45.0), (10.0, 50.0), (50.0, 10.0)]
+    truth = np.array([2000.0, 0.0, 0.0, 0.0])
+    for seed in range(4):
+        rng = np.random.default_rng(100 + seed)
+        image = _render(positions, truth, rng)
+        out = _solve(image, positions)
+        assert np.all(out[:, 0] >= 0.0)
+
+
+def test_background_does_not_leak_into_empty_atoms():
+    """An atom over pure background must report (nearly) zero flux, not
+    a share of the pedestal: the faint-half inflation of the loose
+    global WLS measured 33x on cg4d-t4-lysozyme."""
+    positions = [(20.0, 20.0), (45.0, 45.0)]
+    truth = np.array([3000.0, 0.0])
+    recovered = []
+    for seed in range(6):
+        rng = np.random.default_rng(200 + seed)
+        image = _render(positions, truth, rng)
+        out = _solve(image, positions)
+        recovered.append(out[1, 0])
+    # The empty atom's flux stays below its own 2 sigma (sigma ~ sqrt of
+    # background photons under the footprint, ~60 here).
+    assert np.mean(recovered) < 2.0 * np.sqrt(2 * np.pi * VAR * BG_RATE) * 2.0
+
+
+def test_fisher_sigma_matches_estimator_scatter():
+    """The reported sigma is the Fisher information at the optimum; the
+    empirical scatter of the flux estimate over noise realizations must
+    match it, not just rank it."""
+    positions = [(32.0, 32.0)]
+    truth = np.array([2500.0])
+    fluxes, sigmas = [], []
+    for seed in range(12):
+        rng = np.random.default_rng(300 + seed)
+        image = _render(positions, truth, rng)
+        out = _solve(image, positions)
+        fluxes.append(out[0, 0])
+        sigmas.append(out[0, 4])
+    ratio = np.std(fluxes, ddof=1) / np.mean(sigmas)
+    assert 0.5 < ratio < 2.0, ratio
+
+
+def test_positions_snap_to_the_true_center():
+    """A prediction 1 px off must recover the true flux through the
+    log-parabolic snap, and report the snapped position."""
+    true_pos = [(30.0, 30.0)]
+    offset_pos = [(31.0, 29.0)]
+    truth = np.array([5000.0])
+    rng = np.random.default_rng(42)
+    image = _render(true_pos, truth, rng)
+    out = _solve(image, offset_pos)
+    assert abs(out[0, 1] - 30.0) < 0.5
+    assert abs(out[0, 2] - 30.0) < 0.5
+    assert abs(out[0, 0] - truth[0]) < 5.0 * out[0, 4]
+
+
+def test_weak_peaks_are_measured_not_gated():
+    """Integration is measurement, not detection: a peak far below any
+    z-score gate must still come back with its flux, not a hard zero.
+    The first cut ran the finder's L1 selection and returned exact
+    zeros for 97.8% of cg4d-t4-lysozyme (median true peak ~30
+    photons); CC(1/2) collapsed to 0.02."""
+    positions = [(30.0, 30.0), (14.0, 48.0)]
+    truth = np.array([30.0, 3000.0])  # weak peak ~ noise scale
+    weak = []
+    for seed in range(10):
+        rng = np.random.default_rng(600 + seed)
+        image = _render(positions, truth, rng)
+        out = _solve(image, positions, alpha=3.0)  # champion-recipe alpha
+        weak.append(out[0, 0])
+    weak = np.array(weak)
+    # Not gated: the weak peak is nonzero in most realizations (the
+    # nonnegative MLE only pins genuinely negative-fluctuation draws).
+    assert np.mean(weak > 0) > 0.5, weak
+    # And measured: mean recovery within a few standard errors of truth
+    # (nonnegative truncation biases a 1.5-sigma peak up by ~2%, far
+    # below this tolerance).
+    se = np.std(weak, ddof=1) / np.sqrt(len(weak))
+    assert abs(np.mean(weak) - truth[0]) < 4.0 * se, (np.mean(weak), se)
+
+
+def test_masked_rate_map_is_unbiased_under_peaks():
+    """The unmasked quantile estimator reads +1 photon/pixel or more
+    under a bright peak (its 'bounded positive bias'); with the
+    footprint masked it must recover the true rate from the ring."""
+    import jax.numpy as jnp
+
+    from subhkl.search.matrix_free import _footprint_mask
+    from subhkl.search.sparse_rbf import compute_rate_batch
+
+    positions = [(30.0, 28.0), (30.0, 31.0)]
+    truth = np.array([4000.0, 1500.0])
+    under_masked, under_raw = [], []
+    for seed in range(6):
+        rng = np.random.default_rng(400 + seed)
+        image = _render(positions, truth, rng).astype(np.float32)
+        valid = _footprint_mask(
+            1,
+            H,
+            W,
+            np.zeros(2, dtype=int),
+            np.array([p[0] for p in positions]),
+            np.array([p[1] for p in positions]),
+            np.full(2, VAR),
+            np.full(2, VAR),
+            np.zeros(2),
+        )
+        rm_masked = np.array(
+            compute_rate_batch(jnp.array(image[None]), 15, valid=jnp.array(valid))
+        )[0]
+        rm_raw = np.array(compute_rate_batch(jnp.array(image[None]), 15))[0]
+        under_masked.append(rm_masked[30, 28])
+        under_raw.append(rm_raw[30, 28])
+    assert abs(np.mean(under_masked) - BG_RATE) < 0.5, np.mean(under_masked)
+    # and the raw estimator really was biased here, else this test is vacuous
+    assert np.mean(under_raw) - BG_RATE > 1.0, np.mean(under_raw)
+
+
+def test_static_mask_removes_ridge_bias():
+    """A bright static ridge crossing near a peak biases its amplitude
+    (the rate map cannot follow a structure narrower than its window);
+    masking the ridge as missing data must restore the flux, exactly the
+    contract of the static-mask files."""
+    positions = [(30.0, 30.0)]
+    truth = np.array([2000.0])
+    biased, masked = [], []
+    for seed in range(6):
+        rng = np.random.default_rng(500 + seed)
+        image = _render(positions, truth, rng)
+        # a 2-px ridge 4 px from the peak center, 12 photons/px on bg 3
+        image[:, 34:36] += rng.poisson(12.0, size=(H, 2))
+        valid = np.ones((1, H, W), dtype=np.float32)
+        valid[:, :, 33:37] = 0.0
+
+        out_b = _solve(image, positions)
+        n = len(positions)
+        out_m = integrate_reflections_matrix_free(
+            image[None],
+            np.zeros(n, dtype=int),
+            np.array([p[0] for p in positions]),
+            np.array([p[1] for p in positions]),
+            np.full(n, VAR),
+            np.full(n, VAR),
+            np.zeros(n),
+            alpha=1.0,
+            gamma=1.0,
+            ref_sigma=1.0,
+            max_sigma=3.0,
+            static_valid=valid,
+        )
+        biased.append(out_b[0, 0] - truth[0])
+        masked.append((out_m[0, 0] - truth[0]) / out_m[0, 4])
+    # masked: mean pull consistent with zero
+    assert abs(np.mean(masked)) * np.sqrt(len(masked)) < 3.0, np.mean(masked)
+    # and the ridge really biases the unmasked solve, else vacuous
+    assert abs(np.mean(biased)) > 30.0, np.mean(biased)
+
+
+def test_empty_input_returns_empty():
+    out = integrate_reflections_matrix_free(
+        np.zeros((1, H, W)),
+        np.array([], dtype=int),
+        np.array([]),
+        np.array([]),
+        np.array([]),
+        np.array([]),
+        np.array([]),
+        alpha=1.0,
+        gamma=1.0,
+        ref_sigma=1.0,
+        max_sigma=3.0,
+    )
+    assert out.shape == (0, 5)
+
+
+def test_multi_image_scatter_back():
+    """Peaks interleaved across two images land back on their own rows."""
+    rng = np.random.default_rng(7)
+    img0 = _render([(20.0, 20.0)], [3000.0], rng)
+    img1 = _render([(40.0, 40.0)], [1200.0], rng)
+    out = integrate_reflections_matrix_free(
+        np.stack([img0, img1]),
+        np.array([1, 0]),
+        np.array([40.0, 20.0]),
+        np.array([40.0, 20.0]),
+        np.full(2, VAR),
+        np.full(2, VAR),
+        np.zeros(2),
+        alpha=1.0,
+        gamma=1.0,
+        ref_sigma=1.0,
+        max_sigma=3.0,
+    )
+    assert abs(out[0, 0] - 1200.0) < 5.0 * out[0, 4]
+    assert abs(out[1, 0] - 3000.0) < 5.0 * out[1, 4]

@@ -155,7 +155,7 @@ RATE_K_MAX = 16
 
 
 @partial(jit, static_argnames=["filter_size"])
-def compute_rate_batch(imgs, filter_size):
+def compute_rate_batch(imgs, filter_size, valid=None):
     """Local Poisson rate by exact quantile inversion -- the sparse-regime
     replacement for the median background.
 
@@ -193,17 +193,35 @@ def compute_rate_batch(imgs, filter_size):
     and a fixed 30-step bisection of a scalar special function: no sort, no
     window-sized tensor, compile time in seconds.
 
+    When ``valid`` is given (1 = usable pixel, 0 = excluded), every
+    window statistic becomes its conditional version on the usable
+    pixels only: F_k = box_mean(valid * (y <= k)) / box_mean(valid),
+    and the bright fallback is the masked windowed mean.  A caller that
+    knows where the peaks are (the integrator, whose dictionary is the
+    predicted reflection list) can mask their footprints and estimate
+    the rate from genuine background pixels alone -- the quantile
+    argument's "bounded positive bias" from peak contamination is only
+    small while peaks fill a small fraction of the window, which a
+    focusing instrument's spot density does not guarantee (measured:
+    +3.5 photons/pixel on a rate of 3 under a peak covering 22% of the
+    window, eating 9% of that peak's flux from a fixed-background
+    amplitude solve).
+
     Args:
         imgs: [photons/Pixel]
         filter_size: [Pixel^0.5]
+        valid: [-] optional (B, H, W) mask, 1 where the rate may look
     Returns:
         [photons/Pixel]
     """
 
-    def process_one(img):
+    def process_one(inputs):
+        img, v = inputs
+        v_frac = jnp.maximum(_box_mean_2d(v, filter_size), 1e-3)
+
         F = jnp.stack(
             [
-                _box_mean_2d((img <= k).astype(img.dtype), filter_size)
+                _box_mean_2d(v * (img <= k).astype(img.dtype), filter_size) / v_frac
                 for k in range(RATE_K_MAX + 1)
             ]
         )  # [K+1, H, W]
@@ -232,7 +250,7 @@ def compute_rate_batch(imgs, filter_size):
         lo, hi = lax.fori_loop(0, 30, bisect, (lo, hi))
         mu = 0.5 * (lo + hi)
 
-        bright = _box_mean_2d(img, filter_size)
+        bright = _box_mean_2d(v * img, filter_size) / v_frac
         rate = jnp.where(any_hit, mu, bright)
 
         blur = jax_gaussian_blur_2d(rate)  # [photons/Pixel]
@@ -241,7 +259,9 @@ def compute_rate_batch(imgs, filter_size):
         # regions with none are masked upstream.
         return jnp.maximum(blur, 1e-3)  # [photons/Pixel]
 
-    return lax.map(process_one, imgs)  # [photons/Pixel]
+    if valid is None:
+        valid = jnp.ones_like(imgs)
+    return lax.map(process_one, (imgs, valid.astype(imgs.dtype)))  # [photons/Pixel]
 
 
 class SparseRBFPeakFinder(SparseBasisPursuit):
@@ -1863,6 +1883,8 @@ def integrate_peaks_rbf_ssn(
     shape_fit_min_snr: float = 0.0,
     shape_fit_normalized: bool = False,
     robust_patch_fit: bool = False,
+    matrix_free: bool = False,
+    static_mask_file: str | None = None,
     border_width: int = 0,
     chunk_size: int = 1024,
     create_visualizations: bool = False,
@@ -2026,6 +2048,7 @@ def integrate_peaks_rbf_ssn(
 
     # --- PHASE 1: GATHER AND BATCH ---
     images_list = []
+    batched_banks = []
     all_frames = []
     all_rs, all_cs = [], []
     _meta_h, _meta_k, _meta_l, _meta_wl = [], [], [], []
@@ -2100,6 +2123,7 @@ def integrate_peaks_rbf_ssn(
             peaks_obj.image.ims[img_key], nan=0.0, posinf=0.0, neginf=0.0
         )
         images_list.append(image_raw)
+        batched_banks.append(peaks_obj.image.bank_mapping.get(img_key, img_key))
 
         for data in keep_data:
             idx = data["rep_idx"]
@@ -2344,15 +2368,46 @@ def integrate_peaks_rbf_ssn(
         all_cov_uv = np.array(all_Sigma_2D[:, 0, 1])
 
     # --- PHASE 2: GPU INTEGRATION ---
-    integrated_results = integrator.integrate_reflections(
-        images_batch,
-        frames,
-        all_rs,
-        all_cs,
-        var_us=all_var_u,
-        var_vs=all_var_v,
-        cov_uvs=all_cov_uv,
-    )
+    if matrix_free:
+        # Amplitude-only global solve per image on the finder's rate-map
+        # noise model; same result contract as integrate_reflections.
+        # Imported here because matrix_free imports compute_rate_batch
+        # from this module.
+        from subhkl.search.matrix_free import integrate_reflections_matrix_free
+
+        static_valid = None
+        if static_mask_file is not None:
+            from subhkl.search.static_mask import load_mask_for_banks
+
+            static_valid = load_mask_for_banks(
+                static_mask_file, batched_banks, images_batch.shape[1:]
+            )
+
+        integrated_results = integrate_reflections_matrix_free(
+            images_batch,
+            frames,
+            all_rs,
+            all_cs,
+            var_us=all_var_u,
+            var_vs=all_var_v,
+            cov_uvs=all_cov_uv,
+            alpha=alpha,
+            gamma=gamma,
+            ref_sigma=integrator.ref_sigma,
+            max_sigma=integrator.max_sigma,
+            static_valid=static_valid,
+            show_progress=show_progress,
+        )
+    else:
+        integrated_results = integrator.integrate_reflections(
+            images_batch,
+            frames,
+            all_rs,
+            all_cs,
+            var_us=all_var_u,
+            var_vs=all_var_v,
+            cov_uvs=all_cov_uv,
+        )
 
     # --- PHASE 3: GEOMETRY AND METADATA MAPPING ---
     results_by_img = defaultdict(list)

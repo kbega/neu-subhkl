@@ -746,6 +746,30 @@ def rbf_integrator(
             "predictions negative.",
         ),
     ] = False,
+    matrix_free: Annotated[
+        bool,
+        typer.Option(
+            "--matrix-free/--no-matrix-free",
+            help="Replace the per-patch amplitude fit with one global "
+            "solve per image: fixed dictionary of flux-normalized "
+            "anisotropic Gaussians at the predicted positions, "
+            "background fixed to the finder's Poisson rate map, and "
+            "strictly nonnegative amplitudes solved under the Poisson "
+            "likelihood by the finder's semi-smooth Newton engine.  "
+            "Sigmas come from the Fisher information at the "
+            "constrained optimum, so crowded reflections report their "
+            "mutual covariance penalty.",
+        ),
+    ] = False,
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Static-structure mask HDF5 (from `static-mask`), mapped "
+            "onto the input by bank id.  With --matrix-free, masked "
+            "pixels are excluded from both the rate-map background and "
+            "the amplitude likelihood as missing data."
+        ),
+    ] = None,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.0,
@@ -777,6 +801,8 @@ def rbf_integrator(
         shape_fit_min_snr=shape_fit_min_snr,
         shape_fit_normalized=shape_fit_normalized,
         robust_patch_fit=robust_patch_fit,
+        matrix_free=matrix_free,
+        static_mask_file=static_mask_file,
         rel_border_width=rel_border_width,
         show_progress=show_progress,
         create_visualizations=create_visualizations,
