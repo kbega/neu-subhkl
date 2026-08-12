@@ -1713,10 +1713,20 @@ class SparseLaueIntegrator(SparseRBFPeakFinder):
                     # passes at the Poisson noise scale.
                     noise = jnp.sqrt(jnp.maximum(patch.flatten(), 1.0))
                     for _ in range(2):
+                        # Core protection: never down-weight pixels the
+                        # peak model itself claims (bright cores deviate
+                        # from the Gaussian template by many Poisson sigma
+                        # and would be clipped -- measured as a 2.5x drop
+                        # in the healthy runs' median intensity).  Ridge
+                        # and bad pixels have model ~ 0 and stay
+                        # down-weightable.
+                        model_peaks = A_tilde[:, :K_NEIGHBORS] @ c_ols[:K_NEIGHBORS]
+                        core = jnp.abs(model_peaks) > noise
                         resid = (y_sub - A_tilde @ c_ols) / noise
-                        w_rob = w * jnp.minimum(
+                        w_huber = w * jnp.minimum(
                             1.0, 2.5 / jnp.maximum(jnp.abs(resid), 1e-6)
                         )
+                        w_rob = jnp.where(core, w, w_huber)
                         C_mat, c_ols = wls(w_rob)
 
                 # Because the basis is normalized, c_ols is literally the total unpenalized photon count!

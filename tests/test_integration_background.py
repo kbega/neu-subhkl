@@ -90,3 +90,20 @@ def test_robust_fit_is_neutral_on_clean_background():
     i_off = _integrate(img, 48.0, 48.0, robust=False)
     i_on = _integrate(img, 48.0, 48.0, robust=True)
     assert abs(i_on - i_off) / flux < 0.05
+
+
+def test_core_protection_never_clips_a_bright_non_gaussian_peak():
+    """Bright cores deviate from the Gaussian template by many Poisson
+    sigma; without model-based core protection the Huber pass clips
+    them (measured as a 2.5x drop in healthy runs' median intensity)."""
+    rng = np.random.default_rng(3)
+    H = W = 96
+    flux, bg = 60000.0, 20.0
+    yy, xx = np.mgrid[0:H, 0:W]
+    r2 = (yy - 48.0) ** 2 + (xx - 48.0) ** 2
+    moffat = (1 + r2 / (2.0 * 2.5**2)) ** (-2.5)
+    moffat = moffat / moffat.sum() * flux
+    img = rng.poisson(bg + moffat).astype(float)
+    i_off = _integrate(img, 48.0, 48.0, robust=False)
+    i_on = _integrate(img, 48.0, 48.0, robust=True)
+    assert abs(i_on - i_off) / i_off < 0.02
