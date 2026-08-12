@@ -3410,7 +3410,7 @@ class MatrixFreeSparseRBFPeakFinder:
 
 from tqdm import tqdm  # noqa: E402
 
-from subhkl.search.ssn import solve_ssn_unified  # noqa: E402
+from subhkl.search.ssn import calibrated_admission_z, solve_ssn_unified  # noqa: E402
 
 # Same clamp the patch integrator puts on its log-parabolic snap.
 MAX_SNAP_SHIFT = 1.5  # [Pixel]
@@ -3621,22 +3621,30 @@ def _measure_whitened_profile(
 
 @jit
 def _solve_image_amplitudes(
-    image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, profile=None
+    image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, admission_z, profile=None
 ):
-    """One image, all its reflections: nonnegative Poisson amplitude solve.
+    """One image, all its reflections: L1-admitted, debiased Poisson solve.
 
-    This is measurement, not detection: the dictionary IS the support
-    (every atom is a predicted reflection), so there is no L1 selection
-    stage -- the alpha vector is zero for real atoms and every real atom
-    is forced into the engine's debiased Newton phase via
-    ``active_override``.  Its nonnegative projection then computes the
-    constrained MLE for each reflection, however faint.  A first version
-    ran the finder's thresholded selection instead and returned exact
-    zeros for 97.8% of cg4d-t4-lysozyme (median true peak ~30 photons,
-    far under any z-score gate) -- CC(1/2) collapsed to 0.02.  The patch
-    integrator survives the same regime only because it force-includes
-    the target column after L1; forcing ALL columns is that rule, said
-    in dictionary language.
+    The L1 penalty is the finder's admission logic with the
+    integrator's own test count: lambda_i = z / SE_i, so an atom
+    activates exactly when its whitened residual correlation exceeds
+    ``admission_z`` standard errors of its OWN amplitude
+    (per_atom_var=True -- the CG global solver's per-coefficient
+    convention), and z is calibrated from the number of predicted
+    reflections, not from a per-pixel search.  No width tax applies:
+    the finder's (sigma/ref)^gamma weight prices scale competition
+    that a fixed-geometry dictionary does not have.  A first version
+    transplanted that weight and thresholded at ~48 sigma -- 97.8% of
+    cg4d-t4-lysozyme amplitudes came back exactly zero and CC(1/2)
+    collapsed to 0.02.
+
+    Unlike the CG finder (whose GPCG endgame keeps lambda in the
+    objective throughout -- correct for detection ranking), the dense
+    engine's DEBIASING phase then refits the admitted set
+    unpenalized: L1 shrinkage is z*SE of flux, proportionally worst
+    for weak reflections, a bias merging cannot undo.  Eliminated
+    atoms come back at exactly zero and are marked censored
+    downstream (sigI = 0; the exporter drops them).
 
     Masked pixels are missing data, not zero counts (see
     _solve_ssn_cg_global): zeroing the data, the background and the atom
@@ -3651,6 +3659,8 @@ def _solve_image_amplitudes(
         valid: [-] (H, W), 1 = usable pixel
         rs, cs, var_u, var_v, cov_uv: atom geometry, padded to a fixed K
         atom_ok: 1.0 for real atoms, 0.0 for padding (zeroes the column)
+        admission_z: [-] calibrated one-sided z threshold for admission
+            (see ssn.calibrated_admission_z); 0 admits every atom
         profile: optional (u, f, norm) measured radial trunk in model
             sigmas with norm = integral of f(m) m dm, from
             _measure_whitened_profile; None keeps the analytic Gaussian
@@ -3689,10 +3699,8 @@ def _solve_image_amplitudes(
     bg_flat = bg.flatten() * v_flat
 
     c_warm = jnp.zeros(A.shape[1], dtype=jnp.float32)
-    # Zero L1 weight on real atoms (no shrinkage, no gate); the huge
-    # weight on padding keeps those inert during the L1 phase, and the
-    # override keeps them out of the debias phase.
-    alpha_vec = jnp.where(atom_ok > 0.5, 0.0, 1e6)
+    # Calibrated z on real atoms; the huge weight keeps padding inert.
+    alpha_vec = jnp.where(atom_ok > 0.5, admission_z, 1e6)
     c = solve_ssn_unified(
         A,
         y,
@@ -3701,7 +3709,7 @@ def _solve_image_amplitudes(
         1,
         c_warm,
         max_iter=20,
-        active_override=atom_ok > 0.5,
+        per_atom_var=True,
     )
 
     # Fisher information of the Poisson likelihood at the constrained
@@ -3731,6 +3739,7 @@ def integrate_reflections_matrix_free(
     static_valid=None,
     profile="gaussian",
     profile_min_peaks=50,
+    fp_target=1.0,
     rate_chunk_size=64,
     show_progress=False,
 ):
@@ -3767,6 +3776,11 @@ def integrate_reflections_matrix_free(
             _measure_whitened_profile, falling back to the Gaussian if
             too few peaks qualify), or a path to the finder's profile
             JSON ({"u": [...], "f": [...]})
+        fp_target: [-] expected number of FALSE admissions over the
+            whole dataset; sets the L1 admission threshold
+            z = Phi^-1(1 - fp_target/n_peaks) (see
+            ssn.calibrated_admission_z).  fp_target >= n_peaks admits
+            every reflection (no gate).
     """
     # Local import: sparse_rbf imports this function lazily at its call
     # site, so a top-level import there would be circular.
@@ -3887,6 +3901,14 @@ def integrate_reflections_matrix_free(
 
     effective_sigma = np.sqrt(np.sqrt(np.maximum(var_us * var_vs - cov_uvs**2, 1e-6)))
 
+    admission_z = calibrated_admission_z(n_peaks, fp_target)
+    if show_progress:
+        print(
+            f"  > L1 admission: z = {admission_z:.2f} "
+            f"({fp_target} expected false admissions over {n_peaks} predictions)"
+        )
+    admission_z_jax = jnp.float32(admission_z)
+
     out = np.zeros((n_peaks, 5), dtype=np.float64)
     pbar = tqdm(range(B), desc="Matrix-free amplitude solve", disable=not show_progress)
     for f in pbar:
@@ -3913,6 +3935,7 @@ def integrate_reflections_matrix_free(
             padded(var_vs, fill=1.0),
             padded(cov_uvs),
             atom_ok,
+            admission_z_jax,
             profile=trunk_jax,
         )
         flux = np.array(flux[:k], dtype=np.float64)

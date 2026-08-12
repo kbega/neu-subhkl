@@ -8,8 +8,33 @@ import jax.numpy as jnp
 from jax import lax, jit, vmap
 from functools import partial
 
+from scipy.special import ndtri
 
-@partial(jit, static_argnames=["max_iter", "loss_type", "force_target"])
+
+def calibrated_admission_z(n_tests, fp_target):
+    """The z threshold whose expected false-admission count is fp_target.
+
+    The L1 penalty rate in this engine is lambda_i = alpha_i / SE_i --
+    an atom activates when its whitened residual correlation exceeds
+    alpha_i standard errors (the KKT condition IS the admission test).
+    Under the null every test is a one-sided Gaussian tail, so the
+    calibrated threshold over n_tests candidates is
+
+        z = Phi^-1(1 - fp_target / n_tests).
+
+    This is the same multiple-testing logic as the finder's
+    effective_alpha, with the caller's own test count: the finder
+    searches ~H*W*K candidate positions per image; the integrator
+    tests exactly its predicted reflections.  fp_target >= n_tests
+    returns 0 (admit everything).
+    """
+    q = fp_target / max(float(n_tests), 1.0)
+    if q >= 1.0:
+        return 0.0
+    return float(ndtri(1.0 - q))
+
+
+@partial(jit, static_argnames=["max_iter", "loss_type", "force_target", "per_atom_var"])
 def solve_ssn_unified(
     A,
     y,
@@ -20,6 +45,7 @@ def solve_ssn_unified(
     max_iter=20,
     force_target=False,
     active_override=None,
+    per_atom_var=False,
 ):
     N_peaks = A.shape[1]
     N_params = N_peaks
@@ -73,7 +99,15 @@ def solve_ssn_unified(
         L = jnp.max(jnp.diag(hess)) + 1e-4
         tau = 1.0 / L
 
-        var_c = jnp.where(loss_type == 1, tau, bg_med * tau)
+        if per_atom_var:
+            # Each atom's own curvature: the global max-diag tau
+            # understates the standard error of every atom but the
+            # sharpest, so their thresholds come out harsher than the
+            # requested z (the CG global solver already thresholds
+            # per-coefficient; this is the dense-path equivalent).
+            var_c = 1.0 / jnp.maximum(jnp.diag(hess), 1e-6)
+        else:
+            var_c = jnp.where(loss_type == 1, tau, bg_med * tau)
         tau_alpha = alpha_vec * jnp.sqrt(var_c)
 
         Gq = (q - c) / tau + grad

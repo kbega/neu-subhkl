@@ -773,6 +773,18 @@ def rbf_integrator(
             "profile JSON."
         ),
     ] = "gaussian",
+    matrix_free_fp_target: Annotated[
+        float,
+        typer.Option(
+            help="Expected number of FALSE admissions over the whole "
+            "dataset for the matrix-free L1 gate; the admission "
+            "threshold is z = Phi^-1(1 - fp_target/n_predictions) -- "
+            "the finder's false-alarm calibration with the "
+            "integrator's own test count.  Values >= the prediction "
+            "count admit everything.  Eliminated reflections are "
+            "censored (sigI = 0, dropped from the export)."
+        ),
+    ] = 1.0,
     static_mask_file: Annotated[
         str | None,
         typer.Option(
@@ -815,6 +827,7 @@ def rbf_integrator(
         robust_patch_fit=robust_patch_fit,
         matrix_free=matrix_free,
         matrix_free_profile=matrix_free_profile,
+        matrix_free_fp_target=matrix_free_fp_target,
         static_mask_file=static_mask_file,
         rel_border_width=rel_border_width,
         show_progress=show_progress,

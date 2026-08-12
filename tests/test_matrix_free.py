@@ -132,11 +132,12 @@ def test_positions_snap_to_the_true_center():
 
 
 def test_weak_peaks_are_measured_not_gated():
-    """Integration is measurement, not detection: a peak far below any
-    z-score gate must still come back with its flux, not a hard zero.
-    The first cut ran the finder's L1 selection and returned exact
-    zeros for 97.8% of cg4d-t4-lysozyme (median true peak ~30
-    photons); CC(1/2) collapsed to 0.02."""
+    """With a permissive fp_target (>= the test count) the admission
+    threshold is z = 0 and every reflection is measured: a peak far
+    below any detection gate still comes back with its flux.  The
+    first cut transplanted the finder's width-taxed threshold (~48
+    sigma) and returned exact zeros for 97.8% of cg4d-t4-lysozyme;
+    CC(1/2) collapsed to 0.02."""
     positions = [(30.0, 30.0), (14.0, 48.0)]
     truth = np.array([30.0, 3000.0])  # weak peak ~ noise scale
     weak = []
@@ -154,6 +155,55 @@ def test_weak_peaks_are_measured_not_gated():
     # below this tolerance).
     se = np.std(weak, ddof=1) / np.sqrt(len(weak))
     assert abs(np.mean(weak) - truth[0]) < 4.0 * se, (np.mean(weak), se)
+
+
+def test_calibrated_admission_censors_subthreshold_only():
+    """The L1 gate is the finder's admission logic at the integrator's
+    test count: with a strict fp_target the sub-threshold peak is
+    censored (flux 0, sigI 0 -> dropped by the exporter), while the
+    bright peak is admitted AND debiased -- its flux must be unbiased,
+    not shrunk by z*SE (~2.6 sigma here, far above the tolerance)."""
+    positions = [(20.0, 20.0), (45.0, 45.0)]
+    truth = np.array([20000.0, 12.0])  # z >> gate, z << gate
+    n = len(positions)
+    bright, weak_censored = [], 0
+    for seed in range(6):
+        rng = np.random.default_rng(800 + seed)
+        image = _render(positions, truth, rng)
+        out = integrate_reflections_matrix_free(
+            image[None],
+            np.zeros(n, dtype=int),
+            np.array([p[0] for p in positions]),
+            np.array([p[1] for p in positions]),
+            np.full(n, VAR),
+            np.full(n, VAR),
+            np.zeros(n),
+            alpha=1.0,
+            gamma=1.0,
+            ref_sigma=1.0,
+            max_sigma=3.0,
+            fp_target=0.01,  # z = Phi^-1(1 - 0.005) ~ 2.58
+        )
+        bright.append((out[0, 0] - truth[0]) / out[0, 4])
+        if out[1, 0] == 0.0:
+            assert out[1, 4] == 0.0  # censored, not "0 +- sigma"
+            weak_censored += 1
+    # the weak peak (z ~ 0.5) is censored in every realization
+    assert weak_censored == 6
+    # the admitted peak is debiased: mean pull consistent with zero
+    assert abs(np.mean(bright)) * np.sqrt(len(bright)) < 3.0, np.mean(bright)
+
+
+def test_calibrated_admission_z_values():
+    from subhkl.search.ssn import calibrated_admission_z
+
+    # finder-scale test count -> the familiar ~5-sigma regime
+    assert 4.5 < calibrated_admission_z(2.6e5, 0.05) < 5.5
+    # integrator-scale
+    assert 3.0 < calibrated_admission_z(16600, 1.0) < 4.5
+    # permissive target admits everything
+    assert calibrated_admission_z(10, 10) == 0.0
+    assert calibrated_admission_z(10, 50) == 0.0
 
 
 def test_masked_rate_map_is_unbiased_under_peaks():

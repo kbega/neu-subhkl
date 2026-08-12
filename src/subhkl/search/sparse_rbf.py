@@ -1885,6 +1885,7 @@ def integrate_peaks_rbf_ssn(
     robust_patch_fit: bool = False,
     matrix_free: bool = False,
     matrix_free_profile: str = "gaussian",
+    matrix_free_fp_target: float = 1.0,
     static_mask_file: str | None = None,
     border_width: int = 0,
     chunk_size: int = 1024,
@@ -2398,6 +2399,7 @@ def integrate_peaks_rbf_ssn(
             max_sigma=integrator.max_sigma,
             static_valid=static_valid,
             profile=matrix_free_profile,
+            fp_target=matrix_free_fp_target,
             show_progress=show_progress,
         )
     else:
