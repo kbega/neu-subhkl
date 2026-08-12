@@ -1174,6 +1174,7 @@ def build_3d_cov(params):
         "fit_mosaicity",
         "mosaicity_radial",
         "shape_spherical",
+        "shape_fit_normalized",
     ],
 )
 def global_shape_objective(
@@ -1190,6 +1191,7 @@ def global_shape_objective(
     fit_mosaicity,
     mosaicity_radial=False,
     shape_spherical=False,
+    shape_fit_normalized=False,
 ):
     # 1. Build the crystal shape tensor.  The spherical constraint is the
     # hypothesis test that the anisotropy is streak physics, not sample
@@ -1263,7 +1265,16 @@ def global_shape_objective(
         )
 
         residual = y_sub - amp * template
-        return jnp.sum(residual**2)
+        sse = jnp.sum(residual**2)
+        if shape_fit_normalized:
+            # Per-patch power normalization: a patch votes with its misfit
+            # FRACTION, not its brightness -- squared-error scales with
+            # brightness^2, so an unnormalized mean lets a handful of
+            # bright near-beam tails outvote thousands of typical peaks
+            # (measured: top-3 patches carried 50% of the widening
+            # leverage on cg4d-t4-lysozyme).
+            sse = sse / (jnp.sum(y_sub**2) + 1e-6)
+        return sse
 
     mses = vmap(fit_one_peak)(
         patches, bgs, drs, dcs, P_mats, distances, R_mats, streak_dirs
@@ -1279,6 +1290,7 @@ val_and_grad_fn = jit(
         "fit_mosaicity",
         "mosaicity_radial",
         "shape_spherical",
+        "shape_fit_normalized",
     ],
 )
 
@@ -1296,6 +1308,7 @@ def optimize_global_crystal(
     mosaicity_radial=False,
     shape_spherical=False,
     mosaicity_bound_rad=0.010,
+    shape_fit_normalized=False,
 ):
     # 1. Dynamically size the optimizer state based on the configuration
     if fit_mosaicity:
@@ -1323,6 +1336,7 @@ def optimize_global_crystal(
             fit_mosaicity=fit_mosaicity,
             mosaicity_radial=mosaicity_radial,
             shape_spherical=shape_spherical,
+            shape_fit_normalized=shape_fit_normalized,
         )
         grad_opt = np.array(grad_phys, dtype=np.float64) * scales
         return np.array(val, dtype=np.float64), grad_opt
@@ -1411,6 +1425,7 @@ class SparseLaueIntegrator(SparseRBFPeakFinder):
         num_sigmas=32,
         nominal_sigma=2.0,
         anisotropic=False,
+        robust_patch_fit=False,
         chunk_size=1024,
         show_steps=False,
     ):
@@ -1430,6 +1445,7 @@ class SparseLaueIntegrator(SparseRBFPeakFinder):
 
         self.nominal_sigma = nominal_sigma
         self.anisotropic = anisotropic
+        self.robust_patch_fit = robust_patch_fit
 
     def integrate_reflections(
         self, images_batch, frames, rs, cs, var_us=None, var_vs=None, cov_uvs=None
@@ -1680,10 +1696,28 @@ class SparseLaueIntegrator(SparseRBFPeakFinder):
                 A_tilde = jnp.hstack([A_best_masked, jnp.ones((P * P, 1))])
                 w = 1.0 / jnp.maximum(patch.flatten(), 1.0)
 
-                I_mat = A_tilde.T @ (w[:, None] * A_tilde)
-                C_mat = jnp.linalg.inv(I_mat + 1e-6 * jnp.eye(K_NEIGHBORS + 1))
-                rhs = A_tilde.T @ (w * y_sub)
-                c_ols = C_mat @ rhs
+                def wls(weights):
+                    I_m = A_tilde.T @ (weights[:, None] * A_tilde)
+                    C_m = jnp.linalg.inv(I_m + 1e-6 * jnp.eye(A_tilde.shape[1]))
+                    return C_m, C_m @ (A_tilde.T @ (weights * y_sub))
+
+                C_mat, c_ols = wls(w)
+                if self.robust_patch_fit:
+                    # Diffuse ridges narrower than the rolling-median window
+                    # are classified as signal, stay in the residual, and
+                    # correlate with the template -- measured on
+                    # cg4d-t4-lysozyme as whole banks of negative median
+                    # intensity.  A plane cannot represent them (they are
+                    # smoothed steps); instead down-weight
+                    # unmodeled-structure pixels with two Huber IRLS
+                    # passes at the Poisson noise scale.
+                    noise = jnp.sqrt(jnp.maximum(patch.flatten(), 1.0))
+                    for _ in range(2):
+                        resid = (y_sub - A_tilde @ c_ols) / noise
+                        w_rob = w * jnp.minimum(
+                            1.0, 2.5 / jnp.maximum(jnp.abs(resid), 1e-6)
+                        )
+                        C_mat, c_ols = wls(w_rob)
 
                 # Because the basis is normalized, c_ols is literally the total unpenalized photon count!
                 intensity = c_ols[0]
@@ -1817,6 +1851,8 @@ def integrate_peaks_rbf_ssn(
     shape_spherical: bool = False,
     mosaicity_bound_rad: float = 0.010,
     shape_fit_min_snr: float = 0.0,
+    shape_fit_normalized: bool = False,
+    robust_patch_fit: bool = False,
     border_width: int = 0,
     chunk_size: int = 1024,
     create_visualizations: bool = False,
@@ -1970,6 +2006,7 @@ def integrate_peaks_rbf_ssn(
         border_width=border_width,
         nominal_sigma=nominal_sigma,
         anisotropic=anisotropic,
+        robust_patch_fit=robust_patch_fit,
         chunk_size=chunk_size,
         show_steps=show_progress,
     )
@@ -2255,6 +2292,7 @@ def integrate_peaks_rbf_ssn(
             mosaicity_radial=mosaicity_radial,
             shape_spherical=shape_spherical,
             mosaicity_bound_rad=mosaicity_bound_rad,
+            shape_fit_normalized=shape_fit_normalized,
         )
 
         # 5. Project the EXACT 2D footprints for ALL peaks

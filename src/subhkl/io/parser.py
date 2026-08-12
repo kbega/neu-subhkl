@@ -725,6 +725,27 @@ def rbf_integrator(
             "0 keeps every peak."
         ),
     ] = 0.0,
+    shape_fit_normalized: Annotated[
+        bool,
+        typer.Option(
+            "--shape-fit-normalized/--no-shape-fit-normalized",
+            help="Normalize each patch's shape-fit error by its own power "
+            "so patches vote with their misfit fraction, not their "
+            "brightness (a handful of bright near-beam tails otherwise "
+            "dominate the global template).",
+        ),
+    ] = False,
+    robust_patch_fit: Annotated[
+        bool,
+        typer.Option(
+            "--robust-patch-fit/--no-robust-patch-fit",
+            help="Down-weight unmodeled-structure pixels (diffuse ridges, "
+            "bad pixels) with Huber IRLS passes in the per-patch amplitude "
+            "fit.  Diffuse ridges narrower than the background median "
+            "window stay in the residual and bias whole regions of weak "
+            "predictions negative.",
+        ),
+    ] = False,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.0,
@@ -754,6 +775,8 @@ def rbf_integrator(
         shape_spherical=shape_spherical,
         mosaicity_bound_mrad=mosaicity_bound_mrad,
         shape_fit_min_snr=shape_fit_min_snr,
+        shape_fit_normalized=shape_fit_normalized,
+        robust_patch_fit=robust_patch_fit,
         rel_border_width=rel_border_width,
         show_progress=show_progress,
         create_visualizations=create_visualizations,

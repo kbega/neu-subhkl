@@ -133,3 +133,29 @@ def test_spherical_shape_plus_streak_matches_the_full_model():
     # Recovered isotropic core: s = 1.5 px at 2000 px/m -> 7.5e-4 m.
     assert abs(abs(x_sph[0]) - 7.5e-4) < 2.5e-4
     assert abs(abs(x_sph[6]) - 0.005) < 0.0015
+
+
+def test_normalized_shape_fit_resists_a_bright_outlier():
+    """One 100x-brighter patch with a rotated streak must not steer the
+    normalized fit away from the 15 typical patches."""
+    phis = np.deg2rad(np.linspace(10, 150, 15))
+    args = list(_make_patches(phis))
+    # append a bright outlier streaked perpendicular to its recorded frame
+    out = _make_patches(np.deg2rad([60.0]), amp=8000.0, seed=11)
+    wrong_streak = np.array(
+        [[np.cos(np.deg2rad(150.0)), np.sin(np.deg2rad(150.0)), 0.0]]
+    )
+    import jax.numpy as jnp_
+
+    args = [
+        jnp_.concatenate([a, (b if i != 7 else jnp_.array(wrong_streak))])
+        for i, (a, b) in enumerate(zip(args, out))
+    ]
+    x_raw = optimize_global_crystal(*args, fit_mosaicity=True, mosaicity_radial=True)
+    x_norm = optimize_global_crystal(
+        *args, fit_mosaicity=True, mosaicity_radial=True, shape_fit_normalized=True
+    )
+    # the normalized eta stays near the typical 5 mrad; the raw fit is
+    # dragged by the outlier's misfit
+    assert abs(abs(x_norm[6]) - 0.005) < abs(abs(x_raw[6]) - 0.005) + 1e-9
+    assert abs(abs(x_norm[6]) - 0.005) < 0.002
