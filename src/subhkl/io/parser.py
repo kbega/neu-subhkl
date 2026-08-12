@@ -418,6 +418,16 @@ def indexer(
             help="Bound (meters) per component of each per-run sample displacement.",
         ),
     ] = 0.002,
+    refine_goniometer_trans_axes: Annotated[
+        Optional[str],
+        typer.Option(
+            "--refine-goniometer-trans-axes",
+            help="Comma-separated motor names whose lever-arm translations "
+            "to refine.  Defaults to the --refine-goniometer-axes list; "
+            "set it separately to refine e.g. the phi-stage (sample) "
+            "translation without freeing the pure-gauge phi zero point.",
+        ),
+    ] = None,
     refine_goniometer_trans: Annotated[
         bool, typer.Option("--refine-goniometer-trans")
     ] = False,
@@ -610,6 +620,11 @@ def indexer(
         goniometer_per_run_bound_deg=goniometer_per_run_bound_deg,
         refine_goniometer_per_run_trans=refine_goniometer_per_run_trans,
         goniometer_per_run_trans_bound_meters=goniometer_per_run_trans_bound_meters,
+        refine_goniometer_trans_axes=(
+            [x.strip() for x in refine_goniometer_trans_axes.split(",")]
+            if refine_goniometer_trans_axes
+            else None
+        ),
         goniometer_axis_vector_bound_deg=gonio_axis_vec_bounds_parsed,
         refine_goniometer_trans=refine_goniometer_trans,
         goniometer_trans_bound_meters=gonio_trans_bounds_parsed,

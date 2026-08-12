@@ -207,6 +207,7 @@ class VectorizedObjective:
         refine_goniometer=False,
         goniometer_bound_deg=5.0,
         goniometer_refine_mask=None,
+        goniometer_trans_refine_mask=None,
         goniometer_nominal_offsets=None,
         goniometer_axis_vector_mask=None,
         goniometer_axis_vector_bound_deg=1.0,
@@ -339,7 +340,17 @@ class VectorizedObjective:
             )
             self.num_active_gonio = np.sum(self.gonio_mask)
 
-            self.gonio_trans_mask = self.gonio_mask[self.motor_map]
+            # The translation mask follows the angle mask unless a
+            # separate per-motor selection is given: the phi-stage lever
+            # arm (a sample-on-pin eccentricity rotates WITH phi) is only
+            # refinable through this mask, and slaving it to the angle
+            # list would also free the pure-gauge phi zero point.
+            trans_motor_mask = (
+                np.array(goniometer_trans_refine_mask, dtype=bool)
+                if goniometer_trans_refine_mask is not None
+                else np.asarray(self.gonio_mask, dtype=bool)
+            )
+            self.gonio_trans_mask = trans_motor_mask[self.motor_map]
             self.num_active_trans = np.sum(self.gonio_trans_mask)
 
             raw_trans_bounds = jnp.array(goniometer_trans_bound_meters)
@@ -1737,6 +1748,7 @@ class FindUB:
         goniometer_per_run_trans_bound_meters: float = 0.002,
         per_run_frame_map: np.ndarray | None = None,
         refine_sample: bool = False,
+        refine_goniometer_trans_axes: list | None = None,
         goniometer_trans_bound_meters: float | list | np.ndarray = 0.005,
         refine_beam: bool = False,
         beam_bound_deg: float = 1.0,
@@ -1921,6 +1933,24 @@ class FindUB:
                     "Per-run refinement needs per_run_frame_map "
                     "(frame index -> run ordinal)."
                 )
+        trans_refine_mask = None
+        if refine_goniometer_trans_axes:
+            trans_refine_mask = np.array(
+                [
+                    any(
+                        req.lower() in name.lower()
+                        for req in refine_goniometer_trans_axes
+                    )
+                    for name in unique_motors
+                ],
+                dtype=bool,
+            )
+            if not trans_refine_mask.any():
+                raise ValueError(
+                    f"None of {refine_goniometer_trans_axes} matched motors "
+                    f"{unique_motors} for translation refinement."
+                )
+
         if refine_goniometer_per_run_trans and per_run_frame_map is None:
             raise ValueError(
                 "Per-run translation refinement needs per_run_frame_map "
@@ -1977,6 +2007,7 @@ class FindUB:
             goniometer_angles=goniometer_angles,
             refine_goniometer=refine_goniometer,
             goniometer_refine_mask=goniometer_refine_mask,
+            goniometer_trans_refine_mask=trans_refine_mask,
             goniometer_nominal_offsets=self.base_gonio_offset,
             goniometer_bound_deg=bounds_array,
             goniometer_axis_vector_mask=axis_vector_mask,
@@ -2015,9 +2046,14 @@ class FindUB:
         if refine_lattice:
             num_dims += num_lattice_params
         if refine_sample and self.peak_xyz is not None:
-            if goniometer_refine_mask is not None and goniometer_axes is not None:
+            trans_motor_mask = (
+                trans_refine_mask
+                if trans_refine_mask is not None
+                else goniometer_refine_mask
+            )
+            if trans_motor_mask is not None and goniometer_axes is not None:
                 # motor_map exists here, map mask to axes
-                axis_mask = goniometer_refine_mask[motor_map]
+                axis_mask = trans_motor_mask[motor_map]
                 num_dims += np.sum(axis_mask) * 3
             else:
                 num_trans = (

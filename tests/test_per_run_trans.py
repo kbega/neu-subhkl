@@ -116,3 +116,37 @@ def test_frame_map_is_required():
     _, objective, _, _, _, _ = _make_fixture()
     with pytest.raises(ValueError, match="per_run_frame_map"):
         objective(per_run_trans=True)
+
+
+def test_trans_axes_can_be_selected_independently_of_angle_axes():
+    """The phi-stage lever arm must be refinable without freeing the
+    pure-gauge phi zero point: the translation mask decouples."""
+    axes = np.array(
+        [
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, -1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 1.0, 0.0, -1.0],
+        ]
+    )
+    ki = np.array([0.0, 0.0, 1.0])
+    obj = VectorizedObjective(
+        np.eye(3) / 6.0,
+        np.zeros((3, 4)),
+        None,
+        np.array([2.0, 3.8]),
+        goniometer_axes=axes,
+        goniometer_angles=np.zeros((5, 1)),
+        motor_map=[0, 1, 2, 1, 3],
+        refine_sample=True,
+        goniometer_refine_mask=np.array([True, False, True, False]),
+        goniometer_trans_refine_mask=np.array([True, False, True, True]),
+        goniometer_trans_bound_meters=0.005,
+        beam_nominal=ki,
+        kf_lab_fixed_vectors=np.zeros((3, 4)),
+        peak_run_indices=np.zeros(4, dtype=int),
+    )
+    mask = np.array(obj.gonio_trans_mask).astype(int)
+    np.testing.assert_array_equal(mask, [1, 0, 1, 0, 1])  # phi trans active
+    assert obj.num_active_gonio == 2  # phi ANGLE offset still inactive
