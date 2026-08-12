@@ -89,6 +89,8 @@ def run_index(
     goniometer_axis_vector_bound_deg: float | list[float] | np.ndarray = 1.0,
     refine_goniometer_per_run: str | None = None,
     goniometer_per_run_bound_deg: float = 0.5,
+    refine_goniometer_per_run_trans: bool = False,
+    goniometer_per_run_trans_bound_meters: float = 0.002,
     refine_goniometer_trans: bool = False,
     goniometer_trans_bound_meters: float | list[float] | np.ndarray = 0.005,
     refine_beam: bool = False,
@@ -612,7 +614,7 @@ def run_index(
         )
 
     per_run_frame_map = None
-    if refine_goniometer_per_run:
+    if refine_goniometer_per_run or refine_goniometer_per_run_trans:
         if per_run_file_offsets is None:
             raise ValueError(
                 "--refine-goniometer-per-run needs a merged --nexus file "
@@ -643,6 +645,8 @@ def run_index(
         goniometer_axis_vector_bound_deg=goniometer_axis_vector_bound_deg,
         refine_goniometer_per_run=refine_goniometer_per_run,
         goniometer_per_run_bound_deg=goniometer_per_run_bound_deg,
+        refine_goniometer_per_run_trans=refine_goniometer_per_run_trans,
+        goniometer_per_run_trans_bound_meters=goniometer_per_run_trans_bound_meters,
         per_run_frame_map=per_run_frame_map,
         goniometer_names=goniometer_names,
         refine_sample=refine_goniometer_trans,
@@ -773,6 +777,24 @@ def run_index(
             if per_run_file_offsets is not None:
                 grp["run_file_offsets"] = np.asarray(per_run_file_offsets)
 
+        if (
+            refine_goniometer_per_run_trans
+            and getattr(opt, "goniometer_per_run_trans", None) is not None
+        ):
+            # Per-run sample displacements cannot be folded into any static
+            # dataset the downstream stages read (unlike the corrected
+            # angles above): they are recorded here for provenance, and
+            # consumers need explicit support to apply them.
+            grp_name = "goniometer/per_run"
+            grp = f[grp_name] if grp_name in f else f.create_group(grp_name)
+            if "trans_m" in grp:
+                del grp["trans_m"]
+            grp["trans_m"] = np.asarray(opt.goniometer_per_run_trans)
+            if "frame_to_run" not in grp:
+                grp["frame_to_run"] = np.asarray(per_run_frame_map, dtype=np.int32)
+            if "run_files" not in grp and per_run_files is not None:
+                grp["run_files"] = np.array(per_run_files, dtype="S")
+
         if opt.goniometer_offsets is not None:
             grp_name = "goniometer/offsets"
             if grp_name in f:
@@ -827,6 +849,8 @@ def run_index(
             "refine_goniometer_axis_vector": refine_goniometer_axis_vector,
             "refine_goniometer_per_run": refine_goniometer_per_run,
             "goniometer_per_run_bound_deg": goniometer_per_run_bound_deg,
+            "refine_goniometer_per_run_trans": refine_goniometer_per_run_trans,
+            "goniometer_per_run_trans_bound_meters": goniometer_per_run_trans_bound_meters,
             "refine_goniometer_trans": refine_goniometer_trans,
             "refine_beam": refine_beam,
             "refine_detector": refine_detector,

@@ -400,6 +400,24 @@ def indexer(
             help="Bound (deg) for each per-run angle correction.",
         ),
     ] = 0.5,
+    refine_goniometer_per_run_trans: Annotated[
+        bool,
+        typer.Option(
+            "--refine-goniometer-per-run-trans/--no-refine-goniometer-per-run-trans",
+            help="Refine one bounded sample displacement (3-vector) per "
+            "scan run, attached at the innermost goniometer axis: the "
+            "translational twin of the per-run angle corrections (mount "
+            "settling, sphere of confusion).  Needs a merged --nexus "
+            "file with file_offsets.",
+        ),
+    ] = False,
+    goniometer_per_run_trans_bound_meters: Annotated[
+        float,
+        typer.Option(
+            "--goniometer-per-run-trans-bound-meters",
+            help="Bound (meters) per component of each per-run sample displacement.",
+        ),
+    ] = 0.002,
     refine_goniometer_trans: Annotated[
         bool, typer.Option("--refine-goniometer-trans")
     ] = False,
@@ -590,6 +608,8 @@ def indexer(
         refine_goniometer_axis_vector=gonio_axis_vec_parsed,
         refine_goniometer_per_run=refine_goniometer_per_run,
         goniometer_per_run_bound_deg=goniometer_per_run_bound_deg,
+        refine_goniometer_per_run_trans=refine_goniometer_per_run_trans,
+        goniometer_per_run_trans_bound_meters=goniometer_per_run_trans_bound_meters,
         goniometer_axis_vector_bound_deg=gonio_axis_vec_bounds_parsed,
         refine_goniometer_trans=refine_goniometer_trans,
         goniometer_trans_bound_meters=gonio_trans_bounds_parsed,

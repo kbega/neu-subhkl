@@ -213,6 +213,8 @@ class VectorizedObjective:
         per_run_motor_index=None,
         per_run_frame_map=None,
         per_run_bound_deg=0.5,
+        per_run_trans=False,
+        per_run_trans_bound_m=0.002,
         refine_sample=False,
         goniometer_trans_bound_meters=0.005,
         sample_nominal=None,
@@ -418,7 +420,8 @@ class VectorizedObjective:
             self.per_run_motor_idx = (
                 int(per_run_motor_index) if per_run_motor_index is not None else None
             )
-            if self.per_run_motor_idx is not None:
+            self.per_run_trans = bool(per_run_trans)
+            if self.per_run_motor_idx is not None or self.per_run_trans:
                 if per_run_frame_map is None:
                     raise ValueError(
                         "Per-run refinement needs per_run_frame_map "
@@ -426,11 +429,21 @@ class VectorizedObjective:
                     )
                 frame_map_np = np.asarray(per_run_frame_map, dtype=int)
                 self.per_run_frame_map = jnp.array(frame_map_np, dtype=jnp.int32)
-                self.num_per_run_params = int(frame_map_np.max()) + 1
-                self.per_run_bound_deg = float(per_run_bound_deg)
+                self.num_runs_static = int(frame_map_np.max()) + 1
             else:
                 self.per_run_frame_map = None
-                self.num_per_run_params = 0
+                self.num_runs_static = 0
+            self.num_per_run_params = (
+                self.num_runs_static if self.per_run_motor_idx is not None else 0
+            )
+            self.per_run_bound_deg = float(per_run_bound_deg)
+            # Per-run translational offsets: the angular wobble's twin.
+            # One 3-vector per scan run at the INNERMOST axis, so it rides
+            # with the sample (mount settling, sphere-of-confusion).
+            self.num_per_run_trans_params = (
+                3 * self.num_runs_static if self.per_run_trans else 0
+            )
+            self.per_run_trans_bound_m = float(per_run_trans_bound_m)
         else:
             self.gonio_axes = None
             self.num_gonio_axes = 0
@@ -442,6 +455,9 @@ class VectorizedObjective:
             self.per_run_motor_idx = None
             self.per_run_frame_map = None
             self.num_per_run_params = 0
+            self.per_run_trans = False
+            self.num_per_run_trans_params = 0
+            self.num_runs_static = 0
 
         self.refine_gonio_trans = refine_sample
         num_trans = max(1, self.num_gonio_axes)
@@ -745,6 +761,8 @@ class VectorizedObjective:
         axis_dirs = None
         axis_tilts = None
         per_run_delta = None
+        per_run_trans_delta = None
+        per_frame_trans = None
         sample_origin_lab = jnp.zeros((x.shape[0], 1, 3))
 
         if self.gonio_axes is not None:
@@ -802,6 +820,20 @@ class VectorizedObjective:
                 per_run_delta = _forward_map_param(pr_norm, self.per_run_bound_deg)
                 per_frame_corr = per_run_delta[:, self.per_run_frame_map]  # (S, M)
 
+            per_run_trans_delta = None
+            per_frame_trans = None
+            if self.num_per_run_trans_params > 0:
+                prt_norm = x[:, idx : idx + self.num_per_run_trans_params].reshape(
+                    -1, self.num_runs_static, 3
+                )
+                idx += self.num_per_run_trans_params
+                per_run_trans_delta = _forward_map_param(
+                    prt_norm, self.per_run_trans_bound_m
+                )
+                per_frame_trans = per_run_trans_delta[
+                    :, self.per_run_frame_map, :
+                ]  # (S, M, 3)
+
             R_list = []
             deg2rad = jnp.pi / 180.0
 
@@ -841,6 +873,10 @@ class VectorizedObjective:
             sample_origin_lab = jnp.zeros((S, M, 3))
             for i in reversed(range(self.num_gonio_axes)):
                 t_i = t_axes[:, i, :][:, None, :]
+                if per_frame_trans is not None and i == self.num_gonio_axes - 1:
+                    # Per-run sample displacement rides on the innermost
+                    # axis: s_lab gains R_full(frame) @ t_run(frame).
+                    t_i = t_i + per_frame_trans
                 # --- NEW KINEMATICS: Translate in local frame, THEN Rotate ---
                 sample_origin_lab = jnp.einsum(
                     "smij,smj->smi", R_list[i], sample_origin_lab + t_i
@@ -980,6 +1016,7 @@ class VectorizedObjective:
             axis_dirs,
             axis_tilts,
             per_run_delta,
+            per_run_trans_delta,
         )
 
     def _positional_metric_vectors(self, ub_mat, kf_ki_sample, ki_sample, k_sq):
@@ -1279,6 +1316,7 @@ class VectorizedObjective:
             _,
             _,
             _,
+            _,
         ) = self._get_physical_params_jax(x_pad)
 
         R_curr = R_cum if R_cum is not None else self.static_R
@@ -1392,6 +1430,7 @@ class FindUB:
         self.goniometer_axis_tilts = None
         self.goniometer_per_run_delta = None
         self.goniometer_per_run_motor = None
+        self.goniometer_per_run_trans = None
         self.goniometer_names = None
         self.sample_offset = None
         self.peak_xyz = None
@@ -1694,6 +1733,8 @@ class FindUB:
         goniometer_axis_vector_bound_deg: float | list | np.ndarray = 1.0,
         refine_goniometer_per_run: str | None = None,
         goniometer_per_run_bound_deg: float = 0.5,
+        refine_goniometer_per_run_trans: bool = False,
+        goniometer_per_run_trans_bound_meters: float = 0.002,
         per_run_frame_map: np.ndarray | None = None,
         refine_sample: bool = False,
         goniometer_trans_bound_meters: float | list | np.ndarray = 0.005,
@@ -1880,6 +1921,11 @@ class FindUB:
                     "Per-run refinement needs per_run_frame_map "
                     "(frame index -> run ordinal)."
                 )
+        if refine_goniometer_per_run_trans and per_run_frame_map is None:
+            raise ValueError(
+                "Per-run translation refinement needs per_run_frame_map "
+                "(frame index -> run ordinal)."
+            )
 
         # Map translation bounds to active axes
         if isinstance(goniometer_trans_bound_meters, (int, float)):
@@ -1938,6 +1984,8 @@ class FindUB:
             per_run_motor_index=per_run_motor_index,
             per_run_frame_map=per_run_frame_map,
             per_run_bound_deg=goniometer_per_run_bound_deg,
+            per_run_trans=refine_goniometer_per_run_trans,
+            per_run_trans_bound_m=goniometer_per_run_trans_bound_meters,
             goniometer_trans_bound_meters=bounds_array_trans,
             sample_nominal=self.base_sample_offset,
             refine_beam=refine_beam,
@@ -1988,6 +2036,8 @@ class FindUB:
             num_dims += 2 * int(np.sum(axis_vector_mask))
         if per_run_motor_index is not None:
             num_dims += objective.num_per_run_params
+        if refine_goniometer_per_run_trans:
+            num_dims += objective.num_per_run_trans_params
         if refine_detector:
             num_dims += objective.num_det_params
 
@@ -2014,6 +2064,7 @@ class FindUB:
                 axes_refined_batch,
                 axis_tilts_batch,
                 per_run_delta_batch,
+                per_run_trans_batch,
             ) = objective._get_physical_params_jax(x_batch)
             self.sample_offset = np.array(t_axes_batch[0])
             self.ki_vec = np.array(ki_vec_batch[0]).flatten()
@@ -2285,6 +2336,7 @@ class FindUB:
             axes_refined_batch,
             axis_tilts_batch,
             per_run_delta_batch,
+            per_run_trans_batch,
         ) = objective._get_physical_params_jax(x_batch)
 
         self.sample_offset = np.array(t_axes_batch[0])
@@ -2334,6 +2386,13 @@ class FindUB:
                 f"Per-run corrections for {refine_goniometer_per_run}: "
                 + " ".join(f"{d:+.4f}" for d in self.goniometer_per_run_delta)
                 + " deg"
+            )
+        if refine_goniometer_per_run_trans and per_run_trans_batch is not None:
+            self.goniometer_per_run_trans = np.array(per_run_trans_batch[0])
+            norms = np.linalg.norm(self.goniometer_per_run_trans, axis=1) * 1e3
+            print(
+                "Per-run sample displacements (|t| mm): "
+                + " ".join(f"{v:.3f}" for v in norms)
             )
 
         if freeze_orientation:
