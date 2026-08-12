@@ -1160,6 +1160,29 @@ def run_peak_predictor(
     if gonio_offsets is not None:
         print(f"Applying refined goniometer offsets from indexer: {gonio_offsets}")
 
+    # The indexer's refined kinematics -- per-run-corrected angles and
+    # refined axis vectors -- are written to its output file; the nexus
+    # only carries the nominals.  Prefer the refined values whenever the
+    # shapes line up, so prediction runs on the same geometry the
+    # solution was fitted with.
+    with h5py.File(indexed_hdf5_filename, "r") as f_idx:
+        for key, attr in (
+            ("goniometer/angles", "angles_raw"),
+            ("goniometer/axes", "axes_raw"),
+        ):
+            if key not in f_idx:
+                continue
+            refined = np.asarray(f_idx[key][()], dtype=float)
+            current = np.asarray(getattr(peaks.goniometer, attr))
+            if refined.shape == current.shape and not np.allclose(refined, current):
+                setattr(peaks.goniometer, attr, refined)
+                print(f"Applying refined {key} from indexer.")
+            elif refined.T.shape == current.shape and not np.allclose(
+                refined.T, current
+            ):
+                setattr(peaks.goniometer, attr, refined.T)
+                print(f"Applying refined {key} from indexer (transposed).")
+
     # Pass the Base UB matrix. The predictor will apply dynamic R_gonio internally!
     UB = U @ B
 
