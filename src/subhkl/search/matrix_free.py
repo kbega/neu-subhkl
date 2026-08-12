@@ -3739,7 +3739,7 @@ def integrate_reflections_matrix_free(
     static_valid=None,
     profile="gaussian",
     profile_min_peaks=50,
-    fp_target=1.0,
+    fp_target=None,
     rate_chunk_size=64,
     show_progress=False,
 ):
@@ -3779,8 +3779,13 @@ def integrate_reflections_matrix_free(
         fp_target: [-] expected number of FALSE admissions over the
             whole dataset; sets the L1 admission threshold
             z = Phi^-1(1 - fp_target/n_peaks) (see
-            ssn.calibrated_admission_z).  fp_target >= n_peaks admits
-            every reflection (no gate).
+            ssn.calibrated_admission_z).  None (the default) applies
+            no gate: elimination happens only at the nonnegativity
+            boundary, the MLE's own verdict -- the production setting,
+            since the gate cannot distinguish "absent" from "present
+            but weak" and any z > 0 trades real completeness for
+            purity (measured on cg4d-t4-lysozyme: z = 2.17 costs 31
+            points of completeness).
     """
     # Local import: sparse_rbf imports this function lazily at its call
     # site, so a top-level import there would be circular.
@@ -3901,12 +3906,17 @@ def integrate_reflections_matrix_free(
 
     effective_sigma = np.sqrt(np.sqrt(np.maximum(var_us * var_vs - cov_uvs**2, 1e-6)))
 
-    admission_z = calibrated_admission_z(n_peaks, fp_target)
-    if show_progress:
-        print(
-            f"  > L1 admission: z = {admission_z:.2f} "
-            f"({fp_target} expected false admissions over {n_peaks} predictions)"
-        )
+    if fp_target is None:
+        admission_z = 0.0
+        if show_progress:
+            print("  > L1 admission: no gate (nonneg-boundary censoring only)")
+    else:
+        admission_z = calibrated_admission_z(n_peaks, fp_target)
+        if show_progress:
+            print(
+                f"  > L1 admission: z = {admission_z:.2f} "
+                f"({fp_target} expected false admissions over {n_peaks} predictions)"
+            )
     admission_z_jax = jnp.float32(admission_z)
 
     out = np.zeros((n_peaks, 5), dtype=np.float64)

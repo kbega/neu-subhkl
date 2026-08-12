@@ -774,17 +774,20 @@ def rbf_integrator(
         ),
     ] = "gaussian",
     matrix_free_fp_target: Annotated[
-        float,
+        float | None,
         typer.Option(
             help="Expected number of FALSE admissions over the whole "
             "dataset for the matrix-free L1 gate; the admission "
             "threshold is z = Phi^-1(1 - fp_target/n_predictions) -- "
             "the finder's false-alarm calibration with the "
-            "integrator's own test count.  Values >= the prediction "
-            "count admit everything.  Eliminated reflections are "
-            "censored (sigI = 0, dropped from the export)."
+            "integrator's own test count.  Unset (the default) applies "
+            "no gate: elimination happens only at the nonnegativity "
+            "boundary.  Eliminated reflections are censored (sigI = 0, "
+            "dropped from the export); the gate is a purity/"
+            "completeness dial, measured -31 points of completeness at "
+            "z = 2.17 on cg4d-t4-lysozyme."
         ),
-    ] = 1.0,
+    ] = None,
     static_mask_file: Annotated[
         str | None,
         typer.Option(

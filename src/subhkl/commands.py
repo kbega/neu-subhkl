@@ -1308,7 +1308,7 @@ def run_rbf_integrator(
     robust_patch_fit: bool = False,
     matrix_free: bool = False,
     matrix_free_profile: str = "gaussian",
-    matrix_free_fp_target: float = 1.0,
+    matrix_free_fp_target: float | None = None,
     static_mask_file: str | None = None,
     rel_border_width: float = 0.0,
     show_progress: bool = True,
