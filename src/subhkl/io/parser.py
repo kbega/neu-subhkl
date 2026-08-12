@@ -965,8 +965,31 @@ def mtz_exporter(
     space_group: str = typer.Option(
         None, help="Optional. Loaded from indexer h5 if missing."
     ),
+    predictions_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Predictor HDF5; adds SNAPD (distance from the "
+            "integrated to the nearest predicted position, px) and "
+            "SIGEFF (projected peak radius, px) columns -- per-peak "
+            "systematics proxies a scaling model can learn from."
+        ),
+    ] = None,
+    corrections_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Indexer HDF5 carrying goniometer/per_run; adds DPHI "
+            "(deg) and DTX/DTY/DTZ (mm) columns with the peak's run's "
+            "fitted goniometer corrections."
+        ),
+    ] = None,
 ):
-    run_mtz_exporter(indexed_h5_filename, output_mtz_filename, space_group)
+    run_mtz_exporter(
+        indexed_h5_filename,
+        output_mtz_filename,
+        space_group,
+        predictions_file=predictions_file,
+        corrections_file=corrections_file,
+    )
 
 
 @app.command()

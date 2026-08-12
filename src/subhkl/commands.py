@@ -1572,9 +1572,18 @@ def run_integrator(
 
 
 def run_mtz_exporter(
-    indexed_h5_filename: str, output_mtz_filename: str, space_group: str = None
+    indexed_h5_filename: str,
+    output_mtz_filename: str,
+    space_group: str = None,
+    predictions_file: str | None = None,
+    corrections_file: str | None = None,
 ):
-    algorithm = MTZExporter(indexed_h5_filename, space_group)
+    algorithm = MTZExporter(
+        indexed_h5_filename,
+        space_group,
+        predictions_file=predictions_file,
+        corrections_file=corrections_file,
+    )
     algorithm.write_mtz(output_mtz_filename)
 
 
