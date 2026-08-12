@@ -321,6 +321,8 @@ def prepare_predict_tasks(
     gonio_axes: Optional[Any] = None,
     gonio_angles: Optional[np.ndarray] = None,
     gonio_offsets: Optional[np.ndarray] = None,
+    per_run_trans: Optional[np.ndarray] = None,
+    frame_to_run: Optional[np.ndarray] = None,
 ) -> List[Tuple[Any, ...]]:
     bank_mapping = image_data.bank_mapping
     tasks = []
@@ -377,6 +379,19 @@ def prepare_predict_tasks(
             else:
                 angles_bank = gonio_angles
 
+        # Per-run sample displacement rides on the innermost axis; the
+        # per-image task granularity makes it a per-task effective offset.
+        so_eff = sample_offset
+        if (
+            per_run_trans is not None
+            and frame_to_run is not None
+            and sample_offset is not None
+            and np.ndim(sample_offset) == 2
+            and img_index < len(frame_to_run)
+        ):
+            so_eff = np.array(sample_offset, dtype=float, copy=True)
+            so_eff[-1] = so_eff[-1] + per_run_trans[int(frame_to_run[img_index])]
+
         tasks.append(
             (
                 img_key,
@@ -386,7 +401,7 @@ def prepare_predict_tasks(
                 UB,  # <-- Pass constant UB!
                 wavelength_min,
                 wavelength_max,
-                sample_offset,
+                so_eff,
                 ki_vec,
                 R_bank,
                 gonio_axes,

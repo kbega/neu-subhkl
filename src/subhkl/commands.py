@@ -1209,6 +1209,15 @@ def run_peak_predictor(
             ):
                 setattr(peaks.goniometer, attr, refined.T)
                 print(f"Applying refined {key} from indexer (transposed).")
+        per_run_trans = None
+        frame_to_run = None
+        if "goniometer/per_run/trans_m" in f_idx:
+            per_run_trans = f_idx["goniometer/per_run/trans_m"][()]
+            frame_to_run = f_idx["goniometer/per_run/frame_to_run"][()]
+            print(
+                "Applying per-run sample displacements from indexer "
+                f"({len(per_run_trans)} runs)."
+            )
 
     # Pass the Base UB matrix. The predictor will apply dynamic R_gonio internally!
     UB = U @ B
@@ -1231,6 +1240,8 @@ def run_peak_predictor(
         gonio_axes=peaks.goniometer.axes_raw,
         gonio_angles=peaks.goniometer.angles_raw,
         gonio_offsets=gonio_offsets,  # Pass the pure zero-points
+        per_run_trans=per_run_trans,
+        frame_to_run=frame_to_run,
     )
 
     print(f"Saving predictions to {integration_peaks_filename}")

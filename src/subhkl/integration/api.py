@@ -197,6 +197,8 @@ class Peaks:
         gonio_axes=None,
         gonio_angles=None,
         gonio_offsets=None,
+        per_run_trans=None,
+        frame_to_run=None,
     ) -> dict:
         peak_dict = {}
         tasks = orchestrator.prepare_predict_tasks(
@@ -219,6 +221,8 @@ class Peaks:
             gonio_axes=gonio_axes,
             gonio_angles=gonio_angles,
             gonio_offsets=gonio_offsets,
+            per_run_trans=per_run_trans,
+            frame_to_run=frame_to_run,
         )
 
         ctx = multiprocessing.get_context("spawn")
