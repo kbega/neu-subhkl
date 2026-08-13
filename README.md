@@ -20,7 +20,7 @@ Then create a virtual environment and install the project:
 ```bash
 uv venv env
 source env/bin/activate  # On Windows: env\Scripts\activate
-uv pip install -e .
+uv pip install subhkl
 ```
 
 ### Option 2: Using standard Python venv
@@ -28,10 +28,10 @@ uv pip install -e .
 ```bash
 python -m venv env
 source env/bin/activate  # On Windows: env\Scripts\activate
-python -m pip install -e .
+python -m pip install subhkl
 ```
 
-### Installing test dependencies
+### Installing test dependencies for local build
 
 ```bash
 uv pip install -e ".[test]"  # with uv
