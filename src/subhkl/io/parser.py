@@ -210,20 +210,6 @@ def finder(
             "assumes a single constant variance across the frame."
         ),
     ] = "poisson",
-    sparse_rbf_legacy: Annotated[
-        bool,
-        typer.Option(
-            help="Use the original greedy matching-pursuit sparse-RBF finder "
-            "instead of the global basis-pursuit one. Opt-out for the new "
-            "default; the greedy path is scheduled for removal."
-        ),
-    ] = False,
-    sparse_rbf_auto_tune_alpha: Annotated[
-        bool, typer.Option(help="Auto-tune SNR threshold.")
-    ] = False,
-    sparse_rbf_candidate_alphas: Annotated[
-        str, typer.Option(help="Candidate SNR thresholds alpha for auto-tuning")
-    ] = "3.0,5.0,10.0,15.0,20.0,25.0,30.0",
     max_workers: int = 16,
     multi_gpu: Annotated[
         bool,
@@ -290,9 +276,6 @@ def finder(
         sparse_rbf_false_alarms_per_image=sparse_rbf_false_alarms_per_image,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
-        sparse_rbf_legacy=sparse_rbf_legacy,
-        sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
-        sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
         max_workers=max_workers,
         multi_gpu=multi_gpu,
         static_mask_file=static_mask_file,

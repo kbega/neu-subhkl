@@ -961,9 +961,6 @@ def run_finder(
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
     sparse_rbf_loss: str = "poisson",
-    sparse_rbf_legacy: bool = False,
-    sparse_rbf_auto_tune_alpha: bool = False,
-    sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",
     max_workers: int = 16,
     multi_gpu: bool = False,
     static_mask_file: str | None = None,
@@ -997,9 +994,6 @@ def run_finder(
             }
         )
     elif finder_algorithm == "sparse_rbf":
-        # Because we separated Typer from core logic, this split is 100% safe
-        alpha_list = [float(k.strip()) for k in sparse_rbf_candidate_alphas.split(",")]
-
         peak_kwargs.update(
             {
                 "alpha": sparse_rbf_alpha,
@@ -1019,9 +1013,6 @@ def run_finder(
                 "show_scale": "linear",
                 "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
                 "loss": sparse_rbf_loss,
-                "legacy": sparse_rbf_legacy,
-                "auto_tune_alpha": sparse_rbf_auto_tune_alpha,
-                "candidate_alphas": alpha_list,
             }
         )
     else:
