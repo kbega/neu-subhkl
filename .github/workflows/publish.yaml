@@ -47,7 +47,11 @@ jobs:
         # Safely handles if GITHUB_REF points to a branch instead of a tag
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            CLEAN_VERSION="${GITHUB_REF#refs/tags/}"
+            # Strip the refs/tags/ prefix first
+            RAW_VERSION="${GITHUB_REF#refs/tags/}"
+
+            # Strip a leading 'v' if it exists
+            CLEAN_VERSION="${RAW_VERSION#v}"
           else
             CLEAN_VERSION="latest-manual"
           fi
