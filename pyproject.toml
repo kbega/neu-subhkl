@@ -17,6 +17,9 @@ dependencies = [
     "scipy>=1.17.1",
 ]
 
+[project.urls]
+Repository = "https://github.com/neutrons/subhkl"
+
 license = { text = "GPL3.0" }
 
 [build-system]

@@ -1,7 +1,9 @@
 # subhkl
 Solving crystal orientation from 2D Laue diffraction images
 
-![subhkl logo](docs/subhkl_logo.png)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/neutrons/subhkl/main/docs/subhkl_logo.png" alt="subhkl logo">
+</p>
 
 ---
 
