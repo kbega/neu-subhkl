@@ -57,6 +57,35 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
                 print(f"Successfully applied calibration to {count} detector panels.")
 
 
+def _file_frame_run_map(
+    angles: np.ndarray, n_axes: int, file_offsets: np.ndarray
+) -> tuple[bool, np.ndarray]:
+    """Frame layout and frame -> run map for a peaks file's own angles.
+
+    The optimizer's internal angle array cannot index the file being
+    written: columns that are all identical collapse to one and re-tile
+    only up to the last peak-bearing image, so its frame count falls
+    short of the file's whenever trailing images carry no peaks
+    (guaranteed in single-run files, where every frame shares one angle
+    setting).  Corrections therefore address the file's frames
+    directly: layout is decided by which dimension spans the goniometer
+    axes (square arrays take the writer's frame-first convention), and
+    the map is rebuilt from the run boundaries in ``file_offsets``.
+    """
+    angles = np.asarray(angles)
+    if angles.ndim != 2 or n_axes not in angles.shape:
+        raise ValueError(
+            f"goniometer/angles shape {angles.shape} does not span "
+            f"{n_axes} goniometer axes"
+        )
+    frame_first = angles.shape[1] == n_axes
+    n_frames = angles.shape[0] if frame_first else angles.shape[1]
+    frame_to_run = (
+        np.searchsorted(np.asarray(file_offsets), np.arange(n_frames), side="right") - 1
+    )
+    return frame_first, frame_to_run
+
+
 def run_index(
     peaks_h5_filename: str,
     output_peaks_filename: str,
@@ -758,8 +787,10 @@ def run_index(
                 for i, n in enumerate(names_axes)
                 if refine_goniometer_per_run.lower() in n.lower()
             ]
-            frame_first = ang.shape[0] == len(per_run_frame_map)
-            corr = delta[np.asarray(per_run_frame_map)]
+            frame_first, file_frame_map = _file_frame_run_map(
+                ang, len(names_axes), per_run_file_offsets
+            )
+            corr = delta[file_frame_map]
             safe_write(f, "goniometer/angles_nominal", ang)
             for col in axis_cols:
                 if frame_first:
@@ -773,7 +804,7 @@ def run_index(
             grp = f.create_group(grp_name)
             grp["motor"] = refine_goniometer_per_run
             grp["delta_deg"] = delta
-            grp["frame_to_run"] = np.asarray(per_run_frame_map, dtype=np.int32)
+            grp["frame_to_run"] = np.asarray(file_frame_map, dtype=np.int32)
             if per_run_files is not None:
                 grp["run_files"] = np.array(per_run_files, dtype="S")
             if per_run_file_offsets is not None:
@@ -793,7 +824,11 @@ def run_index(
                 del grp["trans_m"]
             grp["trans_m"] = np.asarray(opt.goniometer_per_run_trans)
             if "frame_to_run" not in grp:
-                grp["frame_to_run"] = np.asarray(per_run_frame_map, dtype=np.int32)
+                ang = np.asarray(f["goniometer/angles"][()], dtype=float)
+                _, file_frame_map = _file_frame_run_map(
+                    ang, len(f["goniometer/names"]), per_run_file_offsets
+                )
+                grp["frame_to_run"] = np.asarray(file_frame_map, dtype=np.int32)
             if "run_files" not in grp and per_run_files is not None:
                 grp["run_files"] = np.array(per_run_files, dtype="S")
 

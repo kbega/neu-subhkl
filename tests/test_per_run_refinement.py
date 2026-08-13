@@ -113,3 +113,63 @@ def test_frame_map_is_required():
     _, objective, _, _, _, _ = _make_fixture()
     with pytest.raises(ValueError, match="per_run_frame_map"):
         objective(per_run_motor_index=0)
+
+
+# --- Write-back of the corrections into the output peaks file ---
+#
+# The optimizer's internal angle array cannot index the file being
+# written: identical columns collapse to one and re-tile only up to the
+# last peak-bearing image.  A single-run file (force_mode single) makes
+# the collapse certain -- every frame shares one angle setting -- and
+# any trailing peakless image then truncates the re-tiled array below
+# the file's frame count, so a map built from the optimizer's shape
+# can neither index the file nor be told apart from an axis-first
+# layout (cg4d-l1-mbl: angles (56, 5), optimizer 49-55 frames, all ten
+# runs crashed).  _file_frame_run_map rebuilds the map from the file's
+# own layout instead.
+
+
+def test_writeback_map_covers_all_file_frames_not_just_peak_bearing_ones():
+    from subhkl.commands import _file_frame_run_map
+
+    ang = np.tile([90.0, 45.0, 0.0, 45.0, 0.0], (56, 1))  # one run, 56 images
+    frame_first, frame_to_run = _file_frame_run_map(ang, 5, np.array([0]))
+    assert frame_first
+    assert len(frame_to_run) == 56
+    np.testing.assert_array_equal(frame_to_run, 0)
+
+
+def test_writeback_map_follows_run_boundaries_in_joint_files():
+    from subhkl.commands import _file_frame_run_map
+
+    ang = np.zeros((60, 5))
+    frame_first, frame_to_run = _file_frame_run_map(ang, 5, np.array([0, 20, 40]))
+    assert frame_first
+    np.testing.assert_array_equal(frame_to_run, np.repeat([0, 1, 2], 20))
+
+
+def test_writeback_detects_axis_first_layout():
+    from subhkl.commands import _file_frame_run_map
+
+    ang = np.zeros((5, 56))
+    frame_first, frame_to_run = _file_frame_run_map(ang, 5, np.array([0]))
+    assert not frame_first
+    assert len(frame_to_run) == 56
+
+
+def test_writeback_square_array_takes_the_frame_first_convention():
+    from subhkl.commands import _file_frame_run_map
+
+    ang = np.zeros((5, 5))
+    frame_first, frame_to_run = _file_frame_run_map(ang, 5, np.array([0]))
+    assert frame_first
+    assert len(frame_to_run) == 5
+
+
+def test_writeback_rejects_angles_that_span_no_axis_dimension():
+    from subhkl.commands import _file_frame_run_map
+
+    with pytest.raises(ValueError, match="does not span"):
+        _file_frame_run_map(np.zeros((3, 4)), 5, np.array([0]))
+    with pytest.raises(ValueError, match="does not span"):
+        _file_frame_run_map(np.zeros(5), 5, np.array([0]))
