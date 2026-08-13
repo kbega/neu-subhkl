@@ -922,31 +922,14 @@ def run_finder(
     filename: str,
     instrument: str,
     output_filename: str = "output.h5",
-    finder_algorithm: str = "peak_local_max",
+    finder_algorithm: str = "sparse_rbf",
     show_progress: bool = True,
     create_visualizations: bool = False,
     show_steps: bool = False,
-    peak_local_max_min_pixel_distance: int = -1,
-    peak_local_max_min_relative_intensity: float = -1,
-    peak_local_max_normalization: bool = False,
     mask_file: str | None = None,
     mask_rel_erosion_radius: float | None = None,
-    thresholding_noise_cutoff_quantile: float = 0.8,
-    thresholding_min_peak_dist_pixels: float = 8.0,
-    thresholding_blur_kernel_sigma: int = 5,
-    thresholding_open_kernel_size_pixels: int = 3,
     wavelength_min: float | None = None,
     wavelength_max: float | None = None,
-    region_growth_distance_threshold: float = 1.5,
-    region_growth_minimum_sigma: float | None = None,
-    region_growth_minimum_intensity: float = 4500.0,
-    region_growth_maximum_pixel_radius: float = 17.0,
-    peak_center_box_size: int = 15,
-    peak_smoothing_window_size: int = 15,
-    peak_minimum_pixels: int = 30,
-    peak_minimum_signal_to_noise: float = 1.0,
-    peak_pixel_outlier_threshold: float = 2.0,
-    hull_filter: bool = True,
     sparse_rbf_alpha: float | None = None,
     sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
@@ -975,48 +958,33 @@ def run_finder(
 
     peaks = Peaks(filename, instrument, **wavelength_kwargs)
 
+    if finder_algorithm != "sparse_rbf":
+        raise ValueError(
+            f"Unknown finder algorithm: {finder_algorithm!r} (peak_local_max "
+            "and thresholding retired with the convex-hull stage)"
+        )
     peak_kwargs = {"algorithm": finder_algorithm}
-    if finder_algorithm == "peak_local_max":
-        if peak_local_max_min_pixel_distance > 0:
-            peak_kwargs["min_pix"] = peak_local_max_min_pixel_distance
-        if peak_local_max_min_relative_intensity > 0:
-            peak_kwargs["min_rel_intensity"] = peak_local_max_min_relative_intensity
-        peak_kwargs["normalize"] = peak_local_max_normalization
-    elif finder_algorithm == "thresholding":
-        peak_kwargs.update(
-            {
-                "noise_cutoff_quantile": thresholding_noise_cutoff_quantile,
-                "min_peak_dist_pixels": thresholding_min_peak_dist_pixels,
-                "blur_kernel_sigma": thresholding_blur_kernel_sigma,
-                "open_kernel_size_pixels": thresholding_open_kernel_size_pixels,
-                "show_steps": show_steps,
-                "show_scale": "log",
-            }
-        )
-    elif finder_algorithm == "sparse_rbf":
-        peak_kwargs.update(
-            {
-                "alpha": sparse_rbf_alpha,
-                "gamma": sparse_rbf_gamma,
-                "min_sigma": sparse_rbf_min_sigma,
-                "max_sigma": sparse_rbf_max_sigma,
-                "num_sigmas": sparse_rbf_num_sigmas,
-                "false_alarms_per_image": sparse_rbf_false_alarms_per_image,
-                "max_fragmentation_rate": sparse_rbf_max_fragmentation_rate,
-                "profile_file": sparse_rbf_profile_file,
-                "shape_ratio": sparse_rbf_shape_ratio,
-                "shape_orientations": sparse_rbf_shape_orientations,
-                "chunk_size": sparse_rbf_chunk_size,
-                "multi_gpu": multi_gpu,
-                "static_mask_file": static_mask_file,
-                "show_steps": show_steps,
-                "show_scale": "linear",
-                "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
-                "loss": sparse_rbf_loss,
-            }
-        )
-    else:
-        raise ValueError("Invalid finder algorithm")
+    peak_kwargs.update(
+        {
+            "alpha": sparse_rbf_alpha,
+            "gamma": sparse_rbf_gamma,
+            "min_sigma": sparse_rbf_min_sigma,
+            "max_sigma": sparse_rbf_max_sigma,
+            "num_sigmas": sparse_rbf_num_sigmas,
+            "false_alarms_per_image": sparse_rbf_false_alarms_per_image,
+            "max_fragmentation_rate": sparse_rbf_max_fragmentation_rate,
+            "profile_file": sparse_rbf_profile_file,
+            "shape_ratio": sparse_rbf_shape_ratio,
+            "shape_orientations": sparse_rbf_shape_orientations,
+            "chunk_size": sparse_rbf_chunk_size,
+            "multi_gpu": multi_gpu,
+            "static_mask_file": static_mask_file,
+            "show_steps": show_steps,
+            "show_scale": "linear",
+            "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
+            "loss": sparse_rbf_loss,
+        }
+    )
 
     peak_kwargs.update(
         {
@@ -1025,25 +993,9 @@ def run_finder(
         }
     )
 
-    integration_params = {
-        "region_growth_distance_threshold": region_growth_distance_threshold,
-        "region_growth_minimum_sigma": region_growth_minimum_sigma,
-        "region_growth_minimum_intensity": region_growth_minimum_intensity,
-        "region_growth_maximum_pixel_radius": region_growth_maximum_pixel_radius,
-        "peak_center_box_size": peak_center_box_size,
-        "peak_smoothing_window_size": peak_smoothing_window_size,
-        "peak_minimum_pixels": peak_minimum_pixels,
-        "peak_minimum_signal_to_noise": peak_minimum_signal_to_noise,
-        "peak_pixel_outlier_threshold": peak_pixel_outlier_threshold,
-        # Consumed directly by the harvest worker, not by
-        # PeakIntegrator.build_from_dictionary, like
-        # region_growth_minimum_sigma above it.
-        "hull_filter": hull_filter,
-    }
-
     detector_peaks = peaks.get_detector_peaks(
         peak_kwargs,
-        integration_params,
+        {},
         visualize=create_visualizations,
         show_progress=show_progress,
         file_prefix=filename,
@@ -1070,17 +1022,11 @@ def run_finder(
     with h5py.File(output_filename, "a") as f:
         f.attrs["finder_algorithm"] = finder_algorithm
 
-        # `peaks/sigma` means different things depending on who filled it: the
-        # sparse-RBF finder writes its per-peak Gaussian width in pixels, every
-        # other path writes the uncertainty on the intensity.  Only the first
-        # describes how big a peak is on the detector, so say which one this
-        # is rather than leaving a reader to guess from a bare number.
+        # peaks/sigma is the finder's per-peak Gaussian width in pixels
+        # (the finder measures no intensity, so no intensity sigma exists
+        # to confuse it with); say so explicitly for readers.
         if "peaks/sigma" in f:
-            f["peaks/sigma"].attrs["quantity"] = (
-                replay.WIDTH_QUANTITY
-                if finder_algorithm == "sparse_rbf"
-                else "intensity_sigma"
-            )
+            f["peaks/sigma"].attrs["quantity"] = replay.WIDTH_QUANTITY
 
         with h5py.File(filename, "r") as f_in:
             for key in copy_keys:
@@ -1458,143 +1404,6 @@ def run_rbf_integrator(
                     f_in.copy(f_in[k], f, k)
 
 
-def run_integrator(
-    filename: str,
-    instrument: str,
-    integration_peaks_filename: str,
-    output_filename: str,
-    integration_method: str = "free_fit",
-    integration_mask_file: str | None = None,
-    integration_mask_rel_erosion_radius: float | None = 0.05,
-    region_growth_distance_threshold: float = 1.5,
-    region_growth_minimum_intensity: float = 50.0,
-    region_growth_minimum_sigma: float | None = None,
-    region_growth_maximum_pixel_radius: float = 17.0,
-    peak_center_box_size: int = 15,
-    peak_smoothing_window_size: int = 15,
-    peak_minimum_pixels: int = 10,
-    peak_minimum_signal_to_noise: float = 1.0,
-    peak_pixel_outlier_threshold: float = 2.0,
-    create_visualizations: bool = False,
-    show_progress: bool = True,
-    found_peaks_file: str | None = None,
-    max_workers: int = 16,
-):
-    apply_detector_calibration(integration_peaks_filename, instrument)
-
-    peak_dict = {}
-    angles_stack = None
-    all_R = None
-    with h5py.File(integration_peaks_filename, "r") as f:
-        U = f["sample/U"][()] if "sample/U" in f else None
-        B = f["sample/B"][()] if "sample/B" in f else None
-        all_R = f["goniometer/R"][()] if "goniometer/R" in f else None
-        angles_stack = f["goniometer/angles"][()] if "goniometer/angles" in f else None
-        sample_offset = (
-            f["goniometer/translations"][()]
-            if "goniometer/translations" in f
-            else np.zeros(3)
-        )
-        ki_vec = (
-            f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
-        )
-
-        for key in f["banks"].keys():
-            img_idx = int(key)
-            grp = f[f"banks/{key}"]
-            peak_dict[img_idx] = [
-                grp["i"][()],
-                grp["j"][()],
-                grp["h"][()],
-                grp["k"][()],
-                grp["l"][()],
-                grp["wavelength"][()],
-            ]
-
-    peaks = Peaks(filename, instrument)
-
-    integration_params = {
-        "region_growth_distance_threshold": region_growth_distance_threshold,
-        "region_growth_minimum_intensity": region_growth_minimum_intensity,
-        "region_growth_minimum_sigma": region_growth_minimum_sigma,
-        "region_growth_maximum_pixel_radius": region_growth_maximum_pixel_radius,
-        "peak_center_box_size": peak_center_box_size,
-        "peak_smoothing_window_size": peak_smoothing_window_size,
-        "peak_minimum_pixels": peak_minimum_pixels,
-        "peak_minimum_signal_to_noise": peak_minimum_signal_to_noise,
-        "peak_pixel_outlier_threshold": peak_pixel_outlier_threshold,
-        "integration_mask_file": integration_mask_file,
-        "integration_mask_rel_erosion_radius": integration_mask_rel_erosion_radius,
-    }
-
-    if all_R is None:
-        print("Warning: Refined R stack not found in prediction file. Using nominal.")
-        all_R = peaks.goniometer.rotation
-
-    if angles_stack is None:
-        angles_stack = peaks.goniometer.angles_raw
-
-    UB = U @ B if U is not None and B is not None else None
-    RUB = None
-    if UB is not None:
-        RUB = np.matmul(all_R, UB) if all_R.ndim == 3 else all_R @ UB
-
-    result = peaks.integrate(
-        peak_dict,
-        integration_params,
-        RUB=RUB,
-        R_stack=all_R,
-        angles_stack=angles_stack,
-        sample_offset=sample_offset,
-        ki_vec=ki_vec,
-        create_visualizations=create_visualizations,
-        show_progress=show_progress,
-        integration_method=integration_method,
-        file_prefix=filename,
-        found_peaks_file=found_peaks_file,
-        max_workers=max_workers,
-    )
-
-    print(f"Saving integrated peaks to {output_filename}")
-
-    copy_keys = [
-        "sample/a",
-        "sample/b",
-        "sample/c",
-        "sample/alpha",
-        "sample/beta",
-        "sample/gamma",
-        "sample/space_group",
-        "sample/U",
-        "sample/B",
-        "goniometer/translations",
-        "beam/ki_vec",
-        "instrument/wavelength",
-    ]
-
-    with h5py.File(output_filename, "w") as f:
-        f["peaks/h"], f["peaks/k"], f["peaks/l"] = result.h, result.k, result.l
-        f["peaks/lambda"] = result.wavelength
-        f["peaks/intensity"], f["peaks/sigma"] = result.intensity, result.sigma
-        f["peaks/two_theta"], f["peaks/azimuthal"] = result.tt, result.az
-        f["peaks/bank"] = result.bank
-        f["peaks/run_index"] = result.run_id
-        f["peaks/xyz"] = result.xyz
-
-        if result.R and any(r is not None for r in result.R):
-            f["goniometer/R"] = np.array(result.R)
-        if result.angles and any(a is not None for a in result.angles):
-            f["goniometer/angles"] = np.array(result.angles)
-
-        with h5py.File(integration_peaks_filename, "r") as f_in:
-            for key in copy_keys:
-                if key in f_in:
-                    f_in.copy(f_in[key], f, key)
-            for k in ["goniometer/axes", "goniometer/names"]:
-                if k in f_in:
-                    f_in.copy(f_in[k], f, k)
-
-
 def run_mtz_exporter(
     indexed_h5_filename: str,
     output_mtz_filename: str,
@@ -1803,7 +1612,12 @@ def run_zone_axis_search(
 
     with h5py.File(peaks_h5_filename, "r") as f_peaks:
         peaks_xyz = f_peaks["peaks/xyz"][()]
-        peaks_intensity = f_peaks["peaks/intensity"][()]
+        # The finder reports no amplitude; rays weight equally without one.
+        peaks_intensity = (
+            f_peaks["peaks/intensity"][()]
+            if "peaks/intensity" in f_peaks
+            else np.ones(len(peaks_xyz))
+        )
 
         # CRITICAL: image_index maps 1:1 to the N_banks dimension of R_stack in merged.h5
         if "peaks/image_index" in f_peaks:

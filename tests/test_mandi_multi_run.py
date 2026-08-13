@@ -17,23 +17,7 @@ WAVELENGTH = [2.0, 4.5]
 
 FINDER_PARAMS = [
     "--finder-algorithm",
-    "thresholding",
-    "--thresholding-noise-cutoff-quantile",
-    "0.99",
-    "--region-growth-minimum-intensity",
-    "3.0",
-    "--region-growth-maximum-pixel-radius",
-    "12.0",
-    "--peak-center-box-size",
-    "3",
-    "--peak-smoothing-window-size",
-    "5",
-    "--peak-minimum-pixels",
-    "40",
-    "--peak-minimum-signal-to-noise",
-    "0.0",
-    "--peak-pixel-outlier-threshold",
-    "4.0",
+    "sparse_rbf",
 ]
 
 

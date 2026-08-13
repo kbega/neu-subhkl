@@ -294,12 +294,7 @@ def _gaussian_frame(
 
 
 def _run_finder(images, peaks, algorithm, create_visualizations=False, **extra):
-    """Run the real finder, told not to draw anything unless asked.
-
-    The integration defaults are tuned for real frames; a single narrow
-    synthetic spot needs the same failsafes `test_finder_integration` passes,
-    or the hull stage discards it and there is nothing left to plot.
-    """
+    """Run the real finder, told not to draw anything unless asked."""
     finder(
         filename=str(images),
         instrument=INSTRUMENT,
@@ -307,11 +302,6 @@ def _run_finder(images, peaks, algorithm, create_visualizations=False, **extra):
         finder_algorithm=algorithm,
         create_visualizations=create_visualizations,
         show_progress=False,
-        peak_local_max_min_relative_intensity=0.5,
-        peak_local_max_min_pixel_distance=5,
-        region_growth_minimum_intensity=20.0,
-        peak_minimum_pixels=1,
-        peak_minimum_signal_to_noise=2.0,
         **extra,
     )
 
@@ -340,7 +330,7 @@ def test_a_finder_run_can_be_replayed_afterwards(tmp_path):
     )
     peaks = tmp_path / "found.h5"
 
-    _run_finder(images, peaks, "peak_local_max")
+    _run_finder(images, peaks, "sparse_rbf")
 
     with h5py.File(peaks, "r") as f:
         assert len(f["peaks/pixel_r"]) > 0
@@ -358,20 +348,23 @@ def test_a_finder_run_can_be_replayed_afterwards(tmp_path):
 
 
 def test_a_finder_run_records_which_algorithm_found_the_peaks(tmp_path):
-    """`peaks/sigma` only means a width for one of the finders, so say which."""
+    """The output says who found the peaks and what peaks/sigma means.
+
+    With the legacy harvesters retired there is exactly one finder and
+    its sigma column is always a width -- but the attributes stay, so a
+    reader never has to know the history to interpret a file."""
     images = _write_single_frame(
         tmp_path / "images.h5", _gaussian_frame((128.0, 128.0))
     )
     peaks = tmp_path / "found.h5"
 
-    _run_finder(images, peaks, "peak_local_max")
+    _run_finder(images, peaks, "sparse_rbf")
 
     with h5py.File(peaks, "r") as f:
-        assert f.attrs["finder_algorithm"] == "peak_local_max"
-        assert f["peaks/sigma"].attrs["quantity"] == "intensity_sigma"
-
-    # ... and with no width recorded, no size is invented for the plot.
-    assert replay.read_peaks_table(peaks).peaks.var_u is None
+        assert f.attrs["finder_algorithm"] == "sparse_rbf"
+        assert f["peaks/sigma"].attrs["quantity"] == replay.WIDTH_QUANTITY
+        # The finder reports no amplitude: intensity is the integrator's.
+        assert "peaks/intensity" not in f
 
 
 @pytest.mark.slow
@@ -591,17 +584,9 @@ _WORKER_DET = {
     "panel": "flat",
 }
 
-_WORKER_PARAMS = {
-    "peak_center_box_size": 3,
-    "peak_smoothing_window_size": 3,
-    "peak_minimum_pixels": 3,
-    "peak_minimum_signal_to_noise": 0.0,
-    "peak_pixel_outlier_threshold": 4.0,
-    "region_growth_distance_threshold": 1.5,
-    "region_growth_minimum_intensity": 20.0,
-    "region_growth_maximum_pixel_radius": 5.0,
-    "region_growth_minimum_sigma": None,
-}
+# The harvest worker takes no integration options since the convex-hull
+# stage retired; the argument slot remains for API stability.
+_WORKER_PARAMS = {}
 
 
 def _harvest(finder_info):
@@ -650,7 +635,7 @@ def test_the_finder_reports_widths_under_a_name_that_means_one_thing():
 
 
 def test_a_finder_that_fits_no_width_reports_none():
-    res = _harvest(("peak_local_max", {"min_pix": 3, "min_rel_intensity": 0.5}, None))
+    res = _harvest(("sparse_rbf", {}, (np.array([20.0]), np.array([20.0]))))
 
     assert res["width"] is None
     # `sigma` is still populated -- with an intensity uncertainty, which is why
@@ -661,7 +646,7 @@ def test_a_finder_that_fits_no_width_reports_none():
 def test_the_inline_finder_plot_still_works_without_widths(tmp_path):
     """Regression guard: the finder draws its own plot for every algorithm.
 
-    `peak_local_max` fits no width, so the plot falls back to plain markers
+    A finder payload without widths falls back to plain markers
     rather than failing to find a size to draw.
     """
     images = _write_single_frame(
@@ -669,6 +654,6 @@ def test_the_inline_finder_plot_still_works_without_widths(tmp_path):
     )
     peaks = tmp_path / "found.h5"
 
-    _run_finder(images, peaks, "peak_local_max", create_visualizations=True)
+    _run_finder(images, peaks, "sparse_rbf", create_visualizations=True)
 
     assert (tmp_path / "img0-found.png").stat().st_size > 0

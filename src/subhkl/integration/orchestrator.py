@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, astuple
 import numpy as np
 from typing import List, Any, Optional, Dict, Tuple
@@ -25,7 +24,8 @@ class DetectorPeaks:
     az_phi: List[float]
     wavelength_mins: List[float]
     wavelength_maxes: List[float]
-    intensity: List[float]
+    # No intensity: the finder reports positions, shape and validation
+    # metrics; amplitude measurement belongs to the integrator.
     sigma: List[float]
     radii: List[float]
     xyz: List[List[float]]
@@ -46,31 +46,6 @@ class DetectorPeaks:
     # width was measured, which is the difference from `sigma` above: that one
     # always holds a number, but only sometimes a width.
     width: Optional[List[float]] = None
-
-    def __iter__(self):
-        """Allows tuple unpacking"""
-        return iter(astuple(self))
-
-    def __getitem__(self, index):
-        """Allows index access"""
-        return astuple(self)[index]
-
-
-@dataclass(frozen=True)
-class IntegrationResult:
-    h: List[float]
-    k: List[float]
-    l: List[float]
-    intensity: List[float]
-    sigma: List[float]
-    tt: List[float]
-    az: List[float]
-    wavelength: List[float]
-    bank: List[int]
-    run_id: List[int]
-    xyz: List[List[float]]
-    R: List[Any]
-    angles: List[List[float]]
 
     def __iter__(self):
         """Allows tuple unpacking"""
@@ -385,170 +360,6 @@ def prepare_predict_tasks(
                 gonio_axes,
                 angles_bank,
                 gonio_offsets,  # <-- NEW
-            )
-        )
-    return tasks
-
-
-def prepare_integrate_tasks(
-    image: ImageData,
-    filename: str,
-    instrument: str,
-    peak_dict: Dict[str, List[Any]],
-    integration_params: Dict[str, Any],
-    RUB: np.ndarray,
-    R_stack: Optional[np.ndarray] = None,
-    angles_stack: Optional[np.ndarray] = None,
-    sample_offset: Optional[np.ndarray] = None,
-    ki_vec: Optional[np.ndarray] = None,
-    integration_method: str = "free_fit",
-    create_visualizations: bool = False,
-    show_progress: bool = False,
-    found_peaks_file: Optional[str] = None,
-) -> List[Tuple[Any, ...]]:
-    found_peaks_xyz = None
-    found_peaks_bank = None
-    found_peaks_run = None
-    if found_peaks_file is not None:
-        try:
-            import h5py
-
-            print(f"Loading found peaks from: {found_peaks_file}")
-            with h5py.File(found_peaks_file, "r") as f:
-                if "files" in f and "file_offsets" in f and "peaks/xyz" in f:
-                    files_db = f["files"][()]
-                    offsets = f["file_offsets"][()]
-                    target_name = os.path.basename(filename)
-                    match_idxs = []
-                    # 1. Direct match
-                    for i, fname_bytes in enumerate(files_db):
-                        fname_str = (
-                            fname_bytes.decode("utf-8")
-                            if isinstance(fname_bytes, bytes)
-                            else str(fname_bytes)
-                        )
-                        if target_name in fname_str:
-                            match_idxs.append(i)
-
-                    # 2. Match via source files (if is a merged master)
-                    if not match_idxs and image.raw_files:
-                        for src_file in image.raw_files:
-                            src_name = os.path.basename(src_file)
-                            for i, fname_bytes in enumerate(files_db):
-                                fname_str = (
-                                    fname_bytes.decode("utf-8")
-                                    if isinstance(fname_bytes, bytes)
-                                    else str(fname_bytes)
-                                )
-                                if src_name == os.path.basename(fname_str):
-                                    if i not in match_idxs:
-                                        match_idxs.append(i)
-
-                    if match_idxs:
-                        # Load and concatenate from all matched indices
-                        xyz_list = []
-                        bank_list = []
-                        run_list = []
-                        for idx in match_idxs:
-                            start = int(offsets[idx])
-                            end = (
-                                int(offsets[idx + 1])
-                                if idx < len(files_db) - 1
-                                else f["peaks/xyz"].shape[0]
-                            )
-                            xyz_list.append(f["peaks/xyz"][start:end])
-                            if "bank" in f:
-                                bank_list.append(f["bank"][start:end])
-                            elif "peaks/bank" in f:
-                                bank_list.append(f["peaks/bank"][start:end])
-
-                            if "peaks/run_index" in f:
-                                run_list.append(f["peaks/run_index"][start:end])
-
-                        found_peaks_xyz = (
-                            np.concatenate(xyz_list, axis=0) if xyz_list else None
-                        )
-                        found_peaks_bank = (
-                            np.concatenate(bank_list, axis=0) if bank_list else None
-                        )
-                        found_peaks_run = (
-                            np.concatenate(run_list, axis=0) if run_list else None
-                        )
-                elif "peaks/xyz" in f:
-                    found_peaks_xyz = f["peaks/xyz"][()]
-                    if "bank" in f:
-                        found_peaks_bank = f["bank"][()]
-                    elif "peaks/bank" in f:
-                        found_peaks_bank = f["peaks/bank"][()]
-                    if "peaks/run_index" in f:
-                        found_peaks_run = f["peaks/run_index"][()]
-        except Exception as e:
-            print(f"Failed to load found peaks: {e}")
-
-    tasks = []
-    os.path.basename(filename)
-
-    sorted_keys = sorted(peak_dict.keys())
-    if not sorted_keys:
-        return []
-
-    total_images = len(sorted_keys)
-
-    def _resolve(stack, seq_idx, name):
-        if stack is None:
-            return None
-
-        is_batch = (stack.ndim == 3) or (stack.ndim == 2 and name == "angles_stack")
-        if not is_batch:
-            return stack
-
-        n_items = stack.shape[0]
-        if n_items == 1:
-            return stack[0]
-
-        if n_items == total_images:
-            return stack[seq_idx]
-
-        raise ValueError(
-            f"CRITICAL: Array dimension mismatch for '{name}'. "
-            f"The stack contains {n_items} matrices, but there are {total_images} images scheduled. "
-            f"Run index fallback is strictly disabled."
-        )
-
-    for _i, bank in enumerate(sorted_keys):
-        peaks = peak_dict[bank]
-        physical_bank = image.bank_mapping.get(bank, bank)
-        det_config = beamlines[instrument][str(physical_bank)]
-
-        current_rub = _resolve(RUB, _i, "RUB")
-        current_R_val = _resolve(R_stack, _i, "R_stack")
-        current_angles_val = _resolve(angles_stack, _i, "angles_stack")
-
-        # The physical run_id can still be safely fetched for metadata logging
-        run_id = image.get_run_id(bank)
-
-        metrics_info = (
-            found_peaks_xyz,
-            found_peaks_bank,
-            found_peaks_run,
-            run_id,
-            current_rub,
-            current_angles_val,
-            current_R_val,
-            sample_offset,
-            ki_vec,
-        )
-
-        tasks.append(
-            (
-                bank,
-                physical_bank,
-                image.ims[bank],
-                peaks,
-                det_config,
-                integration_params,
-                integration_method,
-                metrics_info,
             )
         )
     return tasks

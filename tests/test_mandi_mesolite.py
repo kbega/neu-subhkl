@@ -45,14 +45,7 @@ SPACE_GROUP = "F d d 2"
 
 # Integration parameters (from bash script)
 FINDER_PARAMS = {
-    "finder_algorithm": "thresholding",
-    "thresholding_noise_cutoff_quantile": 0.99,
-    "region_growth_minimum_intensity": 25.0,
-    "region_growth_maximum_pixel_radius": 6.0,
-    "peak_center_box_size": 3,
-    "peak_smoothing_window_size": 5,
-    "peak_minimum_pixels": 40,
-    "peak_minimum_signal_to_noise": 4.0,
+    "finder_algorithm": "sparse_rbf",
 }
 
 # Indexer parameters with explicit values for all typer.Option parameters

@@ -15,7 +15,6 @@ from subhkl.commands import (
     run_finder,
     run_metrics,
     run_peak_predictor,
-    run_integrator,
     run_mtz_exporter,
     run_reduce,
     run_merge_images,
@@ -72,44 +71,21 @@ def finder(
     filename: Annotated[str, typer.Argument(help="Input raw/event Nexus file")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
     output_filename: str = "output.h5",
-    finder_algorithm: str = "peak_local_max",
+    finder_algorithm: Annotated[
+        str,
+        typer.Option(
+            help="Only 'sparse_rbf' remains: the peak_local_max and "
+            "thresholding harvesters retired with the convex-hull stage, "
+            "whose region-growing intensity they existed to seed."
+        ),
+    ] = "sparse_rbf",
     show_progress: bool = True,
     create_visualizations: bool = False,
     show_steps: bool = False,
-    peak_local_max_min_pixel_distance: int = -1,
-    peak_local_max_min_relative_intensity: float = -1,
-    peak_local_max_normalization: bool = False,
     mask_file: str | None = None,
     mask_rel_erosion_radius: float | None = None,
-    thresholding_noise_cutoff_quantile: float = 0.8,
-    thresholding_min_peak_dist_pixels: float = 8.0,
-    thresholding_blur_kernel_sigma: int = 5,
-    thresholding_open_kernel_size_pixels: int = 3,
     wavelength_min: float | None = None,
     wavelength_max: float | None = None,
-    region_growth_distance_threshold: float = 1.5,
-    region_growth_minimum_sigma: float | None = None,
-    region_growth_minimum_intensity: float = 4500.0,
-    region_growth_maximum_pixel_radius: float = 17.0,
-    peak_center_box_size: int = 15,
-    peak_smoothing_window_size: int = 15,
-    peak_minimum_pixels: int = 30,
-    peak_minimum_signal_to_noise: float = 1.0,
-    peak_pixel_outlier_threshold: float = 2.0,
-    hull_filter: Annotated[
-        bool,
-        typer.Option(
-            "--hull-filter/--no-hull-filter",
-            help=(
-                "Drop candidates the convex-hull stage cannot fit a region to. "
-                "On by default, where the hull acts as a true-positive filter "
-                "on the finder's output. Switch it off to report everything "
-                "the finder proposes, with an aperture intensity for the peaks "
-                "the hull stage rejects -- only sensible when the finder's own "
-                "per-peak metrics are trusted to do the filtering."
-            ),
-        ),
-    ] = True,
     sparse_rbf_alpha: Annotated[
         float | None,
         typer.Option(
@@ -243,27 +219,10 @@ def finder(
         show_progress=show_progress,
         create_visualizations=create_visualizations,
         show_steps=show_steps,
-        peak_local_max_min_pixel_distance=peak_local_max_min_pixel_distance,
-        peak_local_max_min_relative_intensity=peak_local_max_min_relative_intensity,
-        peak_local_max_normalization=peak_local_max_normalization,
         mask_file=mask_file,
         mask_rel_erosion_radius=mask_rel_erosion_radius,
-        thresholding_noise_cutoff_quantile=thresholding_noise_cutoff_quantile,
-        thresholding_min_peak_dist_pixels=thresholding_min_peak_dist_pixels,
-        thresholding_blur_kernel_sigma=thresholding_blur_kernel_sigma,
-        thresholding_open_kernel_size_pixels=thresholding_open_kernel_size_pixels,
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
-        region_growth_distance_threshold=region_growth_distance_threshold,
-        region_growth_minimum_sigma=region_growth_minimum_sigma,
-        region_growth_minimum_intensity=region_growth_minimum_intensity,
-        region_growth_maximum_pixel_radius=region_growth_maximum_pixel_radius,
-        peak_center_box_size=peak_center_box_size,
-        peak_smoothing_window_size=peak_smoothing_window_size,
-        peak_minimum_pixels=peak_minimum_pixels,
-        peak_minimum_signal_to_noise=peak_minimum_signal_to_noise,
-        peak_pixel_outlier_threshold=peak_pixel_outlier_threshold,
-        hull_filter=hull_filter,
         sparse_rbf_alpha=sparse_rbf_alpha,
         sparse_rbf_gamma=sparse_rbf_gamma,
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
@@ -895,54 +854,6 @@ def peak_predictor(
         space_group=space_group,
         max_workers=max_workers,
         create_visualizations=create_visualizations,
-    )
-
-
-@app.command()
-def integrator(
-    filename: str,
-    instrument: str,
-    integration_peaks_filename: str,
-    output_filename: str,
-    integration_method: str = "free_fit",
-    integration_mask_file: str | None = None,
-    integration_mask_rel_erosion_radius: float | None = None,
-    region_growth_distance_threshold: float = 1.5,
-    region_growth_minimum_intensity: float = 50.0,
-    region_growth_minimum_sigma: float | None = None,
-    region_growth_maximum_pixel_radius: float = 17.0,
-    peak_center_box_size: int = 15,
-    peak_smoothing_window_size: int = 15,
-    peak_minimum_pixels: int = 10,
-    peak_minimum_signal_to_noise: float = 1.0,
-    peak_pixel_outlier_threshold: float = 2.0,
-    ki_vec: str = typer.Option(None, "--ki-vec", help="Override incident beam vector"),
-    create_visualizations: bool = False,
-    show_progress: bool = True,
-    found_peaks_file: str | None = None,
-    max_workers: int = 16,
-):
-    run_integrator(
-        filename,
-        instrument,
-        integration_peaks_filename,
-        output_filename,
-        integration_method,
-        integration_mask_file,
-        integration_mask_rel_erosion_radius,
-        region_growth_distance_threshold,
-        region_growth_minimum_intensity,
-        region_growth_minimum_sigma,
-        region_growth_maximum_pixel_radius,
-        peak_center_box_size,
-        peak_smoothing_window_size,
-        peak_minimum_pixels,
-        peak_minimum_signal_to_noise,
-        peak_pixel_outlier_threshold,
-        create_visualizations,
-        show_progress,
-        found_peaks_file,
-        max_workers,
     )
 
 
