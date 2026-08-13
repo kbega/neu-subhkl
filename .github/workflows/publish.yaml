@@ -8,10 +8,6 @@ on:
 env:
   IMAGE_NAME: neutrons/subhkl
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   publish-pypi:
     name: Publish to PyPI
@@ -20,7 +16,8 @@ jobs:
       name: pypi
       url: https://pypi.org/p/subhkl
     permissions:
-      id-token: write
+      id-token: write # Required for PyPI Trusted Publishing
+      contents: read  # Required to check out code
     steps:
       - uses: actions/checkout@v4
       
@@ -41,6 +38,9 @@ jobs:
   publish-docker:
     name: Publish Docker image
     runs-on: ubuntu-latest
+    permissions:
+      packages: write # Required to push to GHCR
+      contents: read  # Required to check out code
     steps:
       - name: Download repo
         uses: actions/checkout@v4
