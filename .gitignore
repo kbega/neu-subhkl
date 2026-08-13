@@ -186,3 +186,9 @@ tools/
 *.swo
 *~
 .*.sw?
+
+#versioningit
+src/subhkl/_version.py
+
+# claude
+.claude

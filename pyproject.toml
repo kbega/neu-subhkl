@@ -2,6 +2,7 @@
 name = "subhkl"
 description = "Solving crystal orientation from Laue images"
 dynamic = ["version"]
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "h5py>=3.11.0",
@@ -40,7 +41,7 @@ rocm = [
 
 [tool.versioningit.vcs]
 method = "git"
-match = ["v*"]
+match = ["*"]
 default-tag = "0.0.1"
 
 [tool.versioningit.next-version]
