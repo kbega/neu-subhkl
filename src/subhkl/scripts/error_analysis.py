@@ -25,12 +25,6 @@ def analyze_errors(
     print(f"Total peaks : {len(h)}")
 
     # ----------------------------------------
-    # Build HKL labels
-    # ----------------------------------------
-
-    labels = [f"({hh},{kk},{ll})" for hh, kk, ll in zip(h, k, l)]
-
-    # ----------------------------------------
     # Plot ALL reflections
     # ----------------------------------------
 
