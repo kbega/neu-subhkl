@@ -9,6 +9,7 @@ from subhkl.integration import Peaks
 from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
 from subhkl.viz import detector_assembly, replay
+
 from typing import List
 
 
@@ -739,7 +740,7 @@ def run_finder(
     sparse_rbf_alpha: float | None = None,
     sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
-    sparse_rbf_max_sigma: float = 10.0,
+    sparse_rbf_max_sigma: float | None = None,
     sparse_rbf_num_sigmas: int | None = None,
     sparse_rbf_false_alarms_per_image: float = 1.0,
     sparse_rbf_max_fragmentation_rate: float = 1.0,
@@ -755,6 +756,7 @@ def run_finder(
     sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",
     max_workers: int = 16,
     multi_gpu: bool = False,
+    static_mask_file: str | None = None,
 ):
     print(f"Creating peaks from {filename} for instrument {instrument}")
 
@@ -802,6 +804,7 @@ def run_finder(
                 "shape_orientations": sparse_rbf_shape_orientations,
                 "chunk_size": sparse_rbf_chunk_size,
                 "multi_gpu": multi_gpu,
+                "static_mask_file": static_mask_file,
                 "show_steps": show_steps,
                 "show_scale": "linear",
                 "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
@@ -889,7 +892,7 @@ def run_metrics(
     file2: str | None = None,
     instrument: str | None = None,
     d_min: float | None = None,
-    per_peak: bool | None = None,
+    per_run: bool | None = None,
     per_run: bool = False,
     ki_vec: List[float] | np.ndarray = None,
 ):
@@ -902,8 +905,8 @@ def run_metrics(
         file2=file2,
         instrument=instrument,
         d_min=d_min,
-        per_run=per_run,
         per_peak=per_peak,
+        per_run=per_run,
         ki_vec_override=ki_vec,
     )
 
@@ -922,6 +925,7 @@ def run_metrics(
         f"{result['median_ang_err']:.5f} {result['mean_ang_err']:.5f} {result['max_ang_err']:.5f}"
     )
 
+    # Print per-run metrics if requested
     if per_run and "per_run_errors" in result:
         print("\nPER-RUN MEDIAN ANGULAR ERROR (deg) - Sorted by error:")
         for r, err, count in result["per_run_errors"]:
@@ -1789,6 +1793,130 @@ def run_integrator_visualize(
         output_dir=output_dir,
         dpi=dpi,
         n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written
+
+
+def run_static_mask(
+    output_filename: str,
+    input_filenames: list[str],
+    peaks_filenames: list[str] | None = None,
+    pooled_peaks_filename: str | None = None,
+    peak_deviance_min: float = 9.488,
+    peak_residual_max: float = 2.0,
+    peak_clear_nsigmas: float = 3.5,
+    min_frames: int = 5,
+    smooth_sigma: float = 2.0,
+    grad_nmads: float = 8.0,
+    texture_factor: float = 0.15,
+    wide_sigma: float = 20.0,
+    edge_sigma: float = 25.0,
+    dilate_px: int = 8,
+    static_quantile: float = 25.0,
+    grad_min_frac: float = 0.02,
+):
+    """Build a static-structure mask from reduced/merged frame stacks.
+
+    See subhkl.search.static_mask for the estimator; the output is itself a
+    reduced single-frame stack (1 = valid, 0 = masked, one frame per physical
+    bank), so any tool that reads reduced files can display it, and the
+    finder maps it onto its input by bank id (--static-mask-file).
+    """
+    from subhkl.search.static_mask import build_mask_file
+
+    summary = build_mask_file(
+        input_filenames,
+        output_filename,
+        peaks=peaks_filenames,
+        pooled_peaks=pooled_peaks_filename,
+        peak_deviance_min=peak_deviance_min,
+        peak_residual_max=peak_residual_max,
+        peak_clear_nsigmas=peak_clear_nsigmas,
+        min_frames=min_frames,
+        smooth_sigma=smooth_sigma,
+        grad_nmads=grad_nmads,
+        texture_factor=texture_factor,
+        wide_sigma=wide_sigma,
+        edge_sigma=edge_sigma,
+        dilate_px=dilate_px,
+        static_quantile=static_quantile,
+        grad_min_frac=grad_min_frac,
+    )
+    print(
+        f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "
+        f"{100 * summary['masked_fraction']:.2f}% of pixels masked."
+    )
+    if summary["thin_banks"]:
+        print(
+            f"Banks with fewer than {min_frames} distinct frames stay fully "
+            "valid: " + ", ".join(str(b) for b in summary["thin_banks"])
+        )
+    if summary.get("n_exonerated"):
+        print(
+            f"Exonerated {summary['n_exonerated']} metric-certified peak "
+            "footprint(s) from the static evidence."
+        )
+    if summary.get("n_exonerated_pooled"):
+        print(
+            f"Exonerated {summary['n_exonerated_pooled']} bank-level peak "
+            "footprint(s) certified by the pooled (summed-frame) fit."
+        )
+    if summary["duplicates_dropped"]:
+        n = sum(summary["duplicates_dropped"].values())
+        print(
+            f"WARNING: dropped {n} duplicate frame(s) (same goniometer "
+            "orientation or identical content).  The estimator needs the "
+            "sample to move between frames; repeats would promote true "
+            "signal into the mask."
+        )
+    return summary
+
+
+def run_sum_images(
+    output_filename: str,
+    input_filenames: list[str],
+):
+    """Sum each physical bank's deduplicated frames into a one-frame-per-bank
+    stack.
+
+    The companion of `static-mask`: a finder run on the summed stack sees the
+    pooled evidence exactly as the static-map quantile does, so quasi-static
+    reflections too faint for any single frame's certificate compound to
+    certification there (deviance is additive across frames).  Feed that
+    finder output back to `static-mask` as --pooled-peaks.
+    """
+    from subhkl.search.static_mask import build_summed_file
+
+    summary = build_summed_file(input_filenames, output_filename)
+    print(
+        f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "
+        f"{sum(summary['n_frames'].values())} frame(s) summed."
+    )
+    if summary["duplicates_dropped"]:
+        n = sum(summary["duplicates_dropped"].values())
+        print(f"Dropped {n} duplicate frame(s) before summing.")
+    return summary
+
+
+def run_mask_visualize(
+    images_filename: str,
+    mask_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 600,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Draw the static mask over the frames it applies to (`<label>-mask.png`)."""
+    written = replay.replay_mask_plots(
+        images_filename=images_filename,
+        mask_filename=mask_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
         max_workers=max_workers,
         show_progress=show_progress,
     )
