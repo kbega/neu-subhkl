@@ -158,6 +158,7 @@ def extract_xyz_from_file(file_path, instrument=None):
 
     return None, None
 
+
 def compute_metrics(
     file1: str,
     file2: str | None = None,
@@ -421,7 +422,6 @@ def compute_metrics(
         }
         print("error per_peak")
         with h5py.File(file1, "a") as fout:
-
             metrics = fout.require_group("metrics")
 
             if "per_peak" in metrics:
@@ -435,14 +435,14 @@ def compute_metrics(
             peak_grp.create_dataset("lambda", data=lam.astype(np.float32))
             peak_grp.create_dataset(
                 "d_err",
-                 data=d_err.astype(np.float32),
-                 compression="gzip",
+                data=d_err.astype(np.float32),
+                compression="gzip",
             )
 
             peak_grp.create_dataset(
                 "ang_err",
-                 data=ang_err.astype(np.float32),
-                 compression="gzip",
+                data=ang_err.astype(np.float32),
+                compression="gzip",
             )
         print("Finished writing metrics/per_peak")
 
@@ -461,7 +461,7 @@ def compute_metrics(
             run_errors.sort(key=lambda x: x[1], reverse=True)
             result["per_run_errors"] = run_errors
 
-        return result #hkl_table if per_hkl else None
+        return result  # hkl_table if per_hkl else None
 
     except Exception as e:
         import traceback

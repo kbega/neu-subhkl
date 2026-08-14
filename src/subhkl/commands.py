@@ -930,6 +930,7 @@ def run_metrics(
             status = "BAD" if err > 1.0 else "OK"
             print(f"  Run {r:4d}: {err:6.3f} ({count:4d} peaks) [{status}]")
 
+
 def run_peak_predictor(
     filename: str,
     instrument: str,

@@ -8,13 +8,11 @@ def analyze_errors(
     h5_file,
     threshold=0.2,
 ):
-
     # ----------------------------------------
     # Read HDF5
     # ----------------------------------------
 
     with h5py.File(h5_file, "r") as f:
-
         peak = f["metrics/per_peak"]
 
         h = peak["h"][:]
@@ -30,16 +28,13 @@ def analyze_errors(
     # Build HKL labels
     # ----------------------------------------
 
-    labels = [
-        f"({hh},{kk},{ll})"
-        for hh, kk, ll in zip(h, k, l)
-    ]
+    labels = [f"({hh},{kk},{ll})" for hh, kk, ll in zip(h, k, l)]
 
     # ----------------------------------------
     # Plot ALL reflections
     # ----------------------------------------
 
-    plt.figure(figsize=(18,6))
+    plt.figure(figsize=(18, 6))
 
     plt.scatter(
         np.arange(len(ang_err)),
@@ -54,9 +49,7 @@ def analyze_errors(
         label=f"threshold={threshold}",
     )
 
-    plt.xticks(
-        fontsize=6
-    )
+    plt.xticks(fontsize=6)
 
     plt.xlabel("Peak index")
     plt.ylabel("Angular error (degree)")
@@ -110,7 +103,6 @@ def analyze_errors(
         "w",
         newline="",
     ) as fout:
-
         writer = csv.writer(fout)
 
         writer.writerow(
@@ -132,9 +124,7 @@ def analyze_errors(
         ):
             writer.writerow(row)
 
-    print(
-        f"Saved high_error_hkl.csv ({len(high_h)} reflections)"
-    )
+    print(f"Saved high_error_hkl.csv ({len(high_h)} reflections)")
 
     # ----------------------------------------
     # Plot ONLY high-error reflections
@@ -149,7 +139,7 @@ def analyze_errors(
         )
     ]
 
-    plt.figure(figsize=(16,6))
+    plt.figure(figsize=(16, 6))
 
     plt.bar(
         np.arange(len(high_ang)),
@@ -166,9 +156,7 @@ def analyze_errors(
     plt.ylabel("Angular error (degree)")
     plt.xlabel("High-error HKLs")
 
-    plt.title(
-        f"Reflections with angular error > {threshold}"
-    )
+    plt.title(f"Reflections with angular error > {threshold}")
 
     plt.tight_layout()
 
@@ -188,7 +176,6 @@ def analyze_errors(
 
 
 if __name__ == "__main__":
-
     import argparse
 
     parser = argparse.ArgumentParser()

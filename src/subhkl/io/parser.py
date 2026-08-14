@@ -587,11 +587,9 @@ def metrics(
             "--d-min", help="Optional minimum d-spacing filter for metrics calculation."
         ),
     ] = None,
-   per_peak: Annotated[
+    per_peak: Annotated[
         bool | None,
-        typer.Option(
-            "--per_peak", help="Creat table metrics/per_peak."
-        ),
+        typer.Option("--per_peak", help="Creat table metrics/per_peak."),
     ] = None,
     metric: Annotated[
         str,
