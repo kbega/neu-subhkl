@@ -276,6 +276,7 @@ def prepare_predict_tasks(
     gonio_offsets: Optional[np.ndarray] = None,
     per_run_trans: Optional[np.ndarray] = None,
     frame_to_run: Optional[np.ndarray] = None,
+    harmonic_rot: Optional[np.ndarray] = None,
 ) -> List[Tuple[Any, ...]]:
     bank_mapping = image_data.bank_mapping
     tasks = []
@@ -345,6 +346,11 @@ def prepare_predict_tasks(
             so_eff = np.array(sample_offset, dtype=float, copy=True)
             so_eff[-1] = so_eff[-1] + per_run_trans[int(frame_to_run[img_index])]
 
+        # Fourier rocking: a lab-frame q-steering rotation per image.
+        extra_rot = None
+        if harmonic_rot is not None and img_index < len(harmonic_rot):
+            extra_rot = harmonic_rot[img_index]
+
         tasks.append(
             (
                 img_key,
@@ -360,6 +366,7 @@ def prepare_predict_tasks(
                 gonio_axes,
                 angles_bank,
                 gonio_offsets,  # <-- NEW
+                extra_rot,
             )
         )
     return tasks

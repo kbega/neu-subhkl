@@ -359,6 +359,50 @@ def indexer(
             help="Bound (meters) per component of each per-run sample displacement.",
         ),
     ] = 0.002,
+    refine_goniometer_harmonics: Annotated[
+        Optional[str],
+        typer.Option(
+            "--refine-goniometer-harmonics",
+            help="Scan motor name (e.g. 'phi') to refine a Fourier-in-phi "
+            "rocking of the crystal's effective orientation: bounded "
+            "cos/sin coefficients per harmonic about fixed lab axes "
+            "built from the scan axis and the beam.  Captures the "
+            "phi-periodic steering that crystal-fixed anisotropic "
+            "mosaicity imprints on spot positions (grows as 2 sin "
+            "theta, so it dominates the high-2theta banks).",
+        ),
+    ] = None,
+    goniometer_harmonics_orders: Annotated[
+        Optional[str],
+        typer.Option(
+            "--goniometer-harmonics-orders",
+            help="Comma-separated harmonic orders m (default '1,2,3,4,5,6'). "
+            "Crystallographic rotation orders top out at 6, and a "
+            "symmetry axis tilted from the scan axis leaks harmonic n "
+            "into the n +/- 1 sidebands, so the full band is the safe "
+            "default; m = 0 is always excluded (it is the motor zero "
+            "the global offsets refine).  For sparse phi coverage "
+            "restrict the band to keep the fit determined.",
+        ),
+    ] = None,
+    goniometer_harmonics_axes: Annotated[
+        str,
+        typer.Option(
+            "--goniometer-harmonics-axes",
+            help="Which rocking axes get a harmonic series: 'rocking' "
+            "(scan-axis x beam, the rocking-curve axis; 2M DoF), "
+            "'transverse' (both axes perpendicular to the scan axis; "
+            "4M), or 'full' (adds the scan axis itself for periodic "
+            "drive error; 6M).",
+        ),
+    ] = "rocking",
+    goniometer_harmonics_bound_deg: Annotated[
+        float,
+        typer.Option(
+            "--goniometer-harmonics-bound-deg",
+            help="Bound (deg) per Fourier coefficient of the rocking.",
+        ),
+    ] = 0.5,
     refine_goniometer_trans_axes: Annotated[
         Optional[str],
         typer.Option(
@@ -561,6 +605,14 @@ def indexer(
         goniometer_per_run_bound_deg=goniometer_per_run_bound_deg,
         refine_goniometer_per_run_trans=refine_goniometer_per_run_trans,
         goniometer_per_run_trans_bound_meters=goniometer_per_run_trans_bound_meters,
+        refine_goniometer_harmonics=refine_goniometer_harmonics,
+        goniometer_harmonics_orders=(
+            [int(x.strip()) for x in goniometer_harmonics_orders.split(",")]
+            if goniometer_harmonics_orders
+            else None
+        ),
+        goniometer_harmonics_axes=goniometer_harmonics_axes,
+        goniometer_harmonics_bound_deg=goniometer_harmonics_bound_deg,
         refine_goniometer_trans_axes=(
             [x.strip() for x in refine_goniometer_trans_axes.split(",")]
             if refine_goniometer_trans_axes

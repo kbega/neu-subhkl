@@ -120,6 +120,10 @@ def run_index(
     goniometer_per_run_bound_deg: float = 0.5,
     refine_goniometer_per_run_trans: bool = False,
     goniometer_per_run_trans_bound_meters: float = 0.002,
+    refine_goniometer_harmonics: str | None = None,
+    goniometer_harmonics_orders: list[int] | None = None,
+    goniometer_harmonics_axes: str = "rocking",
+    goniometer_harmonics_bound_deg: float = 0.5,
     refine_goniometer_trans_axes: list[str] | None = None,
     refine_goniometer_trans: bool = False,
     goniometer_trans_bound_meters: float | list[float] | np.ndarray = 0.005,
@@ -677,6 +681,10 @@ def run_index(
         goniometer_per_run_bound_deg=goniometer_per_run_bound_deg,
         refine_goniometer_per_run_trans=refine_goniometer_per_run_trans,
         goniometer_per_run_trans_bound_meters=goniometer_per_run_trans_bound_meters,
+        refine_goniometer_harmonics=refine_goniometer_harmonics,
+        goniometer_harmonics_orders=goniometer_harmonics_orders,
+        goniometer_harmonics_axes=goniometer_harmonics_axes,
+        goniometer_harmonics_bound_deg=goniometer_harmonics_bound_deg,
         refine_goniometer_trans_axes=refine_goniometer_trans_axes,
         per_run_frame_map=per_run_frame_map,
         goniometer_names=goniometer_names,
@@ -832,6 +840,24 @@ def run_index(
             if "run_files" not in grp and per_run_files is not None:
                 grp["run_files"] = np.array(per_run_files, dtype="S")
 
+        if (
+            refine_goniometer_harmonics
+            and getattr(opt, "goniometer_harmonics", None) is not None
+        ):
+            # The Fourier rocking has no angle representation (its axes
+            # are not motors), so the coefficients travel with the file
+            # and the predictor rebuilds the per-frame rotation from
+            # them (subhkl.optimization.harmonic_rocking_matrices).
+            gh = opt.goniometer_harmonics
+            grp_name = "goniometer/harmonics"
+            if grp_name in f:
+                del f[grp_name]
+            grp = f.create_group(grp_name)
+            grp["motor"] = gh["motor"]
+            grp["orders"] = np.asarray(gh["orders"], dtype=np.int32)
+            grp["axes"] = np.asarray(gh["axes"], dtype=float)
+            grp["coeffs_deg"] = np.asarray(gh["coeffs_deg"], dtype=float)
+
         if opt.goniometer_offsets is not None:
             grp_name = "goniometer/offsets"
             if grp_name in f:
@@ -888,6 +914,10 @@ def run_index(
             "goniometer_per_run_bound_deg": goniometer_per_run_bound_deg,
             "refine_goniometer_per_run_trans": refine_goniometer_per_run_trans,
             "goniometer_per_run_trans_bound_meters": goniometer_per_run_trans_bound_meters,
+            "refine_goniometer_harmonics": refine_goniometer_harmonics,
+            "goniometer_harmonics_orders": goniometer_harmonics_orders,
+            "goniometer_harmonics_axes": goniometer_harmonics_axes,
+            "goniometer_harmonics_bound_deg": goniometer_harmonics_bound_deg,
             "refine_goniometer_trans_axes": refine_goniometer_trans_axes,
             "refine_goniometer_trans": refine_goniometer_trans,
             "refine_beam": refine_beam,
@@ -1190,6 +1220,43 @@ def run_peak_predictor(
                 "Applying per-run sample displacements from indexer "
                 f"({len(per_run_trans)} runs)."
             )
+        harmonic_rot = None
+        if "goniometer/harmonics" in f_idx:
+            # The Fourier rocking steers q in the lab frame; its axes are
+            # not motors, so it cannot ride on the corrected angles and is
+            # rebuilt here from the stored coefficients, per frame.
+            from subhkl.optimization import harmonic_rocking_matrices
+
+            gh = f_idx["goniometer/harmonics"]
+            harm_motor = gh["motor"][()]
+            harm_motor = (
+                harm_motor.decode("utf-8")
+                if isinstance(harm_motor, bytes)
+                else str(harm_motor)
+            )
+            harm_row = None
+            if gonio_names is not None:
+                for i, name in enumerate(gonio_names):
+                    if harm_motor.lower() in name.lower():
+                        harm_row = i
+                        break
+            if harm_row is None:
+                raise ValueError(
+                    f"Harmonic motor {harm_motor!r} not found in goniometer "
+                    f"names {gonio_names}."
+                )
+            ang = np.asarray(peaks.goniometer.angles_raw, dtype=float)
+            n_axes = len(gonio_names)
+            frame_first, _ = _file_frame_run_map(ang, n_axes, np.zeros(1, dtype=int))
+            harm_angles = ang[:, harm_row] if frame_first else ang[harm_row, :]
+            harmonic_rot = harmonic_rocking_matrices(
+                harm_angles, gh["axes"][()], gh["orders"][()], gh["coeffs_deg"][()]
+            )
+            print(
+                f"Applying Fourier rocking from indexer ({harm_motor}, "
+                f"orders {list(gh['orders'][()])}, "
+                f"{harmonic_rot.shape[0]} frames)."
+            )
 
     # Pass the Base UB matrix. The predictor will apply dynamic R_gonio internally!
     UB = U @ B
@@ -1214,6 +1281,7 @@ def run_peak_predictor(
         gonio_offsets=gonio_offsets,  # Pass the pure zero-points
         per_run_trans=per_run_trans,
         frame_to_run=frame_to_run,
+        harmonic_rot=harmonic_rot,
     )
 
     print(f"Saving predictions to {integration_peaks_filename}")

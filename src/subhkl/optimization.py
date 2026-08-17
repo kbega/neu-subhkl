@@ -34,6 +34,69 @@ def _forward_map_lattice(norm, nominal, frac_bound):
     return min_val + norm * (max_val - min_val)
 
 
+HARMONIC_AXES_MODES = ("rocking", "transverse", "full")
+
+
+def harmonic_axes_from_scan(scan_dir, ki_vec, mode="rocking"):
+    """Lab-frame rotation axes for the Fourier-in-phi rocking model.
+
+    The measured steering on cg4d-t4-lysozyme puts 96% of its power on
+    the single axis perpendicular to both the scan axis and the beam
+    (the rocking-curve axis), so that axis alone is the default.
+    "transverse" adds the second axis perpendicular to the scan axis;
+    "full" adds the scan axis itself, whose harmonics represent a
+    periodic drive error (its constant term stays excluded everywhere:
+    that is the motor zero the global offsets already refine).
+    """
+    if mode not in HARMONIC_AXES_MODES:
+        raise ValueError(
+            f"Unknown harmonic axes mode {mode!r}; pick from {HARMONIC_AXES_MODES}."
+        )
+    n = np.asarray(scan_dir, dtype=float)
+    n = n / np.linalg.norm(n)
+    b = np.asarray(ki_vec, dtype=float)
+    b = b / np.linalg.norm(b)
+    e1 = np.cross(n, b)
+    if np.linalg.norm(e1) < 1e-6:
+        # Scan axis along the beam: any perpendicular direction serves.
+        ref = np.array([1.0, 0.0, 0.0])
+        if abs(n @ ref) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0])
+        e1 = np.cross(n, ref)
+    e1 = e1 / np.linalg.norm(e1)
+    if mode == "rocking":
+        return np.array([e1])
+    e2 = np.cross(n, e1)
+    e2 = e2 / np.linalg.norm(e2)
+    if mode == "transverse":
+        return np.array([e1, e2])
+    return np.array([e1, e2, n])
+
+
+def harmonic_rocking_vectors(angles_deg, axes, orders, coeffs_deg):
+    """Per-frame Rodrigues vectors (radians) of the Fourier rocking.
+
+    delta_k(phi) = sum_m a_km cos(m phi) + b_km sin(m phi) about lab
+    axis e_k, with coeffs_deg shaped (n_axes, n_orders, 2) as (a, b).
+    """
+    ang = np.asarray(angles_deg, dtype=float)
+    orders_np = np.asarray(list(orders), dtype=float)
+    phase = np.deg2rad(orders_np[None, :] * ang[:, None])  # (F, n)
+    c = np.asarray(coeffs_deg, dtype=float)  # (K, n, 2)
+    delta = np.einsum("kn,fn->kf", c[..., 0], np.cos(phase)) + np.einsum(
+        "kn,fn->kf", c[..., 1], np.sin(phase)
+    )
+    return np.deg2rad(np.einsum("kf,kd->fd", delta, np.asarray(axes, dtype=float)))
+
+
+def harmonic_rocking_matrices(angles_deg, axes, orders, coeffs_deg):
+    """Per-frame 3x3 rocking rotations, applied to lab-frame q vectors."""
+    from scipy.spatial.transform import Rotation
+
+    w = harmonic_rocking_vectors(angles_deg, axes, orders, coeffs_deg)
+    return Rotation.from_rotvec(w).as_matrix()
+
+
 def _get_active_lattice_indices(lattice_system):
     if lattice_system == "Cubic":
         return [0]
@@ -216,6 +279,10 @@ class VectorizedObjective:
         per_run_bound_deg=0.5,
         per_run_trans=False,
         per_run_trans_bound_m=0.002,
+        harmonic_frame_angles_deg=None,
+        harmonic_axes=None,
+        harmonic_orders=None,
+        harmonic_bound_deg=0.5,
         refine_sample=False,
         goniometer_trans_bound_meters=0.005,
         sample_nominal=None,
@@ -455,6 +522,46 @@ class VectorizedObjective:
                 3 * self.num_runs_static if self.per_run_trans else 0
             )
             self.per_run_trans_bound_m = float(per_run_trans_bound_m)
+            # Fourier-in-phi rocking: the crystal's effective orientation
+            # oscillates about fixed lab axes as the scan motor turns
+            # (crystal-fixed anisotropic mosaicity sampled by the
+            # rotation).  Bounded Fourier coefficients per axis over the
+            # requested harmonic band; m = 0 is excluded by construction
+            # (degenerate with the global goniometer offsets).
+            self.num_harmonic_params = 0
+            if harmonic_axes is not None and harmonic_orders is not None:
+                if harmonic_frame_angles_deg is None:
+                    raise ValueError(
+                        "Harmonic rocking needs harmonic_frame_angles_deg "
+                        "(scan-motor angle per frame)."
+                    )
+                ang = np.asarray(harmonic_frame_angles_deg, dtype=float)
+                n_frames = np.asarray(goniometer_angles).shape[1]
+                if ang.shape != (n_frames,):
+                    raise ValueError(
+                        f"harmonic_frame_angles_deg shape {ang.shape} does "
+                        f"not match the {n_frames} goniometer frames."
+                    )
+                orders_np = np.asarray(list(harmonic_orders), dtype=float)
+                if orders_np.size == 0 or np.any(orders_np < 1):
+                    raise ValueError(
+                        "Harmonic orders must be positive integers; the "
+                        "m = 0 term is the motor zero the global offsets "
+                        "already refine."
+                    )
+                phase = np.deg2rad(orders_np[:, None] * ang[None, :])
+                self.harmonic_cos = jnp.array(np.cos(phase))
+                self.harmonic_sin = jnp.array(np.sin(phase))
+                axes_np = np.asarray(harmonic_axes, dtype=float)
+                self.harmonic_axes_mat = jnp.array(
+                    axes_np / np.linalg.norm(axes_np, axis=1, keepdims=True)
+                )
+                self.num_harmonic_axes = axes_np.shape[0]
+                self.num_harmonic_orders = orders_np.shape[0]
+                self.num_harmonic_params = (
+                    2 * self.num_harmonic_axes * self.num_harmonic_orders
+                )
+            self.harmonic_bound_deg = float(harmonic_bound_deg)
         else:
             self.gonio_axes = None
             self.num_gonio_axes = 0
@@ -469,6 +576,7 @@ class VectorizedObjective:
             self.per_run_trans = False
             self.num_per_run_trans_params = 0
             self.num_runs_static = 0
+            self.num_harmonic_params = 0
 
         self.refine_gonio_trans = refine_sample
         num_trans = max(1, self.num_gonio_axes)
@@ -773,6 +881,7 @@ class VectorizedObjective:
         axis_tilts = None
         per_run_delta = None
         per_run_trans_delta = None
+        harmonic_coeffs = None
         per_frame_trans = None
         sample_origin_lab = jnp.zeros((x.shape[0], 1, 3))
 
@@ -845,6 +954,15 @@ class VectorizedObjective:
                     :, self.per_run_frame_map, :
                 ]  # (S, M, 3)
 
+            if self.num_harmonic_params > 0:
+                hc_norm = x[:, idx : idx + self.num_harmonic_params].reshape(
+                    -1, self.num_harmonic_axes, self.num_harmonic_orders, 2
+                )
+                idx += self.num_harmonic_params
+                harmonic_coeffs = _forward_map_param(
+                    hc_norm, self.harmonic_bound_deg
+                )  # (S, K, n, 2) in degrees
+
             R_list = []
             deg2rad = jnp.pi / 180.0
 
@@ -880,6 +998,22 @@ class VectorizedObjective:
             R_cum = jnp.eye(3)[None, None, ...].repeat(S, axis=0).repeat(M, axis=1)
             for i in range(self.num_gonio_axes):
                 R_cum = jnp.matmul(R_cum, R_list[i])
+
+            if harmonic_coeffs is not None:
+                # The rocking multiplies from the lab side: it steers the
+                # diffraction directions (q -> R_harm q) and leaves the
+                # sample origin untouched, which is why it is folded into
+                # R_cum after the translation stack is assembled.
+                delta_deg = jnp.einsum(
+                    "skn,nm->skm", harmonic_coeffs[..., 0], self.harmonic_cos
+                ) + jnp.einsum(
+                    "skn,nm->skm", harmonic_coeffs[..., 1], self.harmonic_sin
+                )
+                w = jnp.deg2rad(
+                    jnp.einsum("skm,kd->smd", delta_deg, self.harmonic_axes_mat)
+                )
+                R_harm = jax.vmap(jax.vmap(rotation_matrix_from_rodrigues_jax))(w)
+                R_cum = jnp.matmul(R_harm, R_cum)
 
             sample_origin_lab = jnp.zeros((S, M, 3))
             for i in reversed(range(self.num_gonio_axes)):
@@ -1028,6 +1162,7 @@ class VectorizedObjective:
             axis_tilts,
             per_run_delta,
             per_run_trans_delta,
+            harmonic_coeffs,
         )
 
     def _positional_metric_vectors(self, ub_mat, kf_ki_sample, ki_sample, k_sq):
@@ -1328,6 +1463,7 @@ class VectorizedObjective:
             _,
             _,
             _,
+            _,
         ) = self._get_physical_params_jax(x_pad)
 
         R_curr = R_cum if R_cum is not None else self.static_R
@@ -1442,6 +1578,7 @@ class FindUB:
         self.goniometer_per_run_delta = None
         self.goniometer_per_run_motor = None
         self.goniometer_per_run_trans = None
+        self.goniometer_harmonics = None
         self.goniometer_names = None
         self.sample_offset = None
         self.peak_xyz = None
@@ -1747,6 +1884,10 @@ class FindUB:
         refine_goniometer_per_run_trans: bool = False,
         goniometer_per_run_trans_bound_meters: float = 0.002,
         per_run_frame_map: np.ndarray | None = None,
+        refine_goniometer_harmonics: str | None = None,
+        goniometer_harmonics_orders: list[int] | None = None,
+        goniometer_harmonics_axes: str = "rocking",
+        goniometer_harmonics_bound_deg: float = 0.5,
         refine_sample: bool = False,
         refine_goniometer_trans_axes: list | None = None,
         goniometer_trans_bound_meters: float | list | np.ndarray = 0.005,
@@ -1957,6 +2098,50 @@ class FindUB:
                 "(frame index -> run ordinal)."
             )
 
+        # Fourier-in-phi rocking: resolve the scan motor, take its axis
+        # direction and the beam to build the rocking axes, and hand the
+        # scan angle per frame to the objective as the harmonic phase.
+        harmonic_axes_mat = None
+        harmonic_orders_list = None
+        harmonic_frame_angles = None
+        if refine_goniometer_harmonics:
+            if goniometer_axes is None or goniometer_angles is None:
+                raise ValueError(
+                    "Harmonic rocking refinement needs goniometer axes and angles."
+                )
+            harm_motor_index = None
+            for i, name in enumerate(unique_motors):
+                if refine_goniometer_harmonics.lower() in name.lower():
+                    harm_motor_index = i
+                    break
+            if harm_motor_index is None:
+                raise ValueError(
+                    f"Motor {refine_goniometer_harmonics!r} not found in "
+                    f"{unique_motors} for harmonic refinement."
+                )
+            harm_axis_row = motor_map.index(harm_motor_index)
+            axis_arr = np.asarray(goniometer_axes[harm_axis_row], dtype=float)
+            scan_dir = axis_arr[0:3] * (axis_arr[3] if axis_arr.shape[0] > 3 else 1.0)
+            ki_nominal = np.asarray(
+                self.ki_vec if self.ki_vec is not None else [0.0, 0.0, 1.0],
+                dtype=float,
+            )
+            harmonic_axes_mat = harmonic_axes_from_scan(
+                scan_dir, ki_nominal, goniometer_harmonics_axes
+            )
+            # The full band 1..6 by default: crystallographic rotation
+            # orders top out at 6 (cubic included), and a symmetry axis
+            # tilted from the scan axis leaks its harmonic n into the
+            # n +/- 1 sidebands, so multiples of n alone are not enough.
+            harmonic_orders_list = (
+                [int(m) for m in goniometer_harmonics_orders]
+                if goniometer_harmonics_orders
+                else list(range(1, 7))
+            )
+            harmonic_frame_angles = np.asarray(goniometer_angles, dtype=float)[
+                harm_axis_row, :
+            ]
+
         # Map translation bounds to active axes
         if isinstance(goniometer_trans_bound_meters, (int, float)):
             gonio_trans_bounds_list = [float(goniometer_trans_bound_meters)]
@@ -2017,6 +2202,10 @@ class FindUB:
             per_run_bound_deg=goniometer_per_run_bound_deg,
             per_run_trans=refine_goniometer_per_run_trans,
             per_run_trans_bound_m=goniometer_per_run_trans_bound_meters,
+            harmonic_frame_angles_deg=harmonic_frame_angles,
+            harmonic_axes=harmonic_axes_mat,
+            harmonic_orders=harmonic_orders_list,
+            harmonic_bound_deg=goniometer_harmonics_bound_deg,
             goniometer_trans_bound_meters=bounds_array_trans,
             sample_nominal=self.base_sample_offset,
             refine_beam=refine_beam,
@@ -2074,6 +2263,8 @@ class FindUB:
             num_dims += objective.num_per_run_params
         if refine_goniometer_per_run_trans:
             num_dims += objective.num_per_run_trans_params
+        if harmonic_axes_mat is not None:
+            num_dims += objective.num_harmonic_params
         if refine_detector:
             num_dims += objective.num_det_params
 
@@ -2101,6 +2292,7 @@ class FindUB:
                 axis_tilts_batch,
                 per_run_delta_batch,
                 per_run_trans_batch,
+                harmonic_coeffs_batch,
             ) = objective._get_physical_params_jax(x_batch)
             self.sample_offset = np.array(t_axes_batch[0])
             self.ki_vec = np.array(ki_vec_batch[0]).flatten()
@@ -2373,6 +2565,7 @@ class FindUB:
             axis_tilts_batch,
             per_run_delta_batch,
             per_run_trans_batch,
+            harmonic_coeffs_batch,
         ) = objective._get_physical_params_jax(x_batch)
 
         self.sample_offset = np.array(t_axes_batch[0])
@@ -2430,6 +2623,24 @@ class FindUB:
                 "Per-run sample displacements (|t| mm): "
                 + " ".join(f"{v:.3f}" for v in norms)
             )
+
+        if harmonic_axes_mat is not None and harmonic_coeffs_batch is not None:
+            coeffs = np.array(harmonic_coeffs_batch[0])
+            self.goniometer_harmonics = {
+                "motor": refine_goniometer_harmonics,
+                "orders": np.asarray(harmonic_orders_list, dtype=np.int32),
+                "axes": np.asarray(harmonic_axes_mat, dtype=float),
+                "coeffs_deg": coeffs,
+            }
+            amp = np.hypot(coeffs[..., 0], coeffs[..., 1])
+            for k in range(amp.shape[0]):
+                print(
+                    f"Harmonic rocking axis {np.round(harmonic_axes_mat[k], 3)}: "
+                    + " ".join(
+                        f"m={m}: {a:.4f}" for m, a in zip(harmonic_orders_list, amp[k])
+                    )
+                    + " deg"
+                )
 
         if freeze_orientation:
             rot_params = self.fixed_rot_params

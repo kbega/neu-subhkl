@@ -244,6 +244,7 @@ def predict_single_bank(
     gonio_axes=None,
     gonio_angles=None,
     gonio_offsets=None,  # <-- NEW
+    extra_rot=None,
 ):
     """
     Worker function for predicting peaks on a single detector bank.
@@ -270,6 +271,7 @@ def predict_single_bank(
         gonio_axes=gonio_axes,
         gonio_angles=gonio_angles,
         gonio_offsets=gonio_offsets,  # <-- Pass Down
+        extra_rot=extra_rot,
     )
     if len(row) > 0:
         return bank_id, [row, col, h_f, k_f, l_f, wl_f]
