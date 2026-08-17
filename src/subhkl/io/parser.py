@@ -618,6 +618,10 @@ def metrics(
             "--per-run", help="Calculate and display metrics for each run/image."
         ),
     ] = False,
+    per_peak: Annotated[
+        bool | None,
+        typer.Option("--per_peak", help="Creat table metrics/per_peak."),
+    ] = None,
     ki_vec: Annotated[
         str | None,
         typer.Option(
@@ -637,6 +641,7 @@ def metrics(
         instrument=instrument,
         d_min=d_min,
         per_run=per_run,
+        per_peak=per_peak,
         ki_vec=ki_vec_parsed,
     )
 
