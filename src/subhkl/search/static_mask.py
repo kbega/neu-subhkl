@@ -117,16 +117,18 @@ def estimate_static_mask(
     # l1-mbl forward banks as an exclusion ring around every true peak.
     stack = np.stack([ndimage.gaussian_filter(f, smooth_sigma) for f in rates])
 
-    def _tail_radius(sig: float, amp: float, scale: float, thr: float) -> float:
-        """Radius where the peak's smoothed profile falls below ``thr``.
+    def _tail_radius(sig: float, height: float, thr: float) -> float:
+        """Radius where the peak's smoothed band-pass profile falls below
+        ``thr``.
 
-        Smoothing spreads the peak over s_eff and attenuates its amplitude
-        by the area ratio; both in normalised rate units.
+        ``height`` is the peak's measured band-pass value at its own
+        center -- already smoothed, already background-subtracted, in the
+        same normalised units as ``thr`` -- so the only model left is the
+        Gaussian tail of the smoothed profile, whose width is s_eff.
         """
         s_eff_sq = sig**2 + smooth_sigma**2
-        amp_rel = (amp / max(scale, 1e-6)) * (sig**2 / s_eff_sq)
-        if amp_rel > thr:
-            return float(np.sqrt(2.0 * s_eff_sq * np.log(amp_rel / thr)))
+        if height > thr:
+            return float(np.sqrt(2.0 * s_eff_sq * np.log(height / thr)))
         return 0.0
 
     # The criteria live on a *band-pass* of a static map: structure at
@@ -197,11 +199,15 @@ def estimate_static_mask(
     quantiles = sorted({float(static_quantile), 75.0})
     bad = np.zeros(stack.shape[1:], dtype=bool)
     texture_threshold = np.inf
+    band_maps = []
     for q in quantiles:
         sm_q = np.percentile(stack, q, axis=0, method="lower")
         bad_q, _, thr_q = _criteria(sm_q)
         bad |= bad_q
         texture_threshold = min(texture_threshold, thr_q)
+        # Kept for the certificates below: a peak's protection radius is
+        # read off the very maps the criteria threshold.
+        band_maps.append(sm_q - ndimage.gaussian_filter(sm_q, wide_sigma))
 
     # Certificates exist to protect peaks -- nothing else.  The mask may be
     # as liberal as it likes about admitting static structure, because the
@@ -211,6 +217,14 @@ def estimate_static_mask(
     # threshold (with a 2*smooth_sigma margin for the frame-to-frame wobble
     # the fitted sigma cannot know), plus the dilation the bad set receives,
     # so a certified footprint never reaches the final mask however bright.
+    # The peak's height is *measured*, not modelled: the finder reports no
+    # amplitude (that was the hull-era intensity, retired), and what the
+    # radius needs is the peak's leak into the quantile maps -- so it is
+    # read directly off the same band-pass maps the criteria threshold, at
+    # the certificate's own center (a 3x3 max absorbs sub-pixel centers).
+    # This also prices quasi-static peaks correctly by construction: an
+    # order statistic carries a minority-frame peak at full height or not
+    # at all, which no duty-cycle model of a fitted flux could reproduce.
     # Certificates never touch the evidence: an earlier design also cleared
     # the certified footprints out of the frame stack before the quantile,
     # and every failure mode of this estimator's history -- exclusion rings,
@@ -234,7 +248,7 @@ def estimate_static_mask(
     # forward-bank arcs wholesale.  Measured on l1-mbl the split is bimodal:
     # compact peak leaks reach ~0.8x of the gate at the 90th percentile,
     # edge components sit at 4-12x with extents of 200-500 px.
-    accepted: list[tuple[float, float, float, float, float]] = []
+    accepted: list[tuple[float, float, float, float]] = []
     if protect_disks:
         closed = ndimage.binary_closing(
             bad, iterations=int(np.ceil(2.0 * smooth_sigma))
@@ -245,15 +259,24 @@ def estimate_static_mask(
             if sl is not None:
                 extents[i] = max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start)
         H, W = lab.shape
-        scale = float(scales.mean())
-        for r0, c0, sig, amp in protect_disks:
+        for r0, c0, sig in protect_disks:
+            ri, ci = int(round(r0)), int(round(c0))
+            height = max(
+                float(
+                    band[
+                        max(0, ri - 1) : min(H, ri + 2),
+                        max(0, ci - 1) : min(W, ci + 2),
+                    ].max()
+                )
+                for band in band_maps
+            )
             rad = max(
                 protect_nsigmas * sig + 2.0 * smooth_sigma,
-                _tail_radius(sig, amp, scale, texture_threshold) + 2.0 * smooth_sigma,
+                _tail_radius(sig, height, texture_threshold) + 2.0 * smooth_sigma,
             )
             core = int(np.ceil(protect_nsigmas * sig))
-            lo_r, hi_r = max(0, int(r0) - core), min(H, int(r0) + core + 1)
-            lo_c, hi_c = max(0, int(c0) - core), min(W, int(c0) + core + 1)
+            lo_r, hi_r = max(0, ri - core), min(H, ri + core + 1)
+            lo_c, hi_c = max(0, ci - core), min(W, ci + core + 1)
             d2 = (np.arange(lo_r, hi_r)[:, None] - r0) ** 2 + (
                 np.arange(lo_c, hi_c)[None, :] - c0
             ) ** 2
@@ -262,7 +285,7 @@ def estimate_static_mask(
             )
             if any(extents[k] > 4.0 * rad for k in comps if k > 0):
                 continue
-            accepted.append((r0, c0, sig, amp, rad))
+            accepted.append((r0, c0, sig, rad))
 
     if dilate_px > 0:
         bad = ndimage.binary_dilation(bad, iterations=int(dilate_px))
@@ -271,7 +294,7 @@ def estimate_static_mask(
     if accepted:
         rr, cc = np.mgrid[0 : bad.shape[0], 0 : bad.shape[1]]
         protected = np.zeros_like(bad)
-        for r0, c0, _sig, _amp, rad in accepted:
+        for r0, c0, _sig, rad in accepted:
             protected |= (rr - r0) ** 2 + (cc - c0) ** 2 <= (rad + dilate_px) ** 2
         bad &= ~protected
 
@@ -453,31 +476,30 @@ def _confident_peaks_by_frame(
     peaks_path: str | Path,
     deviance_min: float,
     residual_max: float,
-) -> dict[int, list[tuple[float, float, float, float]]]:
-    """Per image index: (row, col, sigma, amplitude) of certified peaks.
+) -> dict[int, list[tuple[float, float, float]]]:
+    """Per image index: (row, col, sigma) of certified peaks.
 
     The certificate is the finder's own fit statistics: evidence at least
     at the chi^2_4 admission level (the finder's calibrated false-alarm
     control already governs above it -- see CHI2_4_P95) and a shape the
     atom family explains (residual deviance per DoF near one).  An
     artifact fails one or both and earns no exoneration.  The geometry of
-    the protected region is the estimator's business -- it knows the
-    ambient rate a peak's tail must be compared against.
+    the protected region is the estimator's business -- it measures the
+    peak's height off its own quantile maps (the finder reports no
+    amplitude: that was the hull-era intensity, retired with it).
     """
-    out: dict[int, list[tuple[float, float, float, float]]] = {}
+    out: dict[int, list[tuple[float, float, float]]] = {}
     with h5py.File(peaks_path, "r") as f:
         idx = np.asarray(f["peaks/image_index"][()]).astype(int)
         r = np.asarray(f["peaks/pixel_r"][()], dtype=float)
         c = np.asarray(f["peaks/pixel_c"][()], dtype=float)
         sigma = np.asarray(f["peaks/sigma"][()], dtype=float)
-        flux = np.asarray(f["peaks/intensity"][()], dtype=float)
         dev = np.asarray(f["peaks/deviance"][()], dtype=float)
         res = np.asarray(f["peaks/residual_deviance"][()], dtype=float)
     confident = (dev > deviance_min) & (res < residual_max)
     for i in np.nonzero(confident)[0]:
         s_i = max(float(sigma[i]), 1.0)
-        amp = max(float(flux[i]), 0.0) / (2.0 * np.pi * s_i**2)
-        out.setdefault(int(idx[i]), []).append((float(r[i]), float(c[i]), s_i, amp))
+        out.setdefault(int(idx[i]), []).append((float(r[i]), float(c[i]), s_i))
     return out
 
 
@@ -495,11 +517,10 @@ def _confident_pooled_peaks(
     exoneration.  A finder run on the per-bank *sum* (see
     ``build_summed_file``) closes the asymmetry -- deviance is additive, so
     the same peak compounds ~n-fold there -- and its certified detections
-    are exonerated in every frame of their bank.  The amplitude recorded
-    here is the pooled one; the caller rescales by the bank's frame count
-    to recover the per-frame amplitude (exact for a static feature, an
-    overestimate only for moving peaks, which the quantile never masks and
-    which therefore cost nothing to over-protect).
+    are exonerated in every frame of their bank.  No amplitude travels
+    with the certificate: the estimator measures each peak's height off
+    its own quantile maps, which prices static and quasi-static peaks
+    alike without any frame-count rescaling.
 
     The evidence bar is the same as per-frame -- pooling the evidence is the
     point -- but the *shape* bar must transfer.  Residual deviance per DoF
@@ -516,7 +537,7 @@ def _confident_pooled_peaks(
     The bank comes from the finder's own per-peak ``bank`` dataset, so the
     pooled file needs no companion to interpret.
     """
-    out: dict[int, list[tuple[float, float, float, float]]] = {}
+    out: dict[int, list[tuple[float, float, float]]] = {}
     with h5py.File(peaks_path, "r") as f:
         if "bank" not in f:
             raise ValueError(
@@ -527,7 +548,6 @@ def _confident_pooled_peaks(
         r = np.asarray(f["peaks/pixel_r"][()], dtype=float)
         c = np.asarray(f["peaks/pixel_c"][()], dtype=float)
         sigma = np.asarray(f["peaks/sigma"][()], dtype=float)
-        flux = np.asarray(f["peaks/intensity"][()], dtype=float)
         dev = np.asarray(f["peaks/deviance"][()], dtype=float)
         res = np.asarray(f["peaks/residual_deviance"][()], dtype=float)
     n_frames = np.array([n_by_bank.get(int(b), 1) for b in bank], dtype=float)
@@ -535,8 +555,7 @@ def _confident_pooled_peaks(
     confident = (dev > deviance_min) & (res < residual_bar)
     for i in np.nonzero(confident)[0]:
         s_i = max(float(sigma[i]), 1.0)
-        amp = max(float(flux[i]), 0.0) / (2.0 * np.pi * s_i**2)
-        out.setdefault(int(bank[i]), []).append((float(r[i]), float(c[i]), s_i, amp))
+        out.setdefault(int(bank[i]), []).append((float(r[i]), float(c[i]), s_i))
     return out
 
 
@@ -616,13 +635,7 @@ def build_mask_file(
             masks.append(np.ones(frames.shape[1:], dtype=np.uint8))
             thin.append(bank)
         else:
-            protect = [
-                # The pooled amplitude is a sum over this bank's frames; a
-                # static feature's per-frame amplitude is that divided by
-                # the frame count (exact by definition of static).
-                (r0, c0, sig, amp / frames.shape[0])
-                for r0, c0, sig, amp in pooled.get(bank, [])
-            ]
+            protect = list(pooled.get(bank, []))
             n_exonerated_pooled += len(protect)
             for file_index, image_index in provenance[bank]:
                 disks = confident.get(file_index, {}).get(image_index, [])
