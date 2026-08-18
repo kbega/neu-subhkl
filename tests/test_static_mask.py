@@ -265,7 +265,7 @@ def test_dense_diffraction_is_protected_and_subset_artifacts_are_caught():
             )
         frames.append(rng.poisson(rate).astype(np.float32))
 
-    disks = [(r0, c0, 2.0, 60.0) for r0, c0 in ring_pos]
+    disks = [(r0, c0, 2.0) for r0, c0 in ring_pos]
     valid = estimate_static_mask(np.stack(frames), dilate_px=4, protect_disks=disks)
 
     # The static edge's bright shoulder is masked; the dark side is not.
@@ -362,7 +362,6 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
     size, step_col = 128, 80
     sigma_pk = 2.0
     peak = pixel_integrated_gaussian((size, size), 40.0, 30.0, sigma_pk, 800.0)
-    height = float(peak.max())
     frames = []
     for _ in range(10):
         rate = np.full((size, size), 2.2)
@@ -384,7 +383,6 @@ def test_metric_certified_peaks_are_exonerated_and_artifacts_are_not(tmp_path):
             f["peaks/pixel_r"] = np.full(n, 40.0)
             f["peaks/pixel_c"] = np.full(n, 30.0)
             f["peaks/sigma"] = np.full(n, sigma_pk)
-            f["peaks/intensity"] = np.full(n, height * 2 * np.pi * sigma_pk**2)
             f["peaks/deviance"] = np.full(n, deviance)
             f["peaks/residual_deviance"] = np.full(n, residual)
 
@@ -464,9 +462,9 @@ def test_no_annulus_around_a_quasi_static_certified_peak():
     earlier design cleared the certified evidence out of the frame stack,
     and the clearing itself manufactured a masked annulus around the peak
     (the no-evidence crater dug a positive band-pass rim just outside
-    itself).  Certificates now only protect, with an amplitude-aware radius
-    covering wherever the peak's own smoothed tail exceeds the texture
-    threshold -- so nothing near the peak may be masked, at any radius."""
+    itself).  Certificates now only protect, with a radius measured off the
+    estimator's own quantile maps, covering wherever the peak's smoothed
+    tail exceeds the texture threshold -- so nothing near the peak may be masked, at any radius."""
     rng = np.random.default_rng(67)
     size, sigma_pk, height = 160, 2.0, 200.0
     wobble = [
@@ -480,7 +478,7 @@ def test_no_annulus_around_a_quasi_static_certified_peak():
             rate.shape, 64.0 + dr, 64.0 + dc, sigma_pk, height
         )
         frames.append(rng.poisson(rate).astype(np.float32))
-        disks.append((64.0 + dr, 64.0 + dc, sigma_pk, height))
+        disks.append((64.0 + dr, 64.0 + dc, sigma_pk))
     valid = estimate_static_mask(np.stack(frames), protect_disks=disks)
 
     rr, cc = np.mgrid[0:size, 0:size]
@@ -594,7 +592,6 @@ def test_pooled_peaks_rescue_a_subthreshold_static_peak(tmp_path):
         f["peaks/pixel_r"] = np.array([40.0])
         f["peaks/pixel_c"] = np.array([30.0])
         f["peaks/sigma"] = np.array([sigma_pk])
-        f["peaks/intensity"] = np.array([55.0 * n_frames])
         f["peaks/deviance"] = np.array([60.0])
         f["peaks/residual_deviance"] = np.array([8.0])
 
@@ -622,7 +619,6 @@ def test_pooled_peaks_rescue_a_subthreshold_static_peak(tmp_path):
         f["peaks/pixel_r"] = np.array([40.0])
         f["peaks/pixel_c"] = np.array([30.0])
         f["peaks/sigma"] = np.array([sigma_pk])
-        f["peaks/intensity"] = np.array([55.0 * n_frames])
         f["peaks/deviance"] = np.array([60.0])
         f["peaks/residual_deviance"] = np.array([26.0])
     build_mask_file(
@@ -668,7 +664,6 @@ def test_a_certificate_on_extended_structure_is_refused(tmp_path):
         f["peaks/pixel_r"] = np.tile([40.0, 64.0], 10)
         f["peaks/pixel_c"] = np.tile([30.0, float(step_col)], 10)
         f["peaks/sigma"] = np.full(n, sigma_pk)
-        f["peaks/intensity"] = np.full(n, 800.0 * 2 * np.pi * sigma_pk**2)
         f["peaks/deviance"] = np.full(n, 120.0)
         f["peaks/residual_deviance"] = np.full(n, 1.1)
 

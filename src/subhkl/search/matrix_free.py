@@ -3376,3 +3376,588 @@ class MatrixFreeSparseRBFPeakFinder:
             print(f"  > Deviance/DoF: {dev_per_dof:.4f} {target_str}")
 
         return {"nll": nll_total, "bic": bic_total, "deviance_nu": dev_per_dof}
+
+
+# --- Amplitude-only integration ----------------------------------------------
+#
+# The finder above solves for a dense per-pixel coefficient tensor -- millions
+# of unknowns coupled by a translation-invariant kernel bank -- which is why
+# its Newton systems go through preconditioned CG on a convolution-structured
+# operator that is never materialized.  Integration is the same estimation
+# problem with the hard part already answered: the atoms are the predicted
+# reflections, a few dozen per image, each with its own projected anisotropic
+# shape (so the operator is not translation-invariant and the convolution
+# trick does not apply, and does not need to).  At that size the generalized
+# Jacobian is a K x K matrix and the dense semi-smooth Newton engine
+# (ssn.solve_ssn_unified) solves it directly -- same likelihood, same
+# nonnegativity geometry, no iterative inner loop.
+#
+# What the global solve buys over the per-patch fit is structural: one model
+# per image means overlapping reflections share pixels by shape instead of by
+# patch ownership, and there are no background columns for flux to exchange
+# with -- the background is pinned to the finder's Poisson rate map, computed
+# with the predicted footprints masked out of its quantile windows (the
+# finder must be robust to peaks it has not found yet; the integrator knows
+# where they are, and feeding that back removes the estimator's bounded
+# positive bias, measured at 9% of a peak's flux at t4-like spot density).
+# Against the unconstrained global WLS baseline this removes both measured
+# pathologies on cg4d-t4-lysozyme: 37.9% negative amplitudes, and background
+# flux inflating the faint half by 33x.
+#
+# sigma(I) is the Fisher information of the Poisson likelihood at the
+# constrained optimum, inverted over the image's full dictionary, so crowded
+# reflections report their mutual covariance penalty.
+
+from tqdm import tqdm  # noqa: E402
+
+from subhkl.search.ssn import calibrated_admission_z, solve_ssn_unified  # noqa: E402
+
+# Same clamp the patch integrator puts on its log-parabolic snap.
+MAX_SNAP_SHIFT = 1.5  # [Pixel]
+
+# Padding granularity for the per-image atom count, so a whole dataset
+# compiles a handful of kernel shapes instead of one per image.
+ATOM_PAD_QUANTUM = 32
+
+# Rate-map exclusion footprint, in Mahalanobis sigmas of each peak's
+# projected shape: 3 sigma holds 98.9% of the flux, and the extra half
+# sigma absorbs the +-MAX_SNAP_SHIFT the position may still move.
+MASK_NSIGMA = 3.5
+
+
+def _footprint_mask(B, H, W, frames, rs, cs, var_us, var_vs, cov_uvs):
+    """1 where the rate map may look, 0 inside any predicted footprint."""
+    valid = np.ones((B, H, W), dtype=np.float32)
+    for f, r, c, vu, vv, cuv in zip(frames, rs, cs, var_us, var_vs, cov_uvs):
+        det = max(vu * vv - cuv**2, 1e-6)
+        half_r = int(np.ceil(MASK_NSIGMA * np.sqrt(vv))) + 1
+        half_c = int(np.ceil(MASK_NSIGMA * np.sqrt(vu))) + 1
+        r0, r1 = max(int(r) - half_r, 0), min(int(r) + half_r + 1, H)
+        c0, c1 = max(int(c) - half_c, 0), min(int(c) + half_c + 1, W)
+        if r0 >= r1 or c0 >= c1:
+            continue
+        dv, du = np.mgrid[r0:r1, c0:c1]
+        dv = dv - r
+        du = du - c
+        m2 = (vv * du**2 - 2.0 * cuv * du * dv + vu * dv**2) / det
+        valid[f, r0:r1, c0:c1] *= (m2 > MASK_NSIGMA**2).astype(np.float32)
+    return valid
+
+
+@partial(jit, static_argnames=["patch_size"])
+def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
+    """Log-parabolic sub-pixel snap, the patch integrator's estimator.
+
+    Args:
+        images, bg_maps: [photons/Pixel], (B, H, W)
+        valid: [-] (B, H, W), 1 = usable pixel (masked pixels carry no vote)
+        frames: [-] image index per peak
+        rs, cs: [Pixel] predicted positions
+    Returns:
+        snapped (rs, cs), each clamped to +-MAX_SNAP_SHIFT of the input
+    """
+    P = patch_size
+    half = P // 2
+    pad = P
+    img_pad = jnp.pad(images, ((0, 0), (pad, pad), (pad, pad)), mode="reflect")
+    bg_pad = jnp.pad(bg_maps, ((0, 0), (pad, pad), (pad, pad)), mode="reflect")
+    v_pad = jnp.pad(valid, ((0, 0), (pad, pad), (pad, pad)), mode="reflect")
+
+    nominal_sig_sq2 = 1.0 * jnp.sqrt(2.0) + 1e-6
+    k_grid = jnp.arange(-2, 3)
+    k_1d = jax.scipy.special.erf(
+        (k_grid + 0.5) / nominal_sig_sq2
+    ) - jax.scipy.special.erf((k_grid - 0.5) / nominal_sig_sq2)
+
+    def snap_one(f, r, c):
+        r_int = jnp.int32(jnp.round(r))
+        c_int = jnp.int32(jnp.round(c))
+        r0 = r_int - half + pad
+        c0 = c_int - half + pad
+        patch = lax.dynamic_slice(img_pad[f], (r0, c0), (P, P))
+        patch_bg = lax.dynamic_slice(bg_pad[f], (r0, c0), (P, P))
+        patch_v = lax.dynamic_slice(v_pad[f], (r0, c0), (P, P))
+
+        y_sub = (patch - patch_bg) * patch_v
+        temp = jax.scipy.signal.correlate2d(y_sub, k_1d[:, None], mode="same")
+        smooth = jax.scipy.signal.correlate2d(temp, k_1d[None, :], mode="same")
+
+        safe = jnp.maximum(smooth, 1e-6)
+        val = jnp.log(safe[half, half])
+        val_up = jnp.log(safe[half - 1, half])
+        val_dn = jnp.log(safe[half + 1, half])
+        val_lf = jnp.log(safe[half, half - 1])
+        val_rt = jnp.log(safe[half, half + 1])
+
+        den_r = jnp.minimum(val_up - 2.0 * val + val_dn, -1e-6)
+        dr = jnp.clip(0.5 * (val_up - val_dn) / den_r, -MAX_SNAP_SHIFT, MAX_SNAP_SHIFT)
+        den_c = jnp.minimum(val_lf - 2.0 * val + val_rt, -1e-6)
+        dc = jnp.clip(0.5 * (val_lf - val_rt) / den_c, -MAX_SNAP_SHIFT, MAX_SNAP_SHIFT)
+
+        return r_int + dr, c_int + dc
+
+    return vmap(snap_one)(frames, rs, cs)
+
+
+def _measure_whitened_profile(
+    images,
+    rate_maps,
+    valid,
+    frames,
+    rs,
+    cs,
+    var_us,
+    var_vs,
+    cov_uvs,
+    min_peaks=50,
+    u_max=4.0,
+    du=0.1,
+):
+    """The reflection family's radial profile, measured in model sigmas.
+
+    The finder's ``_measure_radial_profile`` census, upgraded with what
+    the integrator knows and the finder had to estimate: centroids come
+    from the predicted (snapped) positions instead of window moments,
+    the u axis is the MAHALANOBIS radius of each peak's projected
+    covariance instead of an isotropic moment width -- so anisotropy is
+    divided out exactly, and the rank-1-after-scale result the finder
+    measured on cg4d-garnet (mean profile = 95.5% of family energy)
+    holds a fortiori: on cg4d-t4-lysozyme the whitened mean peak is
+    round to the eye at 3 sigma -- and the background under each window
+    is the footprint-masked rate map instead of a local ring, so the
+    profile's own tails cannot subtract themselves.
+
+    Same guards as the finder: a window flux floor at 8 sigma of the
+    background noise, one vote per peak, windows overlapping another
+    footprint or a masked pixel are skipped, flux-weighted averaging,
+    and ``None`` (caller stays on the Gaussian) when fewer than
+    ``min_peaks`` qualify.  No functional form is fitted anywhere.
+
+    Returns:
+        (u, f) with f[0] = 1, or None.
+    """
+    edges = np.arange(0.0, u_max + du, du)
+    centres = 0.5 * (edges[1:] + edges[:-1])
+    acc = np.zeros(centres.size)
+    wgt = np.zeros(centres.size)
+    n_used = 0
+
+    sig_maj = np.sqrt(
+        0.5 * (var_us + var_vs)
+        + np.sqrt(np.maximum(0.25 * (var_us - var_vs) ** 2 + cov_uvs**2, 0.0))
+    )
+    B, H, W = images.shape
+    by_frame = [np.where(frames == f)[0] for f in range(B)]
+
+    for f in range(B):
+        idx = by_frame[f]
+        if len(idx) == 0:
+            continue
+        img = np.asarray(images[f], dtype=np.float64)
+        bg = np.asarray(rate_maps[f], dtype=np.float64)
+        v = np.asarray(valid[f], dtype=np.float64)
+        for i in idx:
+            half = int(np.ceil(u_max * sig_maj[i])) + 1
+            r0, c0 = int(round(rs[i])), int(round(cs[i]))
+            if not (half <= r0 < H - half and half <= c0 < W - half):
+                continue
+            # one vote per peak: skip windows contaminated by a
+            # neighbouring footprint (3 sigma_major each)
+            others = idx[idx != i]
+            if len(others):
+                d = np.hypot(rs[others] - rs[i], cs[others] - cs[i])
+                if np.any(d < 3.0 * (sig_maj[others] + sig_maj[i])):
+                    continue
+            win_v = v[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
+            if win_v.min() < 1.0:
+                continue
+            win = (
+                img[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
+                - bg[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
+            )
+            dv, dr = np.mgrid[-half : half + 1, -half : half + 1].astype(float)
+            dv += r0 - rs[i]
+            dr += c0 - cs[i]
+            det = max(var_us[i] * var_vs[i] - cov_uvs[i] ** 2, 1e-6)
+            m = np.sqrt(
+                (var_vs[i] * dr**2 - 2.0 * cov_uvs[i] * dr * dv + var_us[i] * dv**2)
+                / det
+            )
+            disk = m < u_max
+            flux = float(win[disk].sum())
+            bg_hi = float(np.median(bg[r0, c0 - half : c0 + half + 1]))
+            area = int(disk.sum())
+            if flux < max(50.0, 8.0 * np.sqrt(max(bg_hi, 0.05) * area)):
+                continue
+            u = m[disk].ravel()
+            val = win[disk].ravel() / flux
+            # Linear bin sharing: each pixel splits its vote between the
+            # two nearest bin centres.  A hard assignment aliases against
+            # the pixel lattice -- peaks near-integer positions sample m
+            # at discrete radii, and when several peaks are in phase the
+            # binned profile turns into a comb (measured on a synthetic
+            # integer grid: non-monotone by 40%).  Sharing is the same
+            # census with a triangular kernel one bin wide, not a fit.
+            t = np.clip(u / du - 0.5, 0.0, centres.size - 1.0)
+            lo = np.floor(t).astype(int)
+            hi = np.minimum(lo + 1, centres.size - 1)
+            w_hi = t - lo
+            np.add.at(acc, lo, flux * val * (1.0 - w_hi))
+            np.add.at(acc, hi, flux * val * w_hi)
+            np.add.at(wgt, lo, flux * (1.0 - w_hi))
+            np.add.at(wgt, hi, flux * w_hi)
+            n_used += 1
+
+    if n_used < min_peaks:
+        return None
+    ok = wgt > 0
+    f_prof = np.zeros(centres.size)
+    f_prof[ok] = acc[ok] / wgt[ok]
+    if f_prof[0] <= 0:
+        return None
+    f_prof = np.maximum(f_prof / f_prof[0], 0.0)
+    return centres, f_prof
+
+
+@jit
+def _solve_image_amplitudes(
+    image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, admission_z, profile=None
+):
+    """One image, all its reflections: L1-admitted, debiased Poisson solve.
+
+    The L1 penalty is the finder's admission logic with the
+    integrator's own test count: lambda_i = z / SE_i, so an atom
+    activates exactly when its whitened residual correlation exceeds
+    ``admission_z`` standard errors of its OWN amplitude
+    (per_atom_var=True -- the CG global solver's per-coefficient
+    convention), and z is calibrated from the number of predicted
+    reflections, not from a per-pixel search.  No width tax applies:
+    the finder's (sigma/ref)^gamma weight prices scale competition
+    that a fixed-geometry dictionary does not have.  A first version
+    transplanted that weight and thresholded at ~48 sigma -- 97.8% of
+    cg4d-t4-lysozyme amplitudes came back exactly zero and CC(1/2)
+    collapsed to 0.02.
+
+    Unlike the CG finder (whose GPCG endgame keeps lambda in the
+    objective throughout -- correct for detection ranking), the dense
+    engine's DEBIASING phase then refits the admitted set
+    unpenalized: L1 shrinkage is z*SE of flux, proportionally worst
+    for weak reflections, a bias merging cannot undo.  Eliminated
+    atoms come back at exactly zero and are marked censored
+    downstream (sigI = 0; the exporter drops them).
+
+    Masked pixels are missing data, not zero counts (see
+    _solve_ssn_cg_global): zeroing the data, the background and the atom
+    rows together removes a masked pixel from every term of the dense
+    engine's likelihood exactly -- its NLL contribution collapses to the
+    u = 1e-6 floor, a constant that cancels from every objective
+    difference the solver takes, and its gradient, Hessian and Fisher
+    rows are identically zero because the atom row is.
+
+    Args:
+        image, bg: [photons/Pixel], (H, W)
+        valid: [-] (H, W), 1 = usable pixel
+        rs, cs, var_u, var_v, cov_uv: atom geometry, padded to a fixed K
+        atom_ok: 1.0 for real atoms, 0.0 for padding (zeroes the column)
+        admission_z: [-] calibrated one-sided z threshold for admission
+            (see ssn.calibrated_admission_z); 0 admits every atom
+        profile: optional (u, f, norm) measured radial trunk in model
+            sigmas with norm = integral of f(m) m dm, from
+            _measure_whitened_profile; None keeps the analytic Gaussian
+    Returns:
+        (flux [photons], sigma [photons]) per atom
+    """
+    H, W = image.shape
+    yy, xx = jnp.indices((H, W), dtype=jnp.float32)
+    v_flat = valid.flatten()
+
+    def atom(r, c, vu, vv, cuv, ok):
+        det = jnp.maximum(vu * vv - cuv**2, 1e-6)
+        a = vv / det
+        b = -cuv / det
+        cc = vu / det
+        du = xx - c
+        dv = yy - r
+        m2 = a * du**2 + 2.0 * b * du * dv + cc * dv**2
+        if profile is None:
+            g = jnp.exp(-0.5 * m2)
+            # Unit total volume: integral of exp(-m^2/2) over the plane in
+            # Mahalanobis measure is 2*pi, times the Jacobian sqrt(det).
+            norm = 2.0 * jnp.pi * jnp.sqrt(det)
+        else:
+            prof_u, prof_f, prof_int = profile
+            g = jnp.interp(jnp.sqrt(m2), prof_u, prof_f, left=prof_f[0], right=0.0)
+            # Same change of variables with the measured trunk:
+            # integral f(m(x)) dA = sqrt(det) * 2*pi * integral f(m) m dm.
+            norm = 2.0 * jnp.pi * jnp.sqrt(det) * prof_int
+        # The coefficient is TOTAL PHOTON FLUX, and g/norm carries
+        # [1/Pixel] so c * g matches bg in [photons/Pixel].
+        return (g / norm).flatten() * ok * v_flat
+
+    A = vmap(atom)(rs, cs, var_u, var_v, cov_uv, atom_ok).T  # (H*W, K)
+    y = image.flatten() * v_flat
+    bg_flat = bg.flatten() * v_flat
+
+    c_warm = jnp.zeros(A.shape[1], dtype=jnp.float32)
+    # Calibrated z on real atoms; the huge weight keeps padding inert.
+    alpha_vec = jnp.where(atom_ok > 0.5, admission_z, 1e6)
+    c = solve_ssn_unified(
+        A,
+        y,
+        bg_flat,
+        alpha_vec,
+        1,
+        c_warm,
+        max_iter=20,
+        per_atom_var=True,
+    )
+
+    # Fisher information of the Poisson likelihood at the constrained
+    # optimum, over the full dictionary: I = A^T diag(1/u) A.  Padding
+    # columns are identically zero; give them a unit diagonal so the
+    # inverse exists (their sigma is discarded on scatter-back).
+    u = jnp.maximum(A @ c + bg_flat, 1e-3)
+    I_F = A.T @ (A / u[:, None])
+    I_F = I_F + jnp.diag(jnp.where(atom_ok > 0.5, 1e-6, 1.0))
+    C = jnp.linalg.inv(I_F)
+    sigma = jnp.sqrt(jnp.maximum(jnp.diag(C), 0.0))
+    return c, sigma
+
+
+def integrate_reflections_matrix_free(
+    images_batch,
+    frames,
+    rs,
+    cs,
+    var_us,
+    var_vs,
+    cov_uvs,
+    alpha,
+    gamma,
+    ref_sigma,
+    max_sigma,
+    static_valid=None,
+    profile="gaussian",
+    profile_min_peaks=50,
+    fp_target=None,
+    rate_chunk_size=64,
+    show_progress=False,
+):
+    """Global amplitude-only integration of every image in the batch.
+
+    Same contract as ``SparseLaueIntegrator.integrate_reflections``:
+    returns one row [intensity, r, c, sigma_eff, sigI] per input peak,
+    positions in the un-padded pixel frame.
+
+    Rows whose amplitude ends ON the nonnegativity boundary carry
+    sigI = 0: a constrained optimum pinned at zero is a censored
+    observation, not a measurement -- exporting it as "0 +- sigma"
+    would feed the merge a noise model it violates (only the positive
+    half of the fluctuation can ever be recorded), biasing weak merged
+    intensities upward.  The exporter drops sigI <= 0 rows.
+
+    Args:
+        images_batch: [photons/Pixel], (B, H, W)
+        frames: [-] image index per peak
+        rs, cs: [Pixel] predicted positions
+        var_us, var_vs, cov_uvs: [Pixel^2] projected 2D shape per peak
+        alpha, gamma, ref_sigma: accepted for orchestrator API symmetry
+            with the patch integrator, but INERT here: this mode is
+            measurement, not detection, so no sparsity gate applies (see
+            _solve_image_amplitudes)
+        max_sigma: [Pixel] sets the rate-map window, matching the patch
+            integrator's ``filter_size``
+        static_valid: [-] optional (B, H, W) static-structure mask
+            (1 = usable), e.g. from ``static-mask`` via
+            ``load_mask_for_banks``; excluded from the rate map AND the
+            likelihood
+        profile: "gaussian" (analytic atoms), "auto" (measure the
+            family's radial trunk from the data with
+            _measure_whitened_profile, falling back to the Gaussian if
+            too few peaks qualify), or a path to the finder's profile
+            JSON ({"u": [...], "f": [...]})
+        fp_target: [-] expected number of FALSE admissions over the
+            whole dataset; sets the L1 admission threshold
+            z = Phi^-1(1 - fp_target/n_peaks) (see
+            ssn.calibrated_admission_z).  None (the default) applies
+            no gate: elimination happens only at the nonnegativity
+            boundary, the MLE's own verdict -- the production setting,
+            since the gate cannot distinguish "absent" from "present
+            but weak" and any z > 0 trades real completeness for
+            purity (measured on cg4d-t4-lysozyme: z = 2.17 costs 31
+            points of completeness).
+    """
+    # Local import: sparse_rbf imports this function lazily at its call
+    # site, so a top-level import there would be circular.
+    from subhkl.search.sparse_rbf import compute_rate_batch
+
+    B, H, W = images_batch.shape
+    n_peaks = len(frames)
+    if n_peaks == 0:
+        return np.empty((0, 5))
+
+    frames = np.asarray(frames, dtype=int)
+    rs = np.asarray(rs, dtype=np.float32)
+    cs = np.asarray(cs, dtype=np.float32)
+    var_us = np.asarray(var_us, dtype=np.float32)
+    var_vs = np.asarray(var_vs, dtype=np.float32)
+    cov_uvs = np.asarray(cov_uvs, dtype=np.float32)
+
+    filter_size = max(15, int(max_sigma * 5))
+    if filter_size % 2 == 0:
+        filter_size += 1
+
+    if static_valid is None:
+        static_valid = np.ones((B, H, W), dtype=np.float32)
+    else:
+        static_valid = np.asarray(static_valid, dtype=np.float32)
+
+    # The rate map must not look at predicted footprints (signal) NOR at
+    # static structures (not background either); the likelihood keeps the
+    # footprints -- they are the measurement -- and drops only the static
+    # mask.
+    rate_valid = static_valid * _footprint_mask(
+        B, H, W, frames, rs, cs, var_us, var_vs, cov_uvs
+    )
+
+    images_jax = jnp.array(images_batch, dtype=jnp.float32)
+    static_valid_jax = jnp.array(static_valid)
+    rate_maps = []
+    rate_pbar = tqdm(
+        range(0, B, rate_chunk_size),
+        desc="Rate map (Poisson background)",
+        disable=not show_progress,
+    )
+    for i in rate_pbar:
+        chunk = images_jax[i : i + rate_chunk_size]
+        rates = compute_rate_batch(
+            chunk, filter_size, valid=jnp.array(rate_valid[i : i + rate_chunk_size])
+        )
+        rates.block_until_ready()
+        rate_maps.append(rates)
+    rate_maps = jnp.concatenate(rate_maps, axis=0)
+
+    snap_r, snap_c = _snap_positions(
+        images_jax,
+        rate_maps,
+        static_valid_jax,
+        jnp.array(frames),
+        jnp.array(rs),
+        jnp.array(cs),
+    )
+    snap_r = np.array(snap_r)
+    snap_c = np.array(snap_c)
+
+    trunk = None
+    if profile == "auto":
+        measured = _measure_whitened_profile(
+            np.asarray(images_batch, dtype=np.float32),
+            np.asarray(rate_maps),
+            static_valid,
+            frames,
+            snap_r,
+            snap_c,
+            var_us,
+            var_vs,
+            cov_uvs,
+            min_peaks=profile_min_peaks,
+        )
+        if measured is not None:
+            trunk = measured
+            if show_progress:
+                u_, f_ = measured
+                half_m = float(np.interp(0.5, f_[::-1], u_[::-1]))
+                print(
+                    f"  > measured radial trunk: half-max at m = {half_m:.2f} "
+                    f"(Gaussian: 1.18); f(2.5) = {np.interp(2.5, u_, f_):.3f} "
+                    f"(Gaussian: {np.exp(-(2.5**2) / 2):.3f})"
+                )
+        elif show_progress:
+            print("  > too few isolated bright peaks for a trunk; Gaussian atoms")
+    elif profile not in (None, "gaussian"):
+        import json
+
+        with open(profile, encoding="utf-8") as fh:
+            prof = json.load(fh)
+        trunk = (np.asarray(prof["u"], float), np.asarray(prof["f"], float))
+
+    if trunk is not None:
+        u_, f_ = trunk
+        # integral of f(m) m dm over the measured support -- the exact
+        # flux normalization for atoms built from the trunk (trapezoid on
+        # the measurement grid; the trunk is zero beyond it by
+        # construction).
+        prof_int = float(np.trapezoid(f_ * u_, u_))
+        trunk_jax = (
+            jnp.array(u_, dtype=jnp.float32),
+            jnp.array(f_, dtype=jnp.float32),
+            jnp.float32(prof_int),
+        )
+    else:
+        trunk_jax = None
+
+    # Group peaks by image and pad every group to a common atom count so
+    # the solve compiles once.
+    by_frame = [np.where(frames == f)[0] for f in range(B)]
+    k_max = max((len(ix) for ix in by_frame), default=0)
+    if k_max == 0:
+        return np.empty((0, 5))
+    k_pad = int(np.ceil(k_max / ATOM_PAD_QUANTUM) * ATOM_PAD_QUANTUM)
+
+    effective_sigma = np.sqrt(np.sqrt(np.maximum(var_us * var_vs - cov_uvs**2, 1e-6)))
+
+    if fp_target is None:
+        admission_z = 0.0
+        if show_progress:
+            print("  > L1 admission: no gate (nonneg-boundary censoring only)")
+    else:
+        admission_z = calibrated_admission_z(n_peaks, fp_target)
+        if show_progress:
+            print(
+                f"  > L1 admission: z = {admission_z:.2f} "
+                f"({fp_target} expected false admissions over {n_peaks} predictions)"
+            )
+    admission_z_jax = jnp.float32(admission_z)
+
+    out = np.zeros((n_peaks, 5), dtype=np.float64)
+    pbar = tqdm(range(B), desc="Matrix-free amplitude solve", disable=not show_progress)
+    for f in pbar:
+        idx = by_frame[f]
+        if len(idx) == 0:
+            continue
+        k = len(idx)
+
+        def padded(arr, fill=0.0):
+            buf = np.full(k_pad, fill, dtype=np.float32)
+            buf[:k] = arr[idx]
+            return jnp.array(buf)
+
+        atom_ok = jnp.array(
+            np.concatenate([np.ones(k), np.zeros(k_pad - k)]).astype(np.float32)
+        )
+        flux, sigma = _solve_image_amplitudes(
+            images_jax[f],
+            rate_maps[f],
+            static_valid_jax[f],
+            padded(snap_r, fill=-1e4),
+            padded(snap_c, fill=-1e4),
+            padded(var_us, fill=1.0),
+            padded(var_vs, fill=1.0),
+            padded(cov_uvs),
+            atom_ok,
+            admission_z_jax,
+            profile=trunk_jax,
+        )
+        flux = np.array(flux[:k], dtype=np.float64)
+        sigma = np.array(sigma[:k], dtype=np.float64)
+        # Boundary-pinned amplitudes are censored, not measured: mark
+        # them with sigI = 0 so the exporter drops them (see docstring).
+        sigma[flux <= 0.0] = 0.0
+
+        out[idx, 0] = flux
+        out[idx, 1] = snap_r[idx]
+        out[idx, 2] = snap_c[idx]
+        out[idx, 3] = effective_sigma[idx]
+        out[idx, 4] = sigma
+
+    return out
