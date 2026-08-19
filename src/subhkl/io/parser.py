@@ -856,7 +856,7 @@ def metrics(
     per_peak: Annotated[
         bool,
         typer.Option(
-            "--per_peak", 
+            "--per-peak", 
             help="Write the metrics/per_peak table (h, k, l, run, lambda,"
             "d_err, ang_err) into FILE1, for scripts/error_analysis.py."
         ),
