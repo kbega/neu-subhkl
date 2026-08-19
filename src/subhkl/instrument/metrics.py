@@ -438,12 +438,12 @@ def compute_metrics(
                     "d_err",
                     data=d_err.astype(np.float32),
                     compression="gzip",
-	        )
+                )
                 peak_grp.create_dataset(
-		    "ang_err",
-		    data=ang_err.astype(np.float32),
-		    compression="gzip",
-	        )
+                    "ang_err",
+                    data=ang_err.astype(np.float32),
+                    compression="gzip",
+                )
                 print("Finished writing metrics/per_peak")
 
         if d_filter_message:
